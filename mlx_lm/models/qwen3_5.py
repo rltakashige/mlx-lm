@@ -188,7 +188,7 @@ class GatedDeltaNet(nn.Module):
             self.dt_bias,
             state,
             mask,
-            use_kernel=False,
+            use_kernel=True,
         )
 
         if cache is not None:
