@@ -413,7 +413,7 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
-            logprobs = logits - mx.logsumexp(logits, keepdims=True)
+            logprobs = logits.astype(mx.float32) - mx.logsumexp(logits.astype(mx.float32), keepdims=True)
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
@@ -536,7 +536,7 @@ def speculative_generate_step(
             for processor in logits_processors:
                 logits = processor(tokens, logits)
 
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        logprobs = logits.astype(mx.float32) - mx.logsumexp(logits.astype(mx.float32), axis=-1, keepdims=True)
         y = sampler(logprobs)
         return y, logprobs
 
@@ -1210,7 +1210,7 @@ class BatchGenerator:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        logprobs = logits.astype(mx.float32) - mx.logsumexp(logits.astype(mx.float32), axis=-1, keepdims=True)
         if any(samplers):
             all_samples = []
             for e in range(batch_size):
