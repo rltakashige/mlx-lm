@@ -7,9 +7,7 @@ import mlx.nn as nn
 
 @partial(mx.compile, shapeless=True)
 def compute_g(A_log, a, dt_bias):
-    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias)).astype(
-        a.dtype
-    )
+    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
 
 
 def _make_gated_delta_kernel(has_mask=False, vectorized=False):
@@ -270,7 +268,7 @@ def gated_delta_update(
     use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
 
-    beta = mx.sigmoid(b)
+    beta = mx.sigmoid(b.astype(mx.float32))
     g = compute_g(A_log, a, dt_bias)
     if state is None:
         B, _, Hk, Dk = q.shape
@@ -278,5 +276,8 @@ def gated_delta_update(
         state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return gated_delta_ops(q, k, v, g, beta, state, mask)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask)
+        y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
+        return y, state.astype(q.dtype)
+    return gated_delta_kernel(
+        q, k, v, g.astype(q.dtype), beta.astype(q.dtype), state, mask
+    )

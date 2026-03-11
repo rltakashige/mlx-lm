@@ -171,8 +171,12 @@ class GatedDeltaNet(nn.Module):
 
         state = cache[1] if cache else None
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q = inv_scale * q * mx.rsqrt(
+            (q * q).sum(axis=-1, keepdims=True) + 1e-6
+        )
+        k = k * mx.rsqrt(
+            (k * k).sum(axis=-1, keepdims=True) + 1e-6
+        )
 
         out, state = gated_delta_update(
             q,
@@ -184,7 +188,7 @@ class GatedDeltaNet(nn.Module):
             self.dt_bias,
             state,
             mask,
-            use_kernel=not self.training,
+            use_kernel=False,
         )
 
         if cache is not None:
