@@ -15,17 +15,38 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         return None
     mask_source = "mask[b_idx * T + t]" if has_mask else "true"
 
-    # Configure g indexing based on whether gating is vectorized
+    # Configure a indexing and g/beta computation based on whether gating is vectorized
     if vectorized:
-        g_comment = "// g: [B, T, Hv, Dk]"
-        g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
-        g_access = "g_[s_idx]"
-        g_advance = "g_ += Hv * Dk;"
+        a_comment = "// a: [B, T, Hv, Dk]"
+        a_setup = "auto a_ = a + (b_idx * T * Hv + hv_idx) * Dk;"
+        a_advance = "a_ += Hv * Dk;"
+        # Vectorized: g varies per Dk element, compute shared values before inner loop
+        g_compute = (
+            "float dt_val = static_cast<float>(dt_bias[hv_idx]);\n"
+            "            float neg_exp_A = -exp(static_cast<float>(A_log[hv_idx]));\n"
+            "            float beta_val = 1.0f / (1.0f + exp(-static_cast<float>(b_[hv_idx])));"
+        )
+        # Per-element g computation inside inner loop
+        g_per_element = (
+            "float a_val = static_cast<float>(a_[s_idx]);\n"
+            "              float x_g = a_val + dt_val;\n"
+            "              float sp = (x_g > 20.0f) ? x_g : log(1.0f + exp(x_g));\n"
+            "              float g_val = exp(neg_exp_A * sp);"
+        )
     else:
-        g_comment = "// g: [B, T, Hv]"
-        g_setup = "auto g_ = g + b_idx * T * Hv;"
-        g_access = "g_[hv_idx]"
-        g_advance = "g_ += Hv;"
+        a_comment = "// a: [B, T, Hv]"
+        a_setup = "auto a_ = a + b_idx * T * Hv;"
+        a_advance = "a_ += Hv;"
+        # Non-vectorized: g is scalar per head, compute once before inner loop
+        g_compute = (
+            "float a_val = static_cast<float>(a_[hv_idx]);\n"
+            "            float dt_val = static_cast<float>(dt_bias[hv_idx]);\n"
+            "            float x_g = a_val + dt_val;\n"
+            "            float sp = (x_g > 20.0f) ? x_g : log(1.0f + exp(x_g));\n"
+            "            float g_val = exp(-exp(static_cast<float>(A_log[hv_idx])) * sp);\n"
+            "            float beta_val = 1.0f / (1.0f + exp(-static_cast<float>(b_[hv_idx])));"
+        )
+        g_per_element = ""
 
     source = f"""
         auto n = thread_position_in_grid.z;
@@ -55,21 +76,24 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
           state[i] = static_cast<float>(i_state[s_idx]);
         }}
 
-        {g_comment}
-        {g_setup}
-        auto beta_ = beta + b_idx * T * Hv;
+        {a_comment}
+        {a_setup}
+        // b: [B, T, Hv]
+        auto b_ = b + b_idx * T * Hv;
 
         for (int t = 0; t < T; ++t) {{
           if ({mask_source}) {{
+            {g_compute}
             float kv_mem = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
               auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] * {g_access};
+              {g_per_element}
+              state[i] = state[i] * g_val;
               kv_mem += state[i] * k_[s_idx];
             }}
             kv_mem = simd_sum(kv_mem);
 
-            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+            auto delta = (v_[dv_idx] - kv_mem) * beta_val;
 
             float out = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
@@ -87,15 +111,15 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
           k_ += Hk * Dk;
           v_ += Hv * Dv;
           y += Hv * Dv;
-          {g_advance}
-          beta_ += Hv;
+          {a_advance}
+          b_ += Hv;
         }}
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
           o_state[s_idx] = static_cast<StT>(state[i]);
         }}
     """
-    inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
+    inputs = ["q", "k", "v", "a", "b", "A_log", "dt_bias", "state_in", "T"]
     if has_mask:
         inputs.append("mask")
 
@@ -170,8 +194,10 @@ def gated_delta_kernel(
     q: mx.array,
     k: mx.array,
     v: mx.array,
-    g: mx.array,
-    beta: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
     state: mx.array,
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
@@ -179,15 +205,15 @@ def gated_delta_kernel(
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype
-    if g.ndim == 4:
+    if a.ndim == 4:
         kernel = _gated_delta_kernel_vec
-        inputs = [q, k, v, g, beta, state, T]
+        inputs = [q, k, v, a, b, A_log, dt_bias, state, T]
         if mask is not None:
             kernel = _gated_delta_kernel_vec_masked
             inputs.append(mask)
     else:
         kernel = _gated_delta_kernel
-        inputs = [q, k, v, g, beta, state, T]
+        inputs = [q, k, v, a, b, A_log, dt_bias, state, T]
         if mask is not None:
             kernel = _gated_delta_kernel_masked
             inputs.append(mask)
@@ -277,5 +303,9 @@ def gated_delta_update(
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return gated_delta_ops(q, k, v, g, beta, state, mask)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask)
+        beta = mx.sigmoid(b.astype(mx.float32))
+        g = compute_g(A_log, a, dt_bias)
+        y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
+        return y, state.astype(q.dtype)
+
+    return gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
