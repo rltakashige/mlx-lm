@@ -116,7 +116,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         }}
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<InT>(state[i]);
+          o_state[s_idx] = static_cast<StT>(state[i]);
         }}
     """
     inputs = ["q", "k", "v", "a", "b", "A_log", "dt_bias", "state_in", "T"]
@@ -187,7 +187,7 @@ def _gated_delta_step_ops(
     if mask is not None:
         mask = mx.expand_dims(mask, axis=(1, 2, 3))
         state = mx.where(mask, state, old_state)
-    return y, state
+    return y.astype(q.dtype), state
 
 
 def gated_delta_kernel(
@@ -204,6 +204,7 @@ def gated_delta_kernel(
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
+    state_type = state.dtype
     if a.ndim == 4:
         kernel = _gated_delta_kernel_vec
         inputs = [q, k, v, a, b, A_log, dt_bias, state, T]
@@ -221,6 +222,7 @@ def gated_delta_kernel(
         inputs=inputs,
         template=[
             ("InT", input_type),
+            ("StT", state_type),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -229,7 +231,7 @@ def gated_delta_kernel(
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
-        output_dtypes=[input_type, input_type],
+        output_dtypes=[input_type, state_type],
     )
 
 
@@ -259,7 +261,7 @@ def gated_delta_ops(
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     if (repeat_factor := Hv // Hk) > 1:
         q = mx.repeat(q, repeat_factor, -2)
@@ -293,11 +295,12 @@ def gated_delta_update(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array]:
-
+    beta = mx.sigmoid(b)
+    g = compute_g(A_log, a, dt_bias)
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=q.dtype)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         beta = mx.sigmoid(b.astype(mx.float32))
