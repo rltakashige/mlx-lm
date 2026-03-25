@@ -221,7 +221,19 @@ class DeepseekV32Attention(nn.Module):
                     mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
                     axis=2,
                 )
-                mask = None
+                # With batched left-padded caches, some gathered indices
+                # may point to zero-padded positions. Mask those out so they
+                # receive -inf in pe_scores and zero softmax weight.
+                if (
+                    hasattr(cache[0], "left_padding")
+                    and cache[0].left_padding.max().item() > 0
+                ):
+                    # topk_indices are (B, n_heads, n_queries, topk)
+                    gathered_idx = topk_indices[:, :, 0, :]
+                    left_pad = cache[0].left_padding[:, None, None]
+                    mask = (gathered_idx >= left_pad)[:, :, None, :]
+                else:
+                    mask = None
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
