@@ -53,7 +53,7 @@ counter = MetalResourceCounter()
 import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import BatchGenerator
-from mlx_lm.models.cache import ArraysCache
+from mlx_lm.models.cache import ArraysCache, BatchKVCache
 from mlx_lm.sample_utils import make_sampler
 
 parser = argparse.ArgumentParser()
@@ -85,6 +85,8 @@ for step in range(num_steps):
                     mx.eval(c.left_padding)
                 if c.lengths is not None:
                     mx.eval(c.lengths)
+            elif isinstance(c, BatchKVCache):
+                mx.eval(c.offset)
     if step % print_steps == 0:
         print(f"Step {step}: {counter.count} Metal resources")
 
