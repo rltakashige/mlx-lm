@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ._tp_utils import switch_mlp_n_sharded
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -152,18 +153,23 @@ class MLPBlock(nn.Module):
         g = self.router(x)
         experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
         expert_weights = mx.softmax(experts, axis=-1, precise=True)
-
-        # Experts block
         x = self.experts(x, indices)
-
         x = x * mx.expand_dims(expert_weights, axis=-1)
-
         y = x.sum(axis=-2)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
+
+    def call_sharded(
+        self, x: mx.array, group: mx.distributed.Group
+    ) -> mx.array:
+        x = sum_gradients(group)(x)
+        g = self.router(x)
+        experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
+        expert_weights = mx.softmax(experts, axis=-1, precise=True)
+        return switch_mlp_n_sharded(self.experts, x, indices, expert_weights, group)
 
 
 class TransformerBlock(nn.Module):

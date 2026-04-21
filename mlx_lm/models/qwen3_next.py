@@ -10,6 +10,11 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
+from ._tp_utils import (
+    all_gather_last,
+    mlp_n_sharded_sharded_out,
+    switch_mlp_n_sharded_sharded_out,
+)
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -352,6 +357,26 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
+
+    def call_sharded(
+        self, x: mx.array, group: mx.distributed.Group
+    ) -> mx.array:
+        x = sum_gradients(group)(x)
+
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+
+        y_shard = switch_mlp_n_sharded_sharded_out(
+            self.switch_mlp, x, inds, scores, group
+        )
+        shared_shard = mlp_n_sharded_sharded_out(self.shared_expert, x, group)
+        shared_shard = mx.sigmoid(self.shared_expert_gate(x)) * shared_shard
+        return all_gather_last(y_shard + shared_shard, group)
 
 
 class Qwen3NextDecoderLayer(nn.Module):

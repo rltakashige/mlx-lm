@@ -5,7 +5,9 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import sum_gradients
 
+from ._tp_utils import switch_mlp_n_sharded
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
@@ -124,19 +126,27 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self,
         x: mx.array,
     ) -> mx.array:
+        inds, scores = self._route(x)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        return y
+
+    def call_sharded(
+        self, x: mx.array, group: mx.distributed.Group
+    ) -> mx.array:
+        x = sum_gradients(group)(x)
+        inds, scores = self._route(x)
+        return switch_mlp_n_sharded(self.switch_mlp, x, inds, scores, group)
+
+    def _route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
-
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
-
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
-
-        return y
+        return inds, scores
 
 
 class Qwen3MoeDecoderLayer(nn.Module):

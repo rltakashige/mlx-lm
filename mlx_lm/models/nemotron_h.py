@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ._tp_utils import mlp_n_sharded, switch_fc_n_sharded
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -421,6 +422,23 @@ class NemotronHMoE(nn.Module):
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(residuals)
 
+        return y
+
+    def call_sharded(
+        self, x: mx.array, group: mx.distributed.Group
+    ) -> mx.array:
+        residuals = x
+        inds, scores = self.gate(x)
+        if self.moe_latent_size is not None:
+            x = self.fc1_latent_proj(x)
+        y = switch_fc_n_sharded(
+            self.switch_mlp, x, inds, group, self.switch_mlp.activation
+        )
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        if self.moe_latent_size is not None:
+            y = self.fc2_latent_proj(y)
+        if self.config.n_shared_experts is not None:
+            y = y + mlp_n_sharded(self.shared_experts, residuals, group)
         return y
 
 

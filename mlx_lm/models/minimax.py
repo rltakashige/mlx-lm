@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ._tp_utils import switch_mlp_n_sharded
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
 
@@ -175,19 +176,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        gates = self.gate(x.astype(mx.float32))
-
-        scores = mx.sigmoid(gates)
-        orig_scores = scores
-        scores = scores + self.e_score_correction_bias
-
-        k = self.num_experts_per_tok
-        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-
-        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        scores = scores.astype(x.dtype)
-
+        inds, scores = self._route(x)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
@@ -195,6 +184,24 @@ class MiniMaxSparseMoeBlock(nn.Module):
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
+
+    def call_sharded(
+        self, x: mx.array, group: mx.distributed.Group
+    ) -> mx.array:
+        x = sum_gradients(group)(x)
+        inds, scores = self._route(x)
+        return switch_mlp_n_sharded(self.switch_mlp, x, inds, scores, group)
+
+    def _route(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        gates = self.gate(x.astype(mx.float32))
+        scores = mx.sigmoid(gates)
+        orig_scores = scores
+        scores = scores + self.e_score_correction_bias
+        k = self.num_experts_per_tok
+        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        return inds, scores.astype(x.dtype)
 
 
 class MiniMaxDecoderLayer(nn.Module):

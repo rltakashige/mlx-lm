@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import sum_gradients
 
+from ._tp_utils import switch_mlp_n_sharded
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
 from .rope_utils import initialize_rope
@@ -171,6 +173,18 @@ class Experts(nn.Module):
         y = self.switch_glu(x, top_k_indices)
 
         return (w * y).sum(-2)
+
+    def call_sharded(
+        self,
+        x: mx.array,
+        top_k_indices: mx.array,
+        top_k_weights: mx.array,
+        group: mx.distributed.Group,
+    ) -> mx.array:
+        x = sum_gradients(group)(x)
+        return switch_mlp_n_sharded(
+            self.switch_glu, x, top_k_indices, top_k_weights, group
+        )
 
 
 class Attention(nn.Module):

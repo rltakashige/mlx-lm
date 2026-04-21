@@ -8,6 +8,11 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ._tp_utils import (
+    all_gather_last,
+    mlp_n_sharded_sharded_out,
+    switch_mlp_n_sharded_sharded_out,
+)
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
@@ -374,6 +379,20 @@ class DeepseekV32MoE(nn.Module):
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
+
+    def call_sharded(
+        self, x: mx.array, group: mx.distributed.Group
+    ) -> mx.array:
+        x = sum_gradients(group)(x)
+        inds, scores = self.gate(x)
+        y_shard = switch_mlp_n_sharded_sharded_out(
+            self.switch_mlp, x, inds, scores, group
+        )
+        if self.config.n_shared_experts is not None:
+            y_shard = y_shard + mlp_n_sharded_sharded_out(
+                self.shared_experts, x, group
+            )
+        return all_gather_last(y_shard, group)
 
 
 class DeepseekV32DecoderLayer(nn.Module):

@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ._tp_utils import mlp_n_sharded, switch_mlp_n_sharded
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -180,6 +181,16 @@ class Step3p5MoE(nn.Module):
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
+        return y
+
+    def call_sharded(
+        self, x: mx.array, group: mx.distributed.Group
+    ) -> mx.array:
+        x = sum_gradients(group)(x)
+        inds, scores = self.gate(x)
+        y = switch_mlp_n_sharded(self.switch_mlp, x, inds, scores, group)
+        if self.share_expert is not None:
+            y = y + mlp_n_sharded(self.share_expert, x, group)
         return y
 
 
