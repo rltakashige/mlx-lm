@@ -217,8 +217,16 @@ class DeepseekV32Attention(nn.Module):
                     mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
                     axis=2,
                 )
-                if mask is not None:
-                    mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+                if (
+                    mask is not None
+                    and hasattr(cache[0], "left_padding")
+                    and cache[0].left_padding.max().item() > 0
+                ):
+                    gathered_idx = topk_indices[:, :, 0, :]
+                    left_pad = cache[0].left_padding[:, None, None]
+                    mask = (gathered_idx >= left_pad)[:, :, None, :]
+                else:
+                    mask = None
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
