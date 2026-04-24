@@ -180,6 +180,9 @@ def convert(
         config.pop("quantization_config", None)
         model = dequantize_model(model)
 
+    if config.get("model_type") == "deepseek_v4":
+        tokenizer.init_kwargs["chat_template_type"] = "deepseek_v4"
+
     save(
         mlx_path,
         hf_path,
