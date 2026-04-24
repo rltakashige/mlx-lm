@@ -6,8 +6,21 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention
-from .cache import _BaseCache, RotatingKVCache
-from .switch_layers import QuantizedSwitchLinear, SwiGLU, SwitchGLU, _gather_sort, _scatter_unsort
+from .cache import ArraysCache, CacheList, RotatingKVCache
+from .switch_layers import SwitchGLU
+
+# Slot indices inside the ArraysCache that sits alongside the RotatingKVCache
+# for compressed-attention layers (CacheList(RotatingKVCache, ArraysCache(6))).
+# Trim is not supported on this composition (ArraysCache inherits is_trimmable
+# = False); rollback is done by snapshotting ``cache.state`` and restoring via
+# ``from_state``.
+_C_COMPRESSED = 0
+_C_COMP_KV_STATE = 1
+_C_COMP_SCORE_STATE = 2
+_C_IDX_COMPRESSED = 3
+_C_IDX_KV_STATE = 4
+_C_IDX_SCORE_STATE = 5
+_N_COMPRESSED_SLOTS = 6
 
 
 # Register a minimal HF config so AutoConfig / AutoTokenizer recognize
@@ -296,126 +309,6 @@ class HyperHead(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Cache                                                                        #
-# --------------------------------------------------------------------------- #
-
-
-class DeepseekV4Cache(_BaseCache):
-    """Cache for layers with ``compress_ratio > 0``.
-
-    Tracks four things:
-
-    - ``window_kv``: rotating ring buffer of the last ``window`` raw KV rows,
-      stored in temporal order via explicit temporal roll on fetch.
-    - ``compressed_kv``: growing buffer of compressed KV rows, appended at
-      prefill (bulk) and during decode once every ``ratio`` tokens.
-    - ``comp_kv_state`` / ``comp_score_state``: fp32 accumulators the
-      Compressor writes between decode steps. When ``overlap`` is on (ratio=4),
-      the buffer holds ``2*ratio`` slots; the first ``ratio`` are the previous
-      window and the next ``ratio`` the one currently filling.
-    - Mirror buffers (``idx_*``) for the Indexer's own Compressor in ratio=4
-      layers.
-
-    ``offset`` is the total number of raw tokens ingested, matching the
-    convention of the other mlx-lm caches.
-    """
-
-    def __init__(
-        self,
-        window: int,
-        ratio: int,
-        head_dim: int,
-        has_indexer: bool,
-        index_head_dim: int,
-    ):
-        self.window = window
-        self.ratio = ratio
-        self.head_dim = head_dim
-        self.has_indexer = has_indexer
-        self.index_head_dim = index_head_dim
-        self.overlap = ratio == 4
-        self.offset = 0
-
-        self.window_kv: Optional[mx.array] = None
-        self.compressed_kv: Optional[mx.array] = None
-        self.compressed_len = 0
-
-        coff = 2 if self.overlap else 1
-        self._coff = coff
-        self.comp_kv_state: Optional[mx.array] = None
-        self.comp_score_state: Optional[mx.array] = None
-
-        if has_indexer:
-            self.idx_compressed_kv: Optional[mx.array] = None
-            self.idx_compressed_len = 0
-            self.idx_kv_state: Optional[mx.array] = None
-            self.idx_score_state: Optional[mx.array] = None
-
-    # ------------------------------------------------------------------ #
-    # window KV                                                           #
-    # ------------------------------------------------------------------ #
-    def prefill_window(self, kv: mx.array) -> mx.array:
-        """Prefill path: attend over the full raw KV. Persist the tail so the
-        next decode step has the right sliding-window context."""
-        self.window_kv = (
-            kv[:, -self.window :, :] if kv.shape[1] > self.window else kv
-        )
-        return kv
-
-    def decode_window(self, kv: mx.array) -> mx.array:
-        """Decode path: extend the stored window with ``kv`` and trim to
-        ``window``. Returns the updated window for attention."""
-        if self.window_kv is None:
-            merged = kv
-        else:
-            merged = mx.concatenate([self.window_kv, kv], axis=1)
-        if merged.shape[1] > self.window:
-            merged = merged[:, -self.window :, :]
-        self.window_kv = merged
-        return merged
-
-    # ------------------------------------------------------------------ #
-    # compressed KV                                                       #
-    # ------------------------------------------------------------------ #
-    def append_compressed(self, kv: mx.array, use_indexer_buffer: bool = False):
-        if use_indexer_buffer:
-            buf = self.idx_compressed_kv
-            if buf is None:
-                self.idx_compressed_kv = kv
-            else:
-                self.idx_compressed_kv = mx.concatenate([buf, kv], axis=1)
-            self.idx_compressed_len = self.idx_compressed_kv.shape[1]
-        else:
-            buf = self.compressed_kv
-            if buf is None:
-                self.compressed_kv = kv
-            else:
-                self.compressed_kv = mx.concatenate([buf, kv], axis=1)
-            self.compressed_len = self.compressed_kv.shape[1]
-
-    # ------------------------------------------------------------------ #
-    # mlx-lm _BaseCache interface                                         #
-    # ------------------------------------------------------------------ #
-    def make_mask(self, *args, **kwargs):
-        # Masking is encoded via topk indices (-1 = masked), so no causal mask.
-        return None
-
-    def empty(self):
-        return self.window_kv is None
-
-    @property
-    def nbytes(self):
-        total = 0
-        if self.window_kv is not None:
-            total += self.window_kv.nbytes
-        if self.compressed_kv is not None:
-            total += self.compressed_kv.nbytes
-        if self.has_indexer and self.idx_compressed_kv is not None:
-            total += self.idx_compressed_kv.nbytes
-        return total
-
-
-# --------------------------------------------------------------------------- #
 # Compressor                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -504,17 +397,15 @@ class Compressor(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: DeepseekV4Cache,
+        state: "ArraysCache",
         offset: int,
-        use_indexer_buffer: bool = False,
+        slot_compressed: int,
+        slot_kv_state: int,
+        slot_score_state: int,
     ) -> Optional[mx.array]:
-        """Ingest ``x`` and, if appropriate, emit compressed KV rows.
-
-        Returns the freshly-produced compressed KV chunk (``[B, n_new, d]``)
-        or ``None`` if nothing was produced this call. The caller is
-        responsible for concatenating the result into the cache buffer (it is
-        usually more convenient to let this routine do the append — we do both
-        so the Attention module can still access the newly-emitted rows).
+        """Ingest ``x`` and, if appropriate, emit compressed KV rows into
+        ``state[slot_compressed]``. Accumulator buffers live in
+        ``state[slot_kv_state]`` / ``state[slot_score_state]``.
         """
         B, S, _ = x.shape
         xf = x.astype(mx.float32)
@@ -525,12 +416,8 @@ class Compressor(nn.Module):
         d = self.head_dim
         coff_d = self._coff * d
 
-        if use_indexer_buffer:
-            state_kv = cache.idx_kv_state
-            state_score = cache.idx_score_state
-        else:
-            state_kv = cache.comp_kv_state
-            state_score = cache.comp_score_state
+        state_kv = state[slot_kv_state]
+        state_score = state[slot_score_state]
 
         # Lazy-init state buffers
         if state_kv is None:
@@ -572,7 +459,10 @@ class Compressor(nn.Module):
                 pos_anchor = mx.arange(0, n_rows, dtype=mx.int32) * ratio
                 compressed = self._apply_compressor_rope(compressed, pos_anchor)
                 out_compressed = compressed
-                cache.append_compressed(compressed, use_indexer_buffer=use_indexer_buffer)
+                buf = state[slot_compressed]
+                state[slot_compressed] = (
+                    compressed if buf is None else mx.concatenate([buf, compressed], axis=1)
+                )
 
             # Stash tail into state
             if remainder > 0:
@@ -593,12 +483,8 @@ class Compressor(nn.Module):
                 state_kv[:, :ratio, :] = prev_kv.astype(mx.float32)
                 state_score[:, :ratio, :] = prev_score.astype(mx.float32)
 
-            if use_indexer_buffer:
-                cache.idx_kv_state = state_kv
-                cache.idx_score_state = state_score
-            else:
-                cache.comp_kv_state = state_kv
-                cache.comp_score_state = state_score
+            state[slot_kv_state] = state_kv
+            state[slot_score_state] = state_score
             return out_compressed
 
         # Decode path: S == 1
@@ -639,20 +525,18 @@ class Compressor(nn.Module):
             anchor = mx.array([offset + 1 - ratio], dtype=mx.int32)
             compressed = self._apply_compressor_rope(compressed, anchor)
             out_compressed = compressed
-            cache.append_compressed(compressed, use_indexer_buffer=use_indexer_buffer)
+            buf = state[slot_compressed]
+            state[slot_compressed] = (
+                compressed if buf is None else mx.concatenate([buf, compressed], axis=1)
+            )
 
             if overlap:
                 # Rotate: "current" becomes "previous"
                 state_kv[:, :ratio, :] = state_kv[:, ratio:, :]
                 state_score[:, :ratio, :] = state_score[:, ratio:, :]
 
-        if use_indexer_buffer:
-            cache.idx_kv_state = state_kv
-            cache.idx_score_state = state_score
-        else:
-            cache.comp_kv_state = state_kv
-            cache.comp_score_state = state_score
-
+        state[slot_kv_state] = state_kv
+        state[slot_score_state] = state_score
         return out_compressed
 
 
@@ -698,7 +582,7 @@ class Indexer(nn.Module):
         self,
         x: mx.array,
         qr: mx.array,
-        cache: DeepseekV4Cache,
+        state: "ArraysCache",
         offset: int,
     ) -> mx.array:
         """Return ``topk_idxs [B, S, index_topk]`` of int32 referencing the main
@@ -714,8 +598,13 @@ class Indexer(nn.Module):
         )
 
         # Update the indexer's own compressed-KV cache
-        self.compressor(x, cache, offset, use_indexer_buffer=True)
-        idx_kv = cache.idx_compressed_kv  # [B, T, index_head_dim] (or None)
+        self.compressor(
+            x, state, offset,
+            slot_compressed=_C_IDX_COMPRESSED,
+            slot_kv_state=_C_IDX_KV_STATE,
+            slot_score_state=_C_IDX_SCORE_STATE,
+        )
+        idx_kv = state[_C_IDX_COMPRESSED]  # [B, T, index_head_dim] (or None)
 
         per_head_weights = self.weights_proj(x) * (
             self.softmax_scale * (self.n_heads ** -0.5)
@@ -964,7 +853,15 @@ class V4Attention(nn.Module):
         # single-head KV (MQA with num_kv_heads=1)
         kv = self.kv_norm(self.wkv(x))  # [B, S, head_dim]
 
-        offset = cache.offset if cache is not None else 0
+        # Compressed-attention layers carry CacheList(RotatingKVCache, ArraysCache(6)).
+        # Pure sliding-window layers carry a plain RotatingKVCache.
+        if self.compress_ratio and cache is not None:
+            win_cache = cache.caches[0]
+            state_cache = cache.caches[1]
+        else:
+            win_cache = cache
+            state_cache = None
+        offset = win_cache.offset if win_cache is not None else 0
 
         # RoPE (only the last rd dims)
         q_nope, q_pe = q[..., : -rd], q[..., -rd:]
@@ -979,22 +876,32 @@ class V4Attention(nn.Module):
         is_prefill = offset == 0
 
         if self.compress_ratio:
-            if cache is None:
-                cache = DeepseekV4Cache(
-                    window=self.window,
-                    ratio=self.compress_ratio,
-                    head_dim=self.head_dim,
-                    has_indexer=(self.compress_ratio == 4),
-                    index_head_dim=self.args.index_head_dim,
-                )
+            # Lazy-init caches if none were supplied (e.g. prefill-only call).
+            if state_cache is None:
+                win_cache = RotatingKVCache(max_size=self.window)
+                state_cache = ArraysCache(_N_COMPRESSED_SLOTS)
+            # Advance the window cache by S raw tokens (gives us the canonical
+            # offset + sliding-window storage for future decode).
+            _ = win_cache.update_and_fetch(
+                kv[:, None, :, :], kv[:, None, :, :]
+            )
+            # For attention, use the full raw kv during prefill (queries 0..S-1
+            # need their own window which isn't yet in the rotating cache) and
+            # the temporal-order rotating cache during decode.
             if is_prefill:
-                window_kv = cache.prefill_window(kv)
+                window_kv = kv
             else:
-                window_kv = cache.decode_window(kv)
-            _ = self.compressor(x, cache, offset)
+                keys = win_cache._temporal_order(win_cache.keys)
+                window_kv = keys.squeeze(1)
+            _ = self.compressor(
+                x, state_cache, offset,
+                slot_compressed=_C_COMPRESSED,
+                slot_kv_state=_C_COMP_KV_STATE,
+                slot_score_state=_C_COMP_SCORE_STATE,
+            )
 
             window_len = window_kv.shape[1]
-            compressed = cache.compressed_kv
+            compressed = state_cache[_C_COMPRESSED]
             compressed_len = 0 if compressed is None else compressed.shape[1]
             kv_all = (
                 mx.concatenate([window_kv, compressed], axis=1)
@@ -1006,7 +913,7 @@ class V4Attention(nn.Module):
                 self.window, B, S, offset, window_len
             )
             if self.compress_ratio == 4:
-                compress_idxs = self.indexer(x, qr, cache, offset)
+                compress_idxs = self.indexer(x, qr, state_cache, offset)
                 compress_idxs = mx.where(
                     compress_idxs >= 0,
                     compress_idxs + window_len,
@@ -1022,7 +929,6 @@ class V4Attention(nn.Module):
                     window_len,
                 )
             topk_idxs = mx.concatenate([win_idxs, compress_idxs], axis=-1)
-            cache.offset = cache.offset + S
         else:
             # Pure sliding window. During prefill, attend over the full raw kv
             # and only persist the last ``window`` tokens for future decode.
@@ -1129,109 +1035,22 @@ class DeepseekV4MLP(nn.Module):
         return self.down_proj(nn.silu(gate) * up)
 
 
-_FP4_E2M1_TABLE = mx.array(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-    dtype=mx.float32,
-)
-
-
-def _dequant_fp4_to_bf16(
-    weight: mx.array, scale: mx.array, scale_to_float
-) -> mx.array:
-    """Fallback FP4 → bf16 dequant used when not staying in native mxfp4."""
-    bs = 32
-    packed = weight.astype(mx.uint8)
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
-    unpacked = mx.stack(
-        [mx.take(_FP4_E2M1_TABLE, low), mx.take(_FP4_E2M1_TABLE, high)],
-        axis=-1,
-    ).reshape(weight.shape[0], weight.shape[1] * 2)
-    s = mx.repeat(scale_to_float(scale), bs, axis=-1)
-    return (unpacked * s).astype(mx.bfloat16)
-
-
-def _dsv4_fp4_native(args: "ModelArgs") -> bool:
-    """Return True iff the model config indicates DSV4's native FP4 routed-expert
-    quantization — i.e. ``quantization_config = {"quant_method": "fp8",
-    "fmt": "e4m3", "scale_fmt": "ue8m0", ...}``. In that layout, routed experts
-    ship as FP4-packed uint8 (E2M1 codes) with per-32-col E8M0 scales, which maps
-    losslessly onto MLX's ``mxfp4`` quantized format — so we can avoid dequanting
-    them to bf16 at load time.
-    """
-    qc = args.quantization_config or {}
-    return (
-        qc.get("quant_method") == "fp8"
-        and qc.get("fmt") == "e4m3"
-        and qc.get("scale_fmt") == "ue8m0"
-    )
-
-
-class QuantizedSwitchGLU(nn.Module):
-    """SwitchGLU whose projections are :class:`QuantizedSwitchLinear`. Mirrors
-    ``switch_layers.SwitchGLU`` exactly in call semantics; different only in
-    its parameter tree (weights/scales/biases instead of dense weights).
-    """
-
-    def __init__(
-        self,
-        input_dims: int,
-        hidden_dims: int,
-        num_experts: int,
-        *,
-        mode: str = "mxfp4",
-        bits: int = 4,
-        group_size: int = 32,
-        activation=None,
-    ):
-        super().__init__()
-        self.activation = activation or SwiGLU()
-        kw = dict(
-            bias=False, mode=mode, bits=bits, group_size=group_size
-        )
-        self.gate_proj = QuantizedSwitchLinear(input_dims, hidden_dims, num_experts, **kw)
-        self.up_proj = QuantizedSwitchLinear(input_dims, hidden_dims, num_experts, **kw)
-        self.down_proj = QuantizedSwitchLinear(hidden_dims, input_dims, num_experts, **kw)
-
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
-        idx = indices
-        inv_order = None
-        if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(
-            self.activation(x_up, x_gate), idx, sorted_indices=do_sort
-        )
-        if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
-        return x.squeeze(-2)
-
-
 class DeepseekV4MoE(nn.Module):
     def __init__(self, args: ModelArgs, layer_id: int):
         super().__init__()
         self.num_experts_per_tok = args.num_experts_per_tok
-        if _dsv4_fp4_native(args):
-            # Native DSV4 FP4 experts: build the MoE with pre-quantized
-            # (mxfp4) SwitchLinear tensors so sanitize() can hand them
-            # the raw packed bytes directly with no bf16 intermediate.
-            self.switch_mlp = QuantizedSwitchGLU(
-                args.hidden_size,
-                args.moe_intermediate_size,
-                args.n_routed_experts,
-                mode="mxfp4",
-                bits=4,
-                group_size=32,
-            )
-        else:
-            self.switch_mlp = SwitchGLU(
-                args.hidden_size,
-                args.moe_intermediate_size,
-                args.n_routed_experts,
+        # Routed experts ship as FP4 (E2M1) with E8M0 per-32 scales — a 1:1
+        # match for MLX's mxfp4. Build a dense SwitchGLU and immediately
+        # quantize its three projections in-place; no bf16 intermediate.
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size, args.moe_intermediate_size, args.n_routed_experts
+        )
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            sub = getattr(self.switch_mlp, name)
+            setattr(
+                self.switch_mlp,
+                name,
+                sub.to_quantized(group_size=32, bits=4, mode="mxfp4"),
             )
         self.gate = MoEGate(args, layer_id)
         if args.n_shared_experts:
@@ -1374,19 +1193,15 @@ class Model(nn.Module):
         for layer in self.layers:
             r = layer.attn.compress_ratio
             if r == 0:
-                caches.append(
-                    RotatingKVCache(max_size=self.args.sliding_window)
-                )
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
             else:
-                caches.append(
-                    DeepseekV4Cache(
-                        window=self.args.sliding_window,
-                        ratio=r,
-                        head_dim=self.args.head_dim,
-                        has_indexer=(r == 4),
-                        index_head_dim=self.args.index_head_dim,
-                    )
-                )
+                # Compose the compressed-attention layer's state from existing
+                # cache primitives: a RotatingKVCache for the sliding window
+                # (offset tracking, trim, ring-buffer memory) plus a 6-slot
+                # ArraysCache for the Compressor/Indexer buffers.
+                win = RotatingKVCache(max_size=self.args.sliding_window)
+                state = ArraysCache(6)
+                caches.append(CacheList(win, state))
         return caches
 
     # --------------------------------------------------------------------- #
@@ -1444,15 +1259,12 @@ class Model(nn.Module):
             return w[:m, :n].astype(mx.bfloat16)
 
         # 2) Handle each `.scale` sibling entry:
-        #    - Routed-expert FP4 packed weights (uint8 [out, in//2]) + E8M0 scale
-        #      (uint8 [out, in//32]) → *reinterpret* as MLX's mxfp4 layout
-        #      (uint32 [out, in//8] + uint8 scale). No dequant; no bf16
-        #      intermediate. DSV4 Flash's ~138 GB of experts stays ~138 GB in
-        #      memory.
-        #    - FP8 weights (uint8 [M, N]) + E8M0 128x128 block scale → bf16
-        #      dequant (same as DSV3.2). Only a few GB of non-expert weights
-        #      hit this path.
-        native_experts = _dsv4_fp4_native(self.args)
+        #    - Routed-expert FP4 (uint8 [out, in//2]) + E8M0 (uint8 [out, in//32])
+        #      → reinterpret as MLX mxfp4 (uint32 [out, in//8] + uint8 scale).
+        #      The bit layout matches: element 2i in low nibble, 2i+1 in high;
+        #      MLX's mxfp4 packs 8 fp4 values per uint32 in little-endian, so a
+        #      run of 4 uint8 bytes reads as the right uint32. No allocation.
+        #    - FP8 (uint8 [M, N]) + E8M0 128x128 block scale → bf16 dequant.
         dequanted = {}
         for k, v in weights.items():
             if not k.endswith(".scale"):
@@ -1470,28 +1282,12 @@ class Model(nn.Module):
                 and weight.dtype in (mx.int8, mx.uint8)
                 and v.shape[-1] * 16 == weight.shape[-1]
             )
-            if is_routed_expert and native_experts:
-                # Reinterpret FP4 bytes as mxfp4 packed uint32. The bit layout
-                # matches: DSV4 stores element 2i in low nibble, 2i+1 in high;
-                # MLX mxfp4 packs 8 consecutive fp4 elements into one uint32
-                # little-endian. So 4 consecutive bytes == 1 uint32 with the
-                # same per-nibble ordering.
+            if is_routed_expert:
                 packed = weight.astype(mx.uint8)
-                if packed.shape[-1] % 4 != 0:
-                    raise ValueError(
-                        f"Expected FP4 packed last-dim divisible by 4, got shape "
-                        f"{packed.shape} for {wk}"
-                    )
-                uint32_weight = packed.view(mx.uint32).reshape(
+                dequanted[wk] = packed.view(mx.uint32).reshape(
                     packed.shape[0], packed.shape[-1] // 4
                 )
-                # E8M0 scale is already uint8 with the exact shape MLX wants.
-                dequanted[wk] = uint32_weight
                 dequanted[k] = v.astype(mx.uint8)
-            elif is_routed_expert:
-                # Non-native path (e.g. someone re-quantizing): fall back to
-                # dense bf16 dequant via the old table-lookup route.
-                dequanted[wk] = _dequant_fp4_to_bf16(weight, v, _scale_to_float)
             elif weight.dtype in (mx.uint8,):
                 dequanted[wk] = dequant_fp8_block(weight, v)
             else:
@@ -1527,11 +1323,7 @@ class Model(nn.Module):
             remapped[nk] = v
         weights = remapped
 
-        # 4) Stack routed experts into SwitchGLU layout. When the MoE's
-        #    switch_mlp is QuantizedSwitchLinear-backed (native FP4 path),
-        #    stack both ``.weight`` (uint32) AND ``.scales`` (uint8). Otherwise
-        #    stack only ``.weight`` (dense bf16).
-        stack_scales = native_experts
+        # 4) Stack per-expert {weight, scales} into the SwitchGLU layout.
         for l in range(n_layers):
             prefix = f"model.layers.{l}.ffn.experts"
             for src, dst in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
@@ -1544,15 +1336,14 @@ class Model(nn.Module):
                     weights[f"model.layers.{l}.ffn.switch_mlp.{dst}.weight"] = (
                         mx.stack(stack)
                     )
-                if stack_scales:
-                    skey0 = f"{prefix}.0.{src}.scale"
-                    if skey0 in weights:
-                        sstack = [
-                            weights.pop(f"{prefix}.{e}.{src}.scale")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[
-                            f"model.layers.{l}.ffn.switch_mlp.{dst}.scales"
-                        ] = mx.stack(sstack)
+                skey0 = f"{prefix}.0.{src}.scale"
+                if skey0 in weights:
+                    sstack = [
+                        weights.pop(f"{prefix}.{e}.{src}.scale")
+                        for e in range(self.args.n_routed_experts)
+                    ]
+                    weights[
+                        f"model.layers.{l}.ffn.switch_mlp.{dst}.scales"
+                    ] = mx.stack(sstack)
 
         return weights

@@ -1464,21 +1464,21 @@ class TestModels(unittest.TestCase):
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",
             vocab_size=64,
-            hidden_size=32,
+            hidden_size=64,
             num_hidden_layers=4,
             num_attention_heads=4,
             num_key_value_heads=1,
-            q_lora_rank=16,
-            o_lora_rank=16,
+            q_lora_rank=32,
+            o_lora_rank=32,
             o_groups=2,
-            head_dim=16,
+            head_dim=32,
             qk_rope_head_dim=8,
             sliding_window=8,
             compress_ratios=[0, 0, 4, 0],
             index_n_heads=4,
-            index_head_dim=16,
+            index_head_dim=32,
             index_topk=4,
-            moe_intermediate_size=32,
+            moe_intermediate_size=64,
             n_routed_experts=4,
             n_shared_experts=1,
             num_experts_per_tok=2,
@@ -1499,9 +1499,12 @@ class TestModels(unittest.TestCase):
         self.assertEqual(model.model_type, args.model_type)
 
         caches = model.make_cache()
+        from mlx_lm.models.cache import ArraysCache, CacheList
         self.assertIsInstance(caches[0], RotatingKVCache)
         self.assertIsInstance(caches[1], RotatingKVCache)
-        self.assertIsInstance(caches[2], deepseek_v4.DeepseekV4Cache)
+        self.assertIsInstance(caches[2], CacheList)
+        self.assertIsInstance(caches[2].caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[2].caches[1], ArraysCache)
         self.assertIsInstance(caches[3], RotatingKVCache)
 
         # Prefill-only path (no cache)
@@ -1523,21 +1526,21 @@ class TestModels(unittest.TestCase):
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",
             vocab_size=8,
-            hidden_size=8,
+            hidden_size=64,
             num_hidden_layers=1,
             num_attention_heads=2,
             num_key_value_heads=1,
-            q_lora_rank=4,
-            o_lora_rank=4,
+            q_lora_rank=32,
+            o_lora_rank=32,
             o_groups=1,
-            head_dim=4,
-            qk_rope_head_dim=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
             sliding_window=4,
             compress_ratios=[0],
             index_n_heads=2,
-            index_head_dim=4,
+            index_head_dim=32,
             index_topk=2,
-            moe_intermediate_size=8,
+            moe_intermediate_size=32,
             n_routed_experts=4,
             n_shared_experts=1,
             num_experts_per_tok=2,
