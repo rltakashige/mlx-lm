@@ -409,9 +409,12 @@ class HyperConnection(nn.Module):
         # x: [B, S, hc, D]  ->  (y [B, S, D], post [B, S, hc], comb [B, S, hc, hc])
         B, S, hc, D = x.shape
         dtype = x.dtype
-        xf = x.reshape(B, S, hc * D).astype(mx.float32)
-        inv = mx.rsqrt(xf.square().mean(axis=-1, keepdims=True) + self.norm_eps)
-        mixes = (xf @ self.fn.T) * inv
+        # fast.rms_norm is a fused kernel; normalizing before the matmul is
+        # equivalent to (xf @ fn.T) * rsqrt(...) since the scale is scalar/row.
+        xf = mx.fast.rms_norm(
+            x.reshape(B, S, hc * D).astype(mx.float32), None, self.norm_eps
+        )
+        mixes = xf @ self.fn.T
         pre, post, comb = hc_split_sinkhorn(
             mixes, self.scale, self.base, hc, self.sinkhorn_iters, self._eps_arr
         )
@@ -452,9 +455,10 @@ class HyperHead(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         B, S, hc, D = x.shape
         dtype = x.dtype
-        xf = x.reshape(B, S, hc * D).astype(mx.float32)
-        inv = mx.rsqrt(xf.square().mean(axis=-1, keepdims=True) + self.norm_eps)
-        mixes = (xf @ self.fn.T) * inv
+        xf = mx.fast.rms_norm(
+            x.reshape(B, S, hc * D).astype(mx.float32), None, self.norm_eps
+        )
+        mixes = xf @ self.fn.T
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(dtype)
 
@@ -1007,7 +1011,7 @@ class V4Attention(nn.Module):
         # Q
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = q * mx.rsqrt(q.square().mean(axis=-1, keepdims=True) + self.eps)
+        q = mx.fast.rms_norm(q, None, self.eps)
 
         # single-head KV (MQA with num_kv_heads=1)
         kv = self.kv_norm(self.wkv(x))  # [B, S, head_dim]
@@ -1105,16 +1109,10 @@ class V4Attention(nn.Module):
         # returns only valid indices (no -1 padding), so no compressed mask
         # either.
         if S == 1:
-            if use_gather:
-                mask = None
-            elif compressed_len > 0:
-                comp_mask = _compressed_visibility(
-                    B, S, offset, compressed_len, self.compress_ratio
-                )
-                win_fill = mx.ones((B, 1, 1, window_len), dtype=mx.bool_)
-                mask = mx.concatenate([win_fill, comp_mask], axis=-1)
-            else:
-                mask = None
+            # Pool rows are emitted only after a full window of raw tokens
+            # has been processed, so at any decode step every pool row is in
+            # the past — no compressed-visibility mask needed.
+            mask = None
         else:
             win_mask = _build_window_mask(B, S, offset, self.window, window_len)
             if compressed_len > 0:
