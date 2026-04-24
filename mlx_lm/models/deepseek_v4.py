@@ -1248,6 +1248,83 @@ class V4Attention(nn.Module):
 # --------------------------------------------------------------------------- #
 
 
+def _make_moe_gate_kernel():
+    """Fused MoE gate post-matmul kernel. Takes pre-matmul ``scores [B,S,N_ROUTED]``
+    (bf16) and ``bias [N_ROUTED]`` (fp32) and returns ``(inds [B,S,TOP_K] int32,
+    weights [B,S,TOP_K] bf16)``. Does sqrtsoftplus + bias-add + top-k partial
+    sort + gather + renormalize in one dispatch.
+
+    Scoped to the ``sqrtsoftplus`` + no-hash case (the common DSV4 path); other
+    score funcs fall back to the multi-op Python path.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+    src = """
+        uint tid = thread_position_in_grid.x;
+        uint total = B * S;
+        if (tid >= total) return;
+
+        auto s_ptr = scores + tid * N_ROUTED;
+        auto i_ptr = inds + tid * TOP_K;
+        auto w_ptr = weights + tid * TOP_K;
+        float rscale = route_scale[0];
+
+        float activated[N_ROUTED];
+        float biased[N_ROUTED];
+
+        for (int i = 0; i < N_ROUTED; ++i) {
+            float v = static_cast<float>(s_ptr[i]);
+            float sp = (v > 20.0f) ? v : metal::fast::log(1.0f + metal::fast::exp(v));
+            activated[i] = metal::sqrt(sp);
+            biased[i] = activated[i] + static_cast<float>(bias[i]);
+        }
+
+        float topk_vals[TOP_K];
+        int topk_idx[TOP_K];
+        for (int k = 0; k < TOP_K; ++k) {
+            topk_vals[k] = -INFINITY;
+            topk_idx[k] = 0;
+        }
+        for (int i = 0; i < N_ROUTED; ++i) {
+            float v = biased[i];
+            int min_pos = 0;
+            float min_val = topk_vals[0];
+            for (int k = 1; k < TOP_K; ++k) {
+                if (topk_vals[k] < min_val) {
+                    min_val = topk_vals[k];
+                    min_pos = k;
+                }
+            }
+            if (v > min_val) {
+                topk_vals[min_pos] = v;
+                topk_idx[min_pos] = i;
+            }
+        }
+
+        float w[TOP_K];
+        float sum = 0.0f;
+        for (int k = 0; k < TOP_K; ++k) {
+            w[k] = activated[topk_idx[k]];
+            sum += w[k];
+        }
+        float scale_factor = rscale / (sum + 1e-20f);
+
+        for (int k = 0; k < TOP_K; ++k) {
+            w_ptr[k] = static_cast<OUT_T>(w[k] * scale_factor);
+            i_ptr[k] = topk_idx[k];
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="dsv4_moe_gate_posmm",
+        input_names=["scores", "bias", "route_scale"],
+        output_names=["inds", "weights"],
+        source=src,
+    )
+
+
+_moe_gate_kernel = _make_moe_gate_kernel()
+
+
 def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "softmax":
         return mx.softmax(scores, axis=-1, precise=True)
@@ -1291,6 +1368,9 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = args.norm_topk_prob
 
         self.weight = mx.zeros((self.n_routed, args.hidden_size))
+        # Pre-allocated route_scale array for the fused kernel (avoids per-call
+        # mx.array allocation on the hot path).
+        self._route_scale_arr = mx.array([args.routed_scaling_factor], dtype=mx.float32)
         if self.hash:
             self.tid2eid = mx.zeros(
                 (args.vocab_size, self.top_k), dtype=mx.int32
@@ -1301,6 +1381,35 @@ class MoEGate(nn.Module):
             )
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
+        if (
+            _moe_gate_kernel is not None
+            and not self.hash
+            and self.score_func == "sqrtsoftplus"
+            and self.norm_topk_prob
+        ):
+            scores_bf = x @ self.weight.T
+            B, S, _ = x.shape
+            total = B * S
+            tg = 32
+            grid = ((total + tg - 1) // tg) * tg
+            rscale = self._route_scale_arr
+            inds, weights = _moe_gate_kernel(
+                inputs=[scores_bf, self.e_score_correction_bias, rscale],
+                template=[
+                    ("B", B),
+                    ("S", S),
+                    ("N_ROUTED", self.n_routed),
+                    ("TOP_K", self.top_k),
+                    ("OUT_T", x.dtype),
+                ],
+                grid=(grid, 1, 1),
+                threadgroup=(tg, 1, 1),
+                output_shapes=[(B, S, self.top_k), (B, S, self.top_k)],
+                output_dtypes=[mx.int32, x.dtype],
+            )
+            return inds, weights
+
+        # Fallback: general path (hash-routed layers, or non-sqrtsoftplus configs).
         scores = x.astype(mx.float32) @ self.weight.T.astype(mx.float32)
         scores = _score_func(scores, self.score_func)
         orig = scores
