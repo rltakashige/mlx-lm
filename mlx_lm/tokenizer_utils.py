@@ -624,6 +624,25 @@ def load(
             raise
         from transformers import PretrainedConfig
 
+        stub_kwargs: Dict[str, Any] = {}
+        model_config_file = model_path / "config.json"
+        if model_config_file.exists():
+            try:
+                with open(model_config_file, "r") as f:
+                    raw = json.load(f)
+                for key in (
+                    "model_type",
+                    "max_position_embeddings",
+                    "vocab_size",
+                    "bos_token_id",
+                    "eos_token_id",
+                    "pad_token_id",
+                ):
+                    if key in raw:
+                        stub_kwargs[key] = raw[key]
+            except (OSError, JSONDecodeError):
+                pass
+
         warnings.warn(
             "Falling back to a generic tokenizer because Transformers does "
             f"not recognize this model config yet: {e}",
@@ -632,7 +651,7 @@ def load(
         )
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            config=PretrainedConfig(),
+            config=PretrainedConfig(**stub_kwargs),
             **tokenizer_config_extra,
         )
 

@@ -10,6 +10,24 @@ from .cache import _BaseCache, RotatingKVCache
 from .switch_layers import QuantizedSwitchLinear, SwiGLU, SwitchGLU, _gather_sort, _scatter_unsort
 
 
+# Register a minimal HF config so AutoConfig / AutoTokenizer recognize
+# ``deepseek_v4`` until huggingface/transformers#45616 merges. Once that PR
+# ships, this registration becomes a no-op (``exist_ok=True``).
+try:
+    from transformers import AutoConfig, PretrainedConfig
+
+    class _DeepseekV4HFConfig(PretrainedConfig):
+        model_type = "deepseek_v4"
+
+        def __init__(self, rope_scaling=None, **kwargs):
+            self.rope_scaling = rope_scaling
+            super().__init__(**kwargs)
+
+    AutoConfig.register("deepseek_v4", _DeepseekV4HFConfig, exist_ok=True)
+except ImportError:
+    pass
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v4"
@@ -334,17 +352,27 @@ class DeepseekV4Cache(_BaseCache):
             self.idx_score_state: Optional[mx.array] = None
 
     # ------------------------------------------------------------------ #
-    # window KV (ring buffer, stored in temporal order after fetch)       #
+    # window KV                                                           #
     # ------------------------------------------------------------------ #
-    def update_window(self, kv: mx.array) -> mx.array:
-        # kv: [B, S, D] — the raw post-RoPE single-head KV.
+    def prefill_window(self, kv: mx.array) -> mx.array:
+        """Prefill path: attend over the full raw KV. Persist the tail so the
+        next decode step has the right sliding-window context."""
+        self.window_kv = (
+            kv[:, -self.window :, :] if kv.shape[1] > self.window else kv
+        )
+        return kv
+
+    def decode_window(self, kv: mx.array) -> mx.array:
+        """Decode path: extend the stored window with ``kv`` and trim to
+        ``window``. Returns the updated window for attention."""
         if self.window_kv is None:
-            self.window_kv = kv
+            merged = kv
         else:
-            self.window_kv = mx.concatenate([self.window_kv, kv], axis=1)
-        if self.window_kv.shape[1] > self.window:
-            self.window_kv = self.window_kv[:, -self.window :, :]
-        return self.window_kv
+            merged = mx.concatenate([self.window_kv, kv], axis=1)
+        if merged.shape[1] > self.window:
+            merged = merged[:, -self.window :, :]
+        self.window_kv = merged
+        return merged
 
     # ------------------------------------------------------------------ #
     # compressed KV                                                       #
@@ -738,38 +766,21 @@ class Indexer(nn.Module):
 def _get_window_topk_idxs(
     window: int, B: int, S: int, offset: int, window_cache_len: int
 ) -> mx.array:
-    """Return ``[B, S, window]`` of indices into the attention's combined KV
-    (window rows 0..window_cache_len-1, then compressed rows offset by
-    window_cache_len). ``-1`` means masked.
+    """Return ``[B, S, window]`` of indices into the window portion of ``kv_all``.
 
-    Layout of window cache after ``update_window``: earliest-first, of length
-    ``min(offset + S, window)``. So for a query at raw-position ``offset+i``,
-    the visible window tokens are the cache rows whose raw-position ``p``
-    satisfies ``max(0, offset+i - window + 1) <= p <= offset+i``.
+    Cache layout: entries ``[0..window_cache_len-1]`` are the last
+    ``window_cache_len`` raw tokens in temporal order, ending at raw position
+    ``offset + S - 1``. For query ``s`` (raw pos ``offset + s``), the valid
+    sliding window is the `window` raw positions ``[offset+s-window+1, offset+s]``.
+    In cache-index space that maps to the range ``[upper-window+1, upper]``
+    where ``upper = s + window_cache_len - S``. Out-of-range slots are ``-1``.
     """
-    # Each cache row k (0..window_cache_len-1) corresponds to raw position
-    # (offset + S) - window_cache_len + k — i.e. the cache is right-aligned
-    # against the latest token.
-    cache_k = mx.arange(window_cache_len, dtype=mx.int32)
-    # raw position at cache index k
-    raw_pos_at_k = (offset + S) - window_cache_len + cache_k  # [window_cache_len]
-
-    # query raw positions
-    q_pos = offset + mx.arange(S, dtype=mx.int32)  # [S]
-    # valid iff raw_pos_at_k in [q_pos - window + 1, q_pos]
-    visible = (raw_pos_at_k[None, :] <= q_pos[:, None]) & (
-        raw_pos_at_k[None, :] >= (q_pos[:, None] - window + 1)
-    )  # [S, window_cache_len]
-
-    # pad to width `window`
-    idxs = mx.where(visible, cache_k[None, :], mx.array(-1, mx.int32))  # [S, wc]
-    if window_cache_len < window:
-        pad = mx.full(
-            (S, window - window_cache_len), -1, dtype=mx.int32
-        )
-        idxs = mx.concatenate([idxs, pad], axis=-1)
-    else:
-        idxs = idxs[:, -window:]
+    upper = mx.arange(S, dtype=mx.int32) + (window_cache_len - S)  # [S]
+    col_offsets = mx.arange(window, dtype=mx.int32) - (window - 1)  # [-W+1, ..., 0]
+    idxs = upper[:, None] + col_offsets[None, :]  # [S, window]
+    neg_one = mx.array(-1, mx.int32)
+    idxs = mx.where(idxs < 0, neg_one, idxs)
+    idxs = mx.where(idxs >= window_cache_len, neg_one, idxs)
     return mx.broadcast_to(idxs[None, ...], (B, S, window))
 
 
@@ -965,10 +976,10 @@ class V4Attention(nn.Module):
         kv_pe = self.rope(kv_pe.reshape(B, 1, S, rd), offset=offset).reshape(B, S, rd)
         kv = mx.concatenate([kv_nope, kv_pe], axis=-1)  # [B, S, D]
 
+        is_prefill = offset == 0
+
         if self.compress_ratio:
             if cache is None:
-                # No cache: build a fresh one just for this call. Equivalent
-                # to prefill without persistence.
                 cache = DeepseekV4Cache(
                     window=self.window,
                     ratio=self.compress_ratio,
@@ -976,22 +987,24 @@ class V4Attention(nn.Module):
                     has_indexer=(self.compress_ratio == 4),
                     index_head_dim=self.args.index_head_dim,
                 )
-            window_kv = cache.update_window(kv)  # [B, wL, D]
-            _ = self.compressor(x, cache, offset)  # appended into cache
+            if is_prefill:
+                window_kv = cache.prefill_window(kv)
+            else:
+                window_kv = cache.decode_window(kv)
+            _ = self.compressor(x, cache, offset)
 
             window_len = window_kv.shape[1]
             compressed = cache.compressed_kv
             compressed_len = 0 if compressed is None else compressed.shape[1]
-
-            if compressed_len > 0:
-                kv_all = mx.concatenate([window_kv, compressed], axis=1)
-            else:
-                kv_all = window_kv
+            kv_all = (
+                mx.concatenate([window_kv, compressed], axis=1)
+                if compressed_len > 0
+                else window_kv
+            )
 
             win_idxs = _get_window_topk_idxs(
                 self.window, B, S, offset, window_len
             )
-
             if self.compress_ratio == 4:
                 compress_idxs = self.indexer(x, qr, cache, offset)
                 compress_idxs = mx.where(
@@ -1011,13 +1024,19 @@ class V4Attention(nn.Module):
             topk_idxs = mx.concatenate([win_idxs, compress_idxs], axis=-1)
             cache.offset = cache.offset + S
         else:
-            # Pure sliding window. Reshape to [B, 1, S, D] for RotatingKVCache.
+            # Pure sliding window. During prefill, attend over the full raw kv
+            # and only persist the last ``window`` tokens for future decode.
             k = kv[:, None, :, :]
-            if cache is not None:
-                k, _v = cache.update_and_fetch(k, k)
-                kv_all = k.squeeze(1)
-            else:
+            if is_prefill:
+                if cache is not None:
+                    _ = cache.update_and_fetch(k, k)
                 kv_all = kv
+            else:
+                if cache is not None:
+                    k, _ = cache.update_and_fetch(k, k)
+                    kv_all = k.squeeze(1)
+                else:
+                    kv_all = kv
             window_len = kv_all.shape[1]
             topk_idxs = _get_window_topk_idxs(
                 self.window, B, S, offset, window_len
