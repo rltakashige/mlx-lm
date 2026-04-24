@@ -70,6 +70,7 @@ def mixed_quant_predicate_builder(
             for s in (
                 "wq_a",
                 "wq_b",
+                "wqkv_a",
                 "wkv",
                 "wo_a",
                 "wo_b",

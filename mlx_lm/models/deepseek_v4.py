@@ -487,8 +487,10 @@ class Compressor(nn.Module):
         self.overlap = compress_ratio == 4
         coff = 2 if self.overlap else 1
         self._coff = coff
-        self.wkv = nn.Linear(dim, coff * head_dim, bias=False)
-        self.wgate = nn.Linear(dim, coff * head_dim, bias=False)
+        # Fused wkv + wgate — same input x, concat output dims. Sanitize
+        # concats the two weight tensors along axis=0 at load time.
+        self._wkv_gate_split = coff * head_dim
+        self.wkv_gate = nn.Linear(dim, 2 * coff * head_dim, bias=False)
         self.ape = mx.zeros((compress_ratio, coff * head_dim), dtype=mx.float32)
         self.norm = nn.RMSNorm(head_dim, eps=rms_norm_eps)
         self.rope = rope  # shared with attention, applies compress_rope_theta + YaRN
@@ -552,11 +554,10 @@ class Compressor(nn.Module):
           slot_compressed:  [B, n_emitted, d]    — growing pool of compressed rows
         """
         B, S, _ = x.shape
-        # Run wkv/wgate in input dtype (bf16); promote only for softmax (below).
-        # Casting x to fp32 before the projections doubles weight-read BW and
-        # is the decode-bound cost — PR #1192 avoids it.
-        kv = self.wkv(x)     # [B, S, coff_d] == [B, S, d] for non-overlap
-        score = self.wgate(x)
+        # Single fused matmul, split into kv/score halves.
+        kv_gate = self.wkv_gate(x)
+        kv = kv_gate[..., : self._wkv_gate_split]
+        score = kv_gate[..., self._wkv_gate_split :]
         ratio = self.compress_ratio
         d = self.head_dim
 
@@ -614,9 +615,10 @@ class Compressor(nn.Module):
             )
 
         B, S, _ = x.shape
-        # Run wkv/wgate in input dtype — fp32 here doubles weight BW (decode-bound).
-        kv = self.wkv(x)
-        score = self.wgate(x)
+        # Single fused matmul, split into kv/score halves.
+        kv_gate = self.wkv_gate(x)
+        kv = kv_gate[..., : self._wkv_gate_split]
+        score = kv_gate[..., self._wkv_gate_split :]
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
@@ -909,11 +911,14 @@ class V4Attention(nn.Module):
         ratios = args.compress_ratios or []
         self.compress_ratio = ratios[layer_id] if layer_id < len(ratios) else 0
 
-        self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=args.attention_bias)
+        # Fused wq_a + wkv: single matmul on the hidden state, split the output
+        # into the q_a and kv halves. Saves one dispatch + one x read per layer.
+        # Sanitize concats the two checkpoint tensors along axis=0 at load time.
+        self.wqkv_a = nn.Linear(
+            self.dim, self.q_lora_rank + self.head_dim, bias=False
+        )
         self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=self.eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
-
-        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=self.eps)
 
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
@@ -991,12 +996,13 @@ class V4Attention(nn.Module):
         rd = self.rope_head_dim
 
         # Q
-        qr = self.q_norm(self.wq_a(x))
+        qkv_a = self.wqkv_a(x)
+        qr = self.q_norm(qkv_a[..., : self.q_lora_rank])
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         q = mx.fast.rms_norm(q, None, self.eps)
 
         # single-head KV (MQA with num_kv_heads=1)
-        kv = self.kv_norm(self.wkv(x))  # [B, S, head_dim]
+        kv = self.kv_norm(qkv_a[..., self.q_lora_rank :])  # [B, S, head_dim]
 
         # Compressed-attention layers carry CacheList(RotatingKVCache, ArraysCache(6)).
         # Pure sliding-window layers carry a plain RotatingKVCache.
@@ -1508,6 +1514,23 @@ class Model(nn.Module):
                 nk = nk.replace(f".shared_experts.{wo}.", f".shared_experts.{wn}.")
             remapped[nk] = v
         weights = remapped
+
+        # 3b) Fuse wq_a + wkv → wqkv_a, and Compressor wkv + wgate → wkv_gate.
+        # The model only declares the fused Linear, so the two checkpoint
+        # tensors must be concatenated along the output dim at load time.
+        def _fuse_pair(keys, out_key):
+            for sfx in ("weight", "scales", "biases"):
+                parts = [f"{k}.{sfx}" for k in keys]
+                if all(p in weights for p in parts):
+                    weights[f"{out_key}.{sfx}"] = mx.concatenate(
+                        [weights.pop(p) for p in parts], axis=0
+                    )
+
+        for l in range(n_layers):
+            attn = f"model.layers.{l}.attn"
+            _fuse_pair([f"{attn}.wq_a", f"{attn}.wkv"], f"{attn}.wqkv_a")
+            for parent in (f"{attn}.compressor", f"{attn}.indexer.compressor"):
+                _fuse_pair([f"{parent}.wkv", f"{parent}.wgate"], f"{parent}.wkv_gate")
 
         # 4) Stack per-expert {weight, scales} into the SwitchGLU layout.
         for l in range(n_layers):

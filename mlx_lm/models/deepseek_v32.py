@@ -83,23 +83,30 @@ class Indexer(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any] = None,
     ):
-        # Computes top_k indices for attention
+        # Computes top_k indices for attention.
+        # K-side first — needed for the cache update even if we short-circuit.
+        # Q-side (wq_b matmul + rope) is deferred past the index_topk check:
+        # for sequences shorter than index_topk we return None without ever
+        # computing q. On DeepSeek-V3.2-Exp this skips ~25 MB of wq_b weight
+        # reads per attention layer per decode step when the sequence hasn't
+        # yet crossed the index_topk threshold.
         b, s, _ = x.shape
-        q = self.wq_b(qr)
-        q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
+        offset = cache.offset if cache is not None else 0
+
         k = self.wk(x)
         k = self.k_norm(k)
         k = mx.reshape(k, (b, 1, s, self.head_dim))
-
-        offset = cache.offset if cache is not None else 0
-
-        q = self.rope(q, offset=offset)
         k = self.rope(k, offset=offset)
 
         if cache is not None:
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
+
+        q = self.wq_b(qr)
+        q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
+        q = self.rope(q, offset=offset)
+
         scores = q @ k.swapaxes(-1, -2)
         scores = mx.maximum(scores, 0)
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
@@ -217,11 +224,15 @@ class DeepseekV32Attention(nn.Module):
                     mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
                     axis=2,
                 )
-                if (
-                    mask is not None
-                    and hasattr(cache[0], "left_padding")
-                    and cache[0].left_padding.max().item() > 0
-                ):
+                # Build the left-padding mask unconditionally when the cache
+                # carries ``left_padding``. The previous implementation branched
+                # on ``left_padding.max().item() > 0`` which forced a GPU→CPU
+                # sync at every attention layer (61 layers → 61 syncs per decode
+                # token), breaking pipeline-parallel overlap on multi-machine
+                # inference. When no sequence has left padding the check
+                # ``gathered_idx >= 0`` is trivially True and SDPA produces the
+                # same output as ``mask=None``.
+                if mask is not None and hasattr(cache[0], "left_padding"):
                     gathered_idx = topk_indices[:, :, 0, :]
                     left_pad = cache[0].left_padding[:, None, None]
                     mask = (gathered_idx >= left_pad)[:, :, None, :]

@@ -1299,6 +1299,13 @@ class GenerationBatch:
         self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.state_machines.extend(batch.state_machines)
+        # _next_logprobs may be stored as either an mx.array (fast path) or
+        # a list (output / pre-first-step). Normalize before concatenating.
+        def _as_array(lp):
+            return lp if isinstance(lp, mx.array) else (
+                mx.stack(lp) if lp else None
+            )
+
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
             self._current_logprobs = batch._current_logprobs
@@ -1306,13 +1313,21 @@ class GenerationBatch:
             self._current_tokens = mx.concatenate(
                 [self._current_tokens, batch._current_tokens]
             )
+            # _current_logprobs is always a list (post-_step output form).
             self._current_logprobs.extend(batch._current_logprobs)
         if self._next_tokens is None:
             self._next_tokens = batch._next_tokens
             self._next_logprobs = batch._next_logprobs
         elif batch._next_tokens is not None:
             self._next_tokens = mx.concatenate([self._next_tokens, batch._next_tokens])
-            self._next_logprobs.extend(batch._next_logprobs)
+            a = _as_array(self._next_logprobs)
+            b = _as_array(batch._next_logprobs)
+            if a is None:
+                self._next_logprobs = b
+            elif b is None:
+                self._next_logprobs = a
+            else:
+                self._next_logprobs = mx.concatenate([a, b], axis=0)
         self._token_context.extend(batch._token_context)
         self._num_tokens.extend(batch._num_tokens)
         self._matcher_states.extend(batch._matcher_states)
@@ -1365,7 +1380,7 @@ class GenerationBatch:
         # Assign the next step to member variables and start computing it
         # asynchronously
         self._next_tokens = sampled
-        self._next_logprobs = list(logprobs)
+        self._next_logprobs = logprobs
         mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
 
         # Eval the current tokens and current logprobs. After that also add
@@ -1375,7 +1390,10 @@ class GenerationBatch:
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)
-        return inputs, self._current_logprobs
+        current_logprobs = self._current_logprobs
+        if isinstance(current_logprobs, mx.array):
+            current_logprobs = list(current_logprobs)
+        return inputs, current_logprobs
 
     def extract_cache(self, idx: int) -> List[Any]:
         return [c.extract(idx) for c in self.prompt_cache]
@@ -1397,7 +1415,12 @@ class GenerationBatch:
         self.state_machines = [self.state_machines[idx] for idx in keep]
 
         self._next_tokens = self._next_tokens[keep] if keep else None
-        self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
+        if isinstance(self._next_logprobs, mx.array):
+            self._next_logprobs = (
+                self._next_logprobs[keep] if keep else None
+            )
+        else:
+            self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matcher_states = [self._matcher_states[idx] for idx in keep]
