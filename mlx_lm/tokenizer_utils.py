@@ -611,9 +611,30 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    tokenizer_config_extra = tokenizer_config_extra or {}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **tokenizer_config_extra
+        )
+    except (AttributeError, ValueError) as e:
+        # Transformers may not recognize brand-new model_types (e.g. deepseek_v4
+        # before a transformers release adds it). Fall back to a generic
+        # tokenizer built from the tokenizer.json in the repo.
+        if "config" in tokenizer_config_extra:
+            raise
+        from transformers import PretrainedConfig
+
+        warnings.warn(
+            "Falling back to a generic tokenizer because Transformers does "
+            f"not recognize this model config yet: {e}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            config=PretrainedConfig(),
+            **tokenizer_config_extra,
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 
