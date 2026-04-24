@@ -182,11 +182,12 @@ class DeepseekV4RoPE(nn.Module):
             theta = pos[:, None] * self.inv_freq[None, :]  # [T, d/2]
             theta = theta.reshape((1,) * (x.ndim - 2) + theta.shape)
 
+        cos = mx.cos(theta)
+        sin = mx.sin(theta)
         if inverse:
-            theta = -theta
-
-        cos = mx.cos(theta).astype(dtype)
-        sin = mx.sin(theta).astype(dtype)
+            sin = -sin
+        cos = cos.astype(dtype)
+        sin = sin.astype(dtype)
 
         rot = x[..., : self.dims].reshape(*x.shape[:-1], self.dims // 2, 2)
         x0, x1 = rot[..., 0], rot[..., 1]
@@ -203,7 +204,7 @@ class DeepseekV4RoPE(nn.Module):
 
 
 @mx.compile
-def hc_split_sinkhorn(
+def _hc_split_sinkhorn_ops(
     mixes: mx.array,
     hc_scale: mx.array,
     hc_base: mx.array,
@@ -211,40 +212,165 @@ def hc_split_sinkhorn(
     iters: int,
     eps: float,
 ):
-    """Reference algorithm (from DeepSeek V4 /inference/kernel.py):
-
-        pre  = sigmoid(mixes[:, :hc]         * scale[0] + base[:hc]) + eps
-        post = 2 * sigmoid(mixes[:, hc:2hc]  * scale[1] + base[hc:2hc])
-        comb = mixes[:, 2hc:].reshape(hc,hc) * scale[2] + base[2hc:].reshape(hc,hc)
-        comb = softmax(comb, axis=-1) + eps
-        comb = comb / (comb.sum(-2) + eps)                 # initial col norm
-        for _ in range(iters - 1):
-            comb = comb / (comb.sum(-1) + eps)             # row norm
-            comb = comb / (comb.sum(-2) + eps)             # col norm
-
-    ``mixes`` has a leading batch shape ``[..., (2+hc)*hc]``; ``pre``/``post``
-    end up ``[..., hc]`` and ``comb`` ``[..., hc, hc]``.
+    """Compiled-op fallback used when the Metal kernel is unavailable (CPU, or
+    odd hc_mult). ``mixes`` has shape ``[..., (2+hc)*hc]``; returns
+    ``pre [..., hc]``, ``post [..., hc]``, ``comb [..., hc, hc]``.
     """
-    s0 = hc_scale[0]
-    s1 = hc_scale[1]
-    s2 = hc_scale[2]
+    mixes = mixes.astype(mx.float32)
+    hc_scale = hc_scale.astype(mx.float32)
+    hc_base = hc_base.astype(mx.float32)
+    s0, s1, s2 = hc_scale[0], hc_scale[1], hc_scale[2]
 
     pre = mx.sigmoid(mixes[..., :hc_mult] * s0 + hc_base[:hc_mult]) + eps
     post = 2 * mx.sigmoid(
         mixes[..., hc_mult : 2 * hc_mult] * s1 + hc_base[hc_mult : 2 * hc_mult]
     )
-
-    comb_logits = mixes[..., 2 * hc_mult :].reshape(
+    comb = mixes[..., 2 * hc_mult :].reshape(
         *mixes.shape[:-1], hc_mult, hc_mult
     ) * s2 + hc_base[2 * hc_mult :].reshape(hc_mult, hc_mult)
-
-    comb = mx.softmax(comb_logits, axis=-1, precise=True) + eps
+    comb = mx.softmax(comb, axis=-1, precise=True) + eps
     comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
-    for _ in range(iters - 1):
+    for _ in range(max(iters - 1, 0)):
         comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
         comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
-
     return pre, post, comb
+
+
+def _make_hc_split_sinkhorn_kernel():
+    # Single Metal kernel doing sigmoid+softmax+N Sinkhorn iters in registers.
+    # Unrolls on HC and ITERS as template params, so each layer's HC call is
+    # one dispatch instead of ~40 from the compiled-op path.
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint idx = thread_position_in_grid.x;
+        constexpr int MIX = (2 + HC) * HC;
+        float epsv = static_cast<float>(eps[0]);
+
+        auto mix = mixes + idx * MIX;
+        auto pre_out = pre + idx * HC;
+        auto post_out = post + idx * HC;
+        auto comb_out = comb + idx * HC * HC;
+
+        float pre_scale = static_cast<float>(scale[0]);
+        float post_scale = static_cast<float>(scale[1]);
+        float comb_scale = static_cast<float>(scale[2]);
+
+        for (int i = 0; i < HC; ++i) {
+            float z = static_cast<float>(mix[i]) * pre_scale
+                + static_cast<float>(base[i]);
+            pre_out[i] = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
+        }
+        for (int i = 0; i < HC; ++i) {
+            int off = HC + i;
+            float z = static_cast<float>(mix[off]) * post_scale
+                + static_cast<float>(base[off]);
+            post_out[i] = 2.0f / (1.0f + metal::fast::exp(-z));
+        }
+
+        float c[HC * HC];
+        for (int i = 0; i < HC; ++i) {
+            float row_max = -INFINITY;
+            for (int j = 0; j < HC; ++j) {
+                int cidx = i * HC + j;
+                int off = 2 * HC + cidx;
+                float v = static_cast<float>(mix[off]) * comb_scale
+                    + static_cast<float>(base[off]);
+                c[cidx] = v;
+                row_max = metal::max(row_max, v);
+            }
+            float row_sum = 0.0f;
+            for (int j = 0; j < HC; ++j) {
+                int cidx = i * HC + j;
+                float v = metal::fast::exp(c[cidx] - row_max);
+                c[cidx] = v;
+                row_sum += v;
+            }
+            float inv_sum = 1.0f / row_sum;
+            for (int j = 0; j < HC; ++j) {
+                int cidx = i * HC + j;
+                c[cidx] = c[cidx] * inv_sum + epsv;
+            }
+        }
+        for (int j = 0; j < HC; ++j) {
+            float col_sum = 0.0f;
+            for (int i = 0; i < HC; ++i) {
+                col_sum += c[i * HC + j];
+            }
+            float inv_denom = 1.0f / (col_sum + epsv);
+            for (int i = 0; i < HC; ++i) {
+                c[i * HC + j] *= inv_denom;
+            }
+        }
+        for (int iter = 1; iter < ITERS; ++iter) {
+            for (int i = 0; i < HC; ++i) {
+                float row_sum = 0.0f;
+                for (int j = 0; j < HC; ++j) {
+                    row_sum += c[i * HC + j];
+                }
+                float inv_denom = 1.0f / (row_sum + epsv);
+                for (int j = 0; j < HC; ++j) {
+                    c[i * HC + j] *= inv_denom;
+                }
+            }
+            for (int j = 0; j < HC; ++j) {
+                float col_sum = 0.0f;
+                for (int i = 0; i < HC; ++i) {
+                    col_sum += c[i * HC + j];
+                }
+                float inv_denom = 1.0f / (col_sum + epsv);
+                for (int i = 0; i < HC; ++i) {
+                    c[i * HC + j] *= inv_denom;
+                }
+            }
+        }
+        for (int i = 0; i < HC * HC; ++i) {
+            comb_out[i] = c[i];
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="deepseek_v4_hc_split_sinkhorn",
+        input_names=["mixes", "scale", "base", "eps"],
+        output_names=["pre", "post", "comb"],
+        source=source,
+    )
+
+
+_hc_split_sinkhorn_kernel = _make_hc_split_sinkhorn_kernel()
+
+
+def hc_split_sinkhorn(
+    mixes: mx.array,
+    hc_scale: mx.array,
+    hc_base: mx.array,
+    hc_mult: int,
+    iters: int,
+    eps,
+):
+    """Dispatch to the Metal kernel if available, else the compiled-op fallback.
+
+    ``mixes`` has shape ``[..., (2+hc)*hc]``; returns ``pre [..., hc]``,
+    ``post [..., hc]``, ``comb [..., hc, hc]``.
+    """
+    if _hc_split_sinkhorn_kernel is None:
+        eps_val = eps.item() if isinstance(eps, mx.array) else float(eps)
+        return _hc_split_sinkhorn_ops(
+            mixes, hc_scale, hc_base, hc_mult, iters, eps_val
+        )
+    eps_arr = eps if isinstance(eps, mx.array) else mx.array([eps], dtype=mx.float32)
+    return _hc_split_sinkhorn_kernel(
+        inputs=[mixes, hc_scale, hc_base, eps_arr],
+        template=[("HC", hc_mult), ("ITERS", iters)],
+        grid=(mixes.size // ((2 + hc_mult) * hc_mult), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[
+            (*mixes.shape[:-1], hc_mult),
+            (*mixes.shape[:-1], hc_mult),
+            (*mixes.shape[:-1], hc_mult, hc_mult),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
 
 
 class HyperConnection(nn.Module):
@@ -276,6 +402,8 @@ class HyperConnection(nn.Module):
         self.fn = mx.zeros((mix_hc, hc_dim), dtype=mx.float32)
         self.base = mx.zeros((mix_hc,), dtype=mx.float32)
         self.scale = mx.zeros((3,), dtype=mx.float32)
+        # Cache so the kernel launch doesn't allocate a new mx.array each call.
+        self._eps_arr = mx.array([hc_eps], dtype=mx.float32)
 
     def hc_pre(self, x: mx.array):
         # x: [B, S, hc, D]  ->  (y [B, S, D], post [B, S, hc], comb [B, S, hc, hc])
@@ -285,7 +413,7 @@ class HyperConnection(nn.Module):
         inv = mx.rsqrt(xf.square().mean(axis=-1, keepdims=True) + self.norm_eps)
         mixes = (xf @ self.fn.T) * inv
         pre, post, comb = hc_split_sinkhorn(
-            mixes, self.scale, self.base, hc, self.sinkhorn_iters, self.hc_eps
+            mixes, self.scale, self.base, hc, self.sinkhorn_iters, self._eps_arr
         )
         y = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)
         return y.astype(dtype), post, comb
@@ -302,13 +430,9 @@ class HyperConnection(nn.Module):
         # post     [B, S, hc]      -> broadcast to [B, S, hc, D]
         # comb     [B, S, hc, hc]
         dtype = f_out.dtype
-        term_new = post[..., None] * f_out[:, :, None, :].astype(mx.float32)
-        term_res = mx.einsum(
-            "bsij,bsjd->bsid",
-            comb.astype(mx.float32),
-            residual.astype(mx.float32),
-        )
-        return (term_new + term_res).astype(dtype)
+        y = post[..., None] * f_out[:, :, None, :].astype(mx.float32)
+        y = y + mx.matmul(comb.astype(mx.float32), residual.astype(mx.float32))
+        return y.astype(dtype)
 
 
 class HyperHead(nn.Module):
@@ -421,6 +545,70 @@ class Compressor(nn.Module):
         rotated = rotated.reshape(B, T, dims)
         return mx.concatenate([out[..., :-rd], rotated], axis=-1)
 
+    def _call_non_overlap(
+        self,
+        x: mx.array,
+        state: "ArraysCache",
+        offset: int,
+        slot_compressed: int,
+        slot_kv_state: int,
+        slot_score_state: int,
+    ) -> Optional[mx.array]:
+        """Concat-buffer pattern (PR #1192 style). Non-overlap only: each
+        emit is independent, no cross-window tokens needed in buffer.
+
+        State layout:
+          slot_kv_state:    [B, buf_len, coff_d] — incomplete-window carry
+          slot_score_state: [B, buf_len, coff_d] — same, for gate scores
+          slot_compressed:  [B, n_emitted, d]    — growing pool of compressed rows
+        """
+        B, S, _ = x.shape
+        # Run wkv/wgate in input dtype (bf16); promote only for softmax (below).
+        # Casting x to fp32 before the projections doubles weight-read BW and
+        # is the decode-bound cost — PR #1192 avoids it.
+        kv = self.wkv(x)     # [B, S, coff_d] == [B, S, d] for non-overlap
+        score = self.wgate(x)
+        ratio = self.compress_ratio
+        d = self.head_dim
+
+        buf_kv = state[slot_kv_state]
+        buf_score = state[slot_score_state]
+        buf_len = 0 if buf_kv is None else buf_kv.shape[1]
+        if buf_len:
+            kv = mx.concatenate([buf_kv, kv], axis=1)
+            score = mx.concatenate([buf_score, score], axis=1)
+
+        total = kv.shape[1]
+        usable = (total // ratio) * ratio
+        # Raw-token position of the first token in the concatenated buffer.
+        pool_base = offset - buf_len
+
+        state[slot_kv_state] = kv[:, usable:] if usable < total else None
+        state[slot_score_state] = score[:, usable:] if usable < total else None
+
+        if usable == 0:
+            return None
+
+        W = usable // ratio
+        kv_win = kv[:, :usable].reshape(B, W, ratio, -1)
+        score_win = score[:, :usable].reshape(B, W, ratio, -1) + self.ape.astype(
+            score.dtype
+        )
+        weights = mx.softmax(
+            score_win.astype(mx.float32), axis=2, precise=True
+        ).astype(kv_win.dtype)
+        compressed = (kv_win * weights).sum(axis=2)[..., :d]
+        compressed = self.norm(compressed.astype(x.dtype))
+
+        positions = mx.arange(W, dtype=mx.int32) * ratio + pool_base
+        compressed = self._apply_compressor_rope(compressed, positions)
+
+        pool = state[slot_compressed]
+        state[slot_compressed] = (
+            compressed if pool is None else mx.concatenate([pool, compressed], axis=1)
+        )
+        return compressed
+
     def __call__(
         self,
         x: mx.array,
@@ -430,21 +618,17 @@ class Compressor(nn.Module):
         slot_kv_state: int,
         slot_score_state: int,
     ) -> Optional[mx.array]:
-        """Ingest ``x`` and, if appropriate, emit compressed KV rows into
-        ``state[slot_compressed]``. Accumulator buffers live in
-        ``state[slot_kv_state]`` / ``state[slot_score_state]``.
-
-        Compressor decode-step emission uses ``offset`` as a scalar (aligned
-        with the reference implementation, which takes ``start_pos: int``).
-        Array-valued offsets are collapsed to their max, matching uniform-
-        step batched generation.
-        """
         if isinstance(offset, mx.array):
             offset = int(offset.max().item())
+        if not self.overlap:
+            return self._call_non_overlap(
+                x, state, offset, slot_compressed, slot_kv_state, slot_score_state
+            )
+
         B, S, _ = x.shape
-        xf = x.astype(mx.float32)
-        kv = self.wkv(xf)
-        score = self.wgate(xf)
+        # Run wkv/wgate in input dtype — fp32 here doubles weight BW (decode-bound).
+        kv = self.wkv(x)
+        score = self.wgate(x)
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
@@ -453,11 +637,10 @@ class Compressor(nn.Module):
         state_kv = state[slot_kv_state]
         state_score = state[slot_score_state]
 
-        # Lazy-init state buffers
         if state_kv is None:
             n_slots = self._coff * ratio
-            state_kv = mx.zeros((B, n_slots, coff_d), dtype=mx.float32)
-            state_score = mx.full((B, n_slots, coff_d), float("-inf"), dtype=mx.float32)
+            state_kv = mx.zeros((B, n_slots, coff_d), dtype=kv.dtype)
+            state_score = mx.full((B, n_slots, coff_d), float("-inf"), dtype=score.dtype)
 
         if offset == 0:
             # Prefill: split into head_tokens (fully windowable) + tail (goes to state).
@@ -477,10 +660,14 @@ class Compressor(nn.Module):
                 if overlap:
                     kv_trans = self._overlap_transform_kv(kv_head)
                     score_trans = self._overlap_transform_score(score_head)
-                    weights = mx.softmax(score_trans, axis=2, precise=True)
+                    weights = mx.softmax(
+                        score_trans.astype(mx.float32), axis=2, precise=True
+                    ).astype(kv_trans.dtype)
                     compressed = (kv_trans * weights).sum(axis=2)  # [B, nw, d]
                 else:
-                    weights = mx.softmax(score_head, axis=2, precise=True)
+                    weights = mx.softmax(
+                        score_head.astype(mx.float32), axis=2, precise=True
+                    ).astype(kv_head.dtype)
                     compressed = (kv_head * weights).sum(axis=2)
                     compressed = compressed[..., :d]
                 compressed = self.norm(compressed.astype(x.dtype))
@@ -501,21 +688,21 @@ class Compressor(nn.Module):
             # Stash tail into state
             if remainder > 0:
                 tail_kv = kv[:, cutoff:, :]
-                tail_score = score[:, cutoff:, :] + self.ape[:remainder]
-                start_slot = ratio if overlap else 0
-                state_kv[:, start_slot : start_slot + remainder, :] = tail_kv.astype(
-                    mx.float32
+                tail_score = score[:, cutoff:, :] + self.ape[:remainder].astype(
+                    score.dtype
                 )
-                state_score[
-                    :, start_slot : start_slot + remainder, :
-                ] = tail_score.astype(mx.float32)
+                start_slot = ratio if overlap else 0
+                state_kv[:, start_slot : start_slot + remainder, :] = tail_kv
+                state_score[:, start_slot : start_slot + remainder, :] = tail_score
 
             # On overlap, also stash the last full window's rows for future overlap.
             if overlap and cutoff > 0:
                 prev_kv = kv[:, cutoff - ratio : cutoff, :]
-                prev_score = score[:, cutoff - ratio : cutoff, :] + self.ape
-                state_kv[:, :ratio, :] = prev_kv.astype(mx.float32)
-                state_score[:, :ratio, :] = prev_score.astype(mx.float32)
+                prev_score = score[:, cutoff - ratio : cutoff, :] + self.ape.astype(
+                    score.dtype
+                )
+                state_kv[:, :ratio, :] = prev_kv
+                state_score[:, :ratio, :] = prev_score
 
             state[slot_kv_state] = state_kv
             state[slot_score_state] = state_score
@@ -529,13 +716,11 @@ class Compressor(nn.Module):
         for i in range(S):
             step_offset = offset + i
             pos_in_window = step_offset % ratio
-            ape_row = self.ape[pos_in_window]
-            new_kv = kv[:, i, :].astype(mx.float32)
-            new_score = (score[:, i, :] + ape_row).astype(mx.float32)
-
-            slot = (ratio + pos_in_window) if overlap else pos_in_window
-            state_kv[:, slot, :] = new_kv
-            state_score[:, slot, :] = new_score
+            slot = ratio + pos_in_window  # overlap branch only; non-overlap short-circuited
+            state_kv[:, slot, :] = kv[:, i, :]
+            state_score[:, slot, :] = score[:, i, :] + self.ape[pos_in_window].astype(
+                score.dtype
+            )
 
             if ((step_offset + 1) % ratio) != 0:
                 continue
@@ -547,10 +732,14 @@ class Compressor(nn.Module):
                 first_s = state_score[:, :ratio, :d]
                 second_s = state_score[:, ratio:, d:]
                 merged_score = mx.concatenate([first_s, second_s], axis=1)
-                weights = mx.softmax(merged_score, axis=1, precise=True)
+                weights = mx.softmax(
+                    merged_score.astype(mx.float32), axis=1, precise=True
+                ).astype(merged_kv.dtype)
                 compressed = (merged_kv * weights).sum(axis=1, keepdims=True)
             else:
-                weights = mx.softmax(state_score, axis=1, precise=True)
+                weights = mx.softmax(
+                    state_score.astype(mx.float32), axis=1, precise=True
+                ).astype(state_kv.dtype)
                 compressed = (state_kv * weights).sum(axis=1, keepdims=True)
                 compressed = compressed[..., :d]
             compressed = self.norm(compressed.astype(x.dtype))
@@ -619,14 +808,16 @@ class Indexer(nn.Module):
         state: "ArraysCache",
         offset,
     ) -> Optional[mx.array]:
-        """Update the Indexer's own compressed buffer, then score and return
-        ``top_idxs [B, S, index_topk]`` into that buffer. ``-1`` entries are
-        slots beyond the cache length or future rows the query cannot see.
-        Returns ``None`` if no compressed rows exist yet.
+        """Update the Indexer's own compressed buffer and return
+        ``top_idxs [B, S, k]`` (``k = min(index_topk, pooled_len)``) into that
+        buffer. Returns ``None`` if no compressed rows exist yet. Indices are
+        always in ``[0, pooled_len)``; no ``-1`` padding, no explicit
+        future-masking at the Indexer level — causal visibility of the main
+        attention's compressed portion is enforced by
+        ``_compressed_visibility`` during prefill.
         """
         B, S, _ = x.shape
         rd = self.rope_head_dim
-        ratio = self.compress_ratio
 
         self.compressor(
             x, state, offset,
@@ -649,28 +840,10 @@ class Indexer(nn.Module):
         score = mx.maximum(score, 0)  # ReLU
         score = (score * per_head_weights[..., None]).sum(axis=2)  # [B, S, T]
 
-        # Mask compressed rows that aren't yet visible to each query.
-        if isinstance(offset, mx.array):
-            off = offset.astype(mx.int32).reshape(-1)
-            p1 = off[:, None] + mx.arange(1, S + 1, dtype=mx.int32)
-        else:
-            p1 = mx.broadcast_to(
-                offset + mx.arange(1, S + 1, dtype=mx.int32)[None, :], (B, S)
-            )
-        t = mx.arange(score.shape[-1], dtype=mx.int32)
-        future = (t[None, None, :] + 1) * ratio > p1[:, :, None]
-        score = mx.where(future, mx.array(-mx.inf, mx.float32), score)
-
-        T = idx_kv.shape[1]
-        k = min(self.index_topk, T)
-        part = mx.argpartition(-score, kth=k - 1, axis=-1)[..., :k]
-        gathered = mx.take_along_axis(score, part, axis=-1)
-        top_idxs = mx.where(
-            mx.isinf(gathered) & (gathered < 0),
-            mx.array(-1, mx.int32),
-            part.astype(mx.int32),
+        k = min(self.index_topk, idx_kv.shape[1])
+        return mx.argpartition(-score, kth=k - 1, axis=-1)[..., :k].astype(
+            mx.int32
         )
-        return top_idxs
 
 
 # --------------------------------------------------------------------------- #
@@ -797,20 +970,27 @@ class V4Attention(nn.Module):
         out = out.reshape(B, S, self.n_groups, group_feat)
 
         if isinstance(self.wo_a, nn.QuantizedLinear):
-            pieces = []
-            for g in range(self.n_groups):
-                rows = slice(g * self.o_lora_rank, (g + 1) * self.o_lora_rank)
-                y = mx.quantized_matmul(
-                    out[:, :, g, :],
-                    self.wo_a.weight[rows],
-                    scales=self.wo_a.scales[rows],
-                    biases=self.wo_a.biases[rows] if self.wo_a.biases is not None else None,
-                    transpose=True,
-                    group_size=self.wo_a.group_size,
-                    bits=self.wo_a.bits,
-                )
-                pieces.append(y)
-            return mx.concatenate(pieces, axis=-1)
+            # Batched over groups: one quantized_matmul for all groups instead
+            # of a per-group Python loop (O(n_groups) → 1 kernel dispatch).
+            out_g = out.transpose(2, 0, 1, 3)  # [G, B, S, group_feat]
+            weight = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+            scales = self.wo_a.scales.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+            biases = (
+                None
+                if self.wo_a.biases is None
+                else self.wo_a.biases.reshape(self.n_groups, self.o_lora_rank, -1)[:, None]
+            )
+            y = mx.quantized_matmul(
+                out_g,
+                weight,
+                scales=scales,
+                biases=biases,
+                transpose=True,
+                group_size=self.wo_a.group_size,
+                bits=self.wo_a.bits,
+                mode=self.wo_a.mode,
+            )
+            return y.transpose(1, 2, 0, 3).reshape(B, S, self.n_groups * self.o_lora_rank)
 
         wa = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, group_feat)
         y = mx.einsum("bsgd,grd->bsgr", out, wa)
@@ -854,18 +1034,20 @@ class V4Attention(nn.Module):
         q = mx.concatenate([q_nope, q_pe], axis=-1)
 
         kv_nope, kv_pe = kv[..., : -rd], kv[..., -rd:]
-        # rope treats penultimate dim as sequence
-        kv_pe = self.rope(kv_pe.reshape(B, 1, S, rd), offset=offset).reshape(B, S, rd)
+        kv_pe = self.rope(kv_pe, offset=offset)  # RoPE works on 3D [B, S, rd]
         kv = mx.concatenate([kv_nope, kv_pe], axis=-1)  # [B, S, D]
 
         if self.compress_ratio:
             if state_cache is None:
                 win_cache = RotatingKVCache(max_size=self.window)
                 state_cache = ArraysCache(_N_COMPRESSED_SLOTS)
-            _ = win_cache.update_and_fetch(
-                kv[:, None, :, :], kv[:, None, :, :]
-            )
-            window_kv = _temporal_window_kv(win_cache).squeeze(1)
+            k4 = kv[:, None, :, :]
+            # Use the cache's own return value — ring-ordered post-wrap, but
+            # that's fine for S=1 where all cached tokens are valid context and
+            # for S>1 where ``_update_concat`` has already reordered to
+            # temporal internally. No extra ``_temporal_order`` roll per layer.
+            win_keys, _ = win_cache.update_and_fetch(k4, k4)
+            window_kv = win_keys.squeeze(1)
             _ = self.compressor(
                 x, state_cache, offset,
                 slot_compressed=_C_COMPRESSED,
@@ -882,8 +1064,8 @@ class V4Attention(nn.Module):
         else:
             k = kv[:, None, :, :]
             if cache is not None:
-                _ = cache.update_and_fetch(k, k)
-                window_kv = _temporal_window_kv(cache).squeeze(1)
+                k_ret, _ = cache.update_and_fetch(k, k)
+                window_kv = k_ret.squeeze(1)
             else:
                 window_kv = kv
             compressed = None
@@ -900,39 +1082,54 @@ class V4Attention(nn.Module):
             S == 1 and compressed_len > 0 and indexer_topk is not None
         )
         if use_gather:
-            K = indexer_topk.shape[-1]
-            safe_idx = mx.maximum(indexer_topk, 0)
-            flat_idx = safe_idx + (
-                mx.arange(B, dtype=safe_idx.dtype) * compressed_len
-            )[:, None, None]
-            gathered = compressed.reshape(B * compressed_len, -1)[
-                flat_idx.reshape(-1)
-            ].reshape(B, K, -1)  # S==1 → drop the S axis
+            d = compressed.shape[-1]
+            # take_along_axis on a broadcast of the pool is ~15% faster at b=1
+            # than reshape+flat-gather (specialized fused kernel vs fancy-index).
+            expanded = mx.broadcast_to(
+                compressed[:, None, None, :, :], (B, 1, S, compressed_len, d)
+            )
+            idx = mx.broadcast_to(
+                indexer_topk[:, None, :, :, None],
+                (B, 1, S, indexer_topk.shape[-1], d),
+            )
+            gathered = mx.take_along_axis(expanded, idx, axis=3).reshape(B, -1, d)
             kv_all = mx.concatenate([window_kv, gathered], axis=1)
         elif compressed_len > 0:
             kv_all = mx.concatenate([window_kv, compressed], axis=1)
         else:
             kv_all = window_kv
 
-        win_mask = _build_window_mask(B, S, offset, self.window, window_len)
-        if use_gather:
-            valid = (indexer_topk >= 0).reshape(B, 1, S, -1)  # [B,1,1,K]
-            mask = mx.concatenate([win_mask, valid], axis=-1)
-        elif compressed_len > 0:
-            comp_mask = _compressed_visibility(
-                B, S, offset, compressed_len, self.compress_ratio
-            )
-            if indexer_topk is not None:
-                # Prefill + ratio=4: fold Indexer top-k into the mask so SDPA
-                # only attends to the selected compressed rows per query.
-                k_range = mx.arange(compressed_len, dtype=mx.int32)
-                selected = (
-                    indexer_topk[..., None] == k_range[None, None, None, :]
-                ).any(axis=-2)[:, None, :, :]  # [B, 1, S, T]
-                comp_mask = comp_mask & selected
-            mask = mx.concatenate([win_mask, comp_mask], axis=-1)
+        # Decode (S=1): every token in the window cache is valid past context
+        # and we're not doing causal masking (only one query), so skip the
+        # window mask entirely. For the gather path the Indexer already
+        # returns only valid indices (no -1 padding), so no compressed mask
+        # either.
+        if S == 1:
+            if use_gather:
+                mask = None
+            elif compressed_len > 0:
+                comp_mask = _compressed_visibility(
+                    B, S, offset, compressed_len, self.compress_ratio
+                )
+                win_fill = mx.ones((B, 1, 1, window_len), dtype=mx.bool_)
+                mask = mx.concatenate([win_fill, comp_mask], axis=-1)
+            else:
+                mask = None
         else:
-            mask = win_mask
+            win_mask = _build_window_mask(B, S, offset, self.window, window_len)
+            if compressed_len > 0:
+                comp_mask = _compressed_visibility(
+                    B, S, offset, compressed_len, self.compress_ratio
+                )
+                if indexer_topk is not None:
+                    k_range = mx.arange(compressed_len, dtype=mx.int32)
+                    selected = (
+                        indexer_topk[..., None] == k_range[None, None, None, :]
+                    ).any(axis=-2)[:, None, :, :]
+                    comp_mask = comp_mask & selected
+                mask = mx.concatenate([win_mask, comp_mask], axis=-1)
+            else:
+                mask = win_mask
 
         kv_all_4d = kv_all[:, None, :, :]
         o = scaled_dot_product_attention(
@@ -962,6 +1159,28 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
         return mx.sigmoid(scores)
     # sqrtsoftplus = sqrt(softplus(x)) = sqrt(logaddexp(x, 0))
     return mx.sqrt(mx.logaddexp(scores, mx.zeros_like(scores)))
+
+
+@mx.compile
+def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
+    if limit and limit > 0:
+        gate = mx.minimum(gate, limit)
+        up = mx.clip(up, -limit, limit)
+    return nn.silu(gate) * up
+
+
+class _DSV4SwiGLU(nn.Module):
+    """SwiGLU with optional clipping of ``gate`` / ``up`` to ``limit``, wrapped
+    in ``mx.compile`` so the silu+clip+min+mul stack runs as a single fused
+    kernel. Used for routed experts (limit = args.swiglu_limit = 10.0) and
+    shared experts (limit = 0 — no clip, still benefits from fusion)."""
+
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return _limited_swiglu(gate, x, self.limit)
 
 
 class MoEGate(nn.Module):
@@ -1015,12 +1234,9 @@ class DeepseekV4MLP(nn.Module):
         self.swiglu_limit = swiglu_limit
 
     def __call__(self, x: mx.array) -> mx.array:
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        if self.swiglu_limit and self.swiglu_limit > 0:
-            up = mx.clip(up, -self.swiglu_limit, self.swiglu_limit)
-            gate = mx.minimum(gate, self.swiglu_limit)
-        return self.down_proj(nn.silu(gate) * up)
+        return self.down_proj(
+            _limited_swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
+        )
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1031,7 +1247,10 @@ class DeepseekV4MoE(nn.Module):
         # match for MLX's mxfp4. Build a dense SwitchGLU and immediately
         # quantize its three projections in-place; no bf16 intermediate.
         self.switch_mlp = SwitchGLU(
-            args.hidden_size, args.moe_intermediate_size, args.n_routed_experts
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.n_routed_experts,
+            activation=_DSV4SwiGLU(args.swiglu_limit),
         )
         for name in ("gate_proj", "up_proj", "down_proj"):
             sub = getattr(self.switch_mlp, name)
@@ -1127,7 +1346,6 @@ class DeepseekV4Model(nn.Module):
     def __call__(self, inputs: mx.array, cache: Optional[List[Any]] = None) -> mx.array:
         B, S = inputs.shape
         h = self.embed_tokens(inputs)  # [B, S, D]
-        # Broadcast to hc_mult copies
         h = mx.broadcast_to(
             h[:, :, None, :],
             (B, S, self.args.hc_mult, h.shape[-1]),
@@ -1140,7 +1358,7 @@ class DeepseekV4Model(nn.Module):
         for i, layer in enumerate(self.layers):
             h = layer(h, cache[i], inputs)
 
-        h = self.hc_head(h)  # [B, S, D]
+        h = self.hc_head(h)
         return self.norm(h)
 
 

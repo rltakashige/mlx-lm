@@ -1508,7 +1508,14 @@ class TestModels(unittest.TestCase):
         self.assertIsInstance(caches[3], RotatingKVCache)
 
         # Prefill-only path (no cache)
-        inputs = mx.array([[3, 1, 4, 1, 5, 9, 2]], dtype=mx.int32)
+        # Prefill length deliberately exceeds ``sliding_window=8`` so the
+        # RotatingKVCache's post-wrap / ring-buffer path, the compressed-KV
+        # buffer growth, and the stored-window-len > config-window case are
+        # all covered. Previous test used 7 tokens (< window) and missed an
+        # entire class of mask-size bugs.
+        inputs = mx.array(
+            [[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3]], dtype=mx.int32
+        )
         out = model(inputs)
         self.assertEqual(out.shape, (1, inputs.shape[1], args.vocab_size))
 
@@ -3263,6 +3270,8 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
 
     def test_gated_delta(self):
+        from mlx_lm.models.gated_delta import compute_g
+
         mx.random.seed(0)
         for B in [1, 2]:
             for T in [1, 2]:
@@ -3274,12 +3283,16 @@ class TestModels(unittest.TestCase):
                 q = mx.random.normal(shape=(B, T, Hk, Dk))
                 k = mx.random.normal(shape=(B, T, Hk, Dk))
                 v = mx.random.normal(shape=(B, T, Hv, Dv))
-                g = mx.random.uniform(shape=(B, T, Hv))
-                beta = mx.random.uniform(shape=(B, T, Hv))
+                a = mx.random.normal(shape=(B, T, Hv))
+                b = mx.random.normal(shape=(B, T, Hv))
+                A_log = mx.random.normal(shape=(Hv,))
+                dt_bias = mx.random.normal(shape=(Hv,))
                 state = mx.random.normal(shape=(B, Hv, Dk, Dv))
 
+                g = compute_g(A_log, a, dt_bias)
+                beta = mx.sigmoid(b)
                 y_op, st_op = gated_delta_ops(q, k, v, g, beta, state)
-                y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
+                y_c, st_c = gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
 
@@ -3338,6 +3351,8 @@ class TestModels(unittest.TestCase):
             self.assertTrue(mx.allclose(y_lo, y_ref, rtol=0.05, atol=0.01))
 
     def test_gated_delta_masked(self):
+        from mlx_lm.models.gated_delta import compute_g
+
         B = 1
         T = 3
         Hk = 16
@@ -3349,9 +3364,14 @@ class TestModels(unittest.TestCase):
         q = mx.random.normal(shape=(B, T, Hk, Dk))
         k = mx.random.normal(shape=(B, T, Hk, Dk))
         v = mx.random.normal(shape=(B, T, Hv, Dv))
-        g = mx.random.normal(shape=(B, T, Hv))
-        beta = mx.random.normal(shape=(B, T, Hv))
+        a = mx.random.normal(shape=(B, T, Hv))
+        b = mx.random.normal(shape=(B, T, Hv))
+        A_log = mx.random.normal(shape=(Hv,))
+        dt_bias = mx.random.normal(shape=(Hv,))
         state = mx.random.normal(shape=(B, Hv, Dk, Dv))
+
+        g = compute_g(A_log, a, dt_bias)
+        beta = mx.sigmoid(b)
 
         for s, e, mask in [
             (1, 3, mx.array([[False, True, True]])),
@@ -3365,11 +3385,13 @@ class TestModels(unittest.TestCase):
                 beta[:, s:e],
                 state,
             )
-            for fn in [gated_delta_ops, gated_delta_kernel]:
-                y, st = fn(q, k, v, g, beta, state, mask)
-                y = y[:, s:e]
-                self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
-                self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+            y_ops, st_ops = gated_delta_ops(q, k, v, g, beta, state, mask)
+            self.assertTrue(mx.allclose(y_ops[:, s:e], y_gt, rtol=1e-4, atol=1e-4))
+            self.assertTrue(mx.allclose(st_ops, st_gt, rtol=1e-4, atol=1e-3))
+
+            y_k, st_k = gated_delta_kernel(q, k, v, a, b, A_log, dt_bias, state, mask)
+            self.assertTrue(mx.allclose(y_k[:, s:e], y_gt, rtol=1e-4, atol=1e-4))
+            self.assertTrue(mx.allclose(st_k, st_gt, rtol=1e-4, atol=1e-3))
 
 
 if __name__ == "__main__":
