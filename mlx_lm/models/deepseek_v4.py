@@ -158,44 +158,34 @@ class DeepseekV4RoPE(nn.Module):
             raise ValueError(f"Unsupported DeepSeek-V4 RoPE type {rope_type!r}")
 
         # Tuple-wrap keeps inv_freq out of the module's parameter tree.
+        # mx.fast.rope takes the period (1/inv_freq), not the frequency.
         self._inv_freq = (inv_freq,)
+        self._freqs = (1.0 / inv_freq,)
 
     @property
     def inv_freq(self) -> mx.array:
         return self._inv_freq[0]
 
+    @property
+    def freqs(self) -> mx.array:
+        return self._freqs[0]
+
     def __call__(self, x: mx.array, offset=0, inverse: bool = False) -> mx.array:
         """``offset`` may be a Python int (all sequences at the same position)
         or an ``mx.array`` of shape ``[B]`` for per-batch-item positions.
         """
-        dtype = x.dtype
-        T = x.shape[-2]
-        if isinstance(offset, mx.array):
-            pos = offset.astype(mx.float32).reshape(-1)[:, None] + mx.arange(
-                T, dtype=mx.float32
-            )  # [B, T]
-            theta = pos[..., None] * self.inv_freq  # [B, T, d/2]
-            if x.ndim == 4:  # [B, H, T, D] — insert head axis
-                theta = theta[:, None, :, :]
-        else:
-            pos = mx.arange(offset, offset + T, dtype=mx.float32)
-            theta = pos[:, None] * self.inv_freq[None, :]  # [T, d/2]
-            theta = theta.reshape((1,) * (x.ndim - 2) + theta.shape)
-
-        cos = mx.cos(theta)
-        sin = mx.sin(theta)
-        if inverse:
-            sin = -sin
-        cos = cos.astype(dtype)
-        sin = sin.astype(dtype)
-
-        rot = x[..., : self.dims].reshape(*x.shape[:-1], self.dims // 2, 2)
-        x0, x1 = rot[..., 0], rot[..., 1]
-        y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
-        y = y.reshape(*x.shape[:-1], self.dims)
-        if x.shape[-1] == self.dims:
-            return y
-        return mx.concatenate([y, x[..., self.dims :]], axis=-1)
+        scale = -1.0 if inverse else 1.0
+        # mx.fast.rope is a single fused kernel; rotates only the last
+        # ``self.dims`` dims and passes through the rest.
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=True,
+            base=None,
+            scale=scale,
+            offset=offset,
+            freqs=self.freqs,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -523,31 +513,26 @@ class Compressor(nn.Module):
         return out
 
     def _apply_compressor_rope(
-        self, compressed_kv: mx.array, offset_positions: mx.array
+        self, compressed_kv: mx.array, first_pos: int
     ) -> mx.array:
-        """Apply RoPE on the last ``rope_head_dim`` dims at the given positions.
+        """Apply RoPE on the last ``rope_head_dim`` dims at strided positions
+        ``first_pos, first_pos + ratio, first_pos + 2*ratio, ...``.
 
-        ``offset_positions`` is a 1-D int array of compressed positions (each
-        compressed row's anchoring raw-token index).
+        ``first_pos`` must be divisible by ``compress_ratio`` (caller guarantees).
         """
         rd = self.rope_head_dim
-        out = compressed_kv
-        # Treat as [B, 1, T, head_dim] so the rope's ``offset`` mechanism works
-        # across a run of consecutive positions.
-        # For prefill we have multiple rows with strictly increasing positions
-        # at a fixed stride `ratio`, so we can apply rope in one shot with an
-        # explicit theta table.
-        B, T, D = out.shape
-        dims = rd
-        pos = offset_positions.astype(mx.float32)
-        theta = pos[:, None] * self.rope.inv_freq[None, :]
-        cos = mx.cos(theta).reshape(1, T, dims // 2).astype(out.dtype)
-        sin = mx.sin(theta).reshape(1, T, dims // 2).astype(out.dtype)
-        rope_part = out[..., -rd:].reshape(B, T, dims // 2, 2)
-        x0, x1 = rope_part[..., 0], rope_part[..., 1]
-        rotated = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
-        rotated = rotated.reshape(B, T, dims)
-        return mx.concatenate([out[..., :-rd], rotated], axis=-1)
+        # mx.fast.rope generates positions as ``scale * (offset + arange(T))``.
+        # We want ``first_pos + arange(T) * ratio`` = ``ratio * (first_pos/ratio + arange(T))``.
+        rotated = mx.fast.rope(
+            compressed_kv[..., -rd:],
+            rd,
+            traditional=True,
+            base=None,
+            scale=float(self.compress_ratio),
+            offset=first_pos // self.compress_ratio,
+            freqs=self.rope.freqs,
+        )
+        return mx.concatenate([compressed_kv[..., :-rd], rotated], axis=-1)
 
     def _call_non_overlap(
         self,
@@ -604,8 +589,7 @@ class Compressor(nn.Module):
         compressed = (kv_win * weights).sum(axis=2)[..., :d]
         compressed = self.norm(compressed.astype(x.dtype))
 
-        positions = mx.arange(W, dtype=mx.int32) * ratio + pool_base
-        compressed = self._apply_compressor_rope(compressed, positions)
+        compressed = self._apply_compressor_rope(compressed, pool_base)
 
         pool = state[slot_compressed]
         state[slot_compressed] = (
@@ -681,8 +665,7 @@ class Compressor(nn.Module):
                 # Reference slices freqs_cis[:cutoff:ratio] which gives positions 0, r, 2r, ...
                 # So compressed row k has position k*ratio.
                 n_rows = compressed.shape[1]
-                pos_anchor = mx.arange(0, n_rows, dtype=mx.int32) * ratio
-                compressed = self._apply_compressor_rope(compressed, pos_anchor)
+                compressed = self._apply_compressor_rope(compressed, 0)
                 out_compressed = compressed
                 buf = state[slot_compressed]
                 state[slot_compressed] = (
@@ -747,8 +730,7 @@ class Compressor(nn.Module):
                 compressed = (state_kv * weights).sum(axis=1, keepdims=True)
                 compressed = compressed[..., :d]
             compressed = self.norm(compressed.astype(x.dtype))
-            anchor = mx.array([step_offset + 1 - ratio], dtype=mx.int32)
-            compressed = self._apply_compressor_rope(compressed, anchor)
+            compressed = self._apply_compressor_rope(compressed, step_offset + 1 - ratio)
             last_compressed = compressed
             buf = state[slot_compressed]
             state[slot_compressed] = (
