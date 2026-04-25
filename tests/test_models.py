@@ -1499,13 +1499,9 @@ class TestModels(unittest.TestCase):
         self.assertEqual(model.model_type, args.model_type)
 
         caches = model.make_cache()
-        from mlx_lm.models.cache import ArraysCache, CacheList
-        self.assertIsInstance(caches[0], RotatingKVCache)
-        self.assertIsInstance(caches[1], RotatingKVCache)
-        self.assertIsInstance(caches[2], CacheList)
-        self.assertIsInstance(caches[2].caches[0], RotatingKVCache)
-        self.assertIsInstance(caches[2].caches[1], ArraysCache)
-        self.assertIsInstance(caches[3], RotatingKVCache)
+        for c in caches:
+            self.assertIsInstance(c, deepseek_v4.DeepseekV4Cache)
+            self.assertIsInstance(c.local, RotatingKVCache)
 
         # Prefill-only path (no cache)
         # Prefill length deliberately exceeds ``sliding_window=8`` so the

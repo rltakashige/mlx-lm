@@ -6,37 +6,15 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention
-from .cache import ArraysCache, CacheList, RotatingKVCache
+from .cache import BatchRotatingKVCache, RotatingKVCache
 from .switch_layers import SwitchGLU
 
-# Slot indices inside the ArraysCache that sits alongside the RotatingKVCache
-# for compressed-attention layers (CacheList(RotatingKVCache, ArraysCache(6))).
-# Trim is not supported on this composition (ArraysCache inherits is_trimmable
-# = False); rollback is done by snapshotting ``cache.state`` and restoring via
-# ``from_state``.
-_C_COMPRESSED = 0
-_C_COMP_KV_STATE = 1
-_C_COMP_SCORE_STATE = 2
-_C_IDX_COMPRESSED = 3
-_C_IDX_KV_STATE = 4
-_C_IDX_SCORE_STATE = 5
-_N_COMPRESSED_SLOTS = 6
-
-
-def _temporal_window_kv(cache) -> mx.array:
-    """Return the sliding-window cache's keys in temporal order as ``[B, 1, L, D]``.
-
-    ``RotatingKVCache._temporal_order(v)`` takes an array argument and returns
-    a reordered copy; ``BatchRotatingKVCache._temporal_order()`` takes no
-    argument and mutates ``self.keys`` in place. Dispatch via the presence of
-    ``rotated`` (only on the batched variant).
-    """
-    if hasattr(cache, "rotated"):
-        cache._temporal_order()
-        keys = cache.keys
-        idx = cache._idx
-        return keys[..., :idx, :] if idx < keys.shape[2] else keys
-    return cache._temporal_order(cache.keys)
+# State-key constants used by the Compressor / Indexer when reading and
+# writing into a DeepseekV4Cache. The cache keeps one independent set of
+# per-key state (buffer_kv, buffer_gate, prev_kv, prev_gate, pool and the
+# corresponding per-row length lists) for each of these.
+_K_COMP = "compressor"
+_K_IDX = "indexer"
 
 
 # Register a minimal HF config so AutoConfig / AutoTokenizer recognize
@@ -107,8 +85,6 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Optional[Dict] = None
     rms_norm_eps: float = 1e-6
-
-    quantization_config: Optional[Dict] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -470,27 +446,733 @@ class HyperHead(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# DeepseekV4Cache                                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _as_lengths_list(lengths, batch_size: int, default: Optional[int] = None):
+    """Normalize ``lengths`` (list, mx.array, or None) into a Python list of
+    ints of length ``batch_size``. ``None`` falls back to ``default`` for
+    every row, or returns ``None`` if no default is given."""
+    if lengths is None:
+        if default is None:
+            return None
+        return [default] * batch_size
+    if isinstance(lengths, mx.array):
+        lengths = lengths.tolist()
+    return [int(x) for x in lengths]
+
+
+def _filter_lengths(lengths, batch_indices):
+    if lengths is None:
+        return None
+    if isinstance(lengths, mx.array):
+        lengths = lengths.tolist()
+    if isinstance(batch_indices, mx.array):
+        batch_indices = batch_indices.tolist()
+    if len(lengths) == 1 and any(idx != 0 for idx in batch_indices):
+        lengths = lengths * (max(batch_indices) + 1)
+    return [int(lengths[idx]) for idx in batch_indices]
+
+
+class _CompressorBranch:
+    """Per-state-key (compressor or indexer) state held by DeepseekV4Cache.
+
+    Fields:
+      buffer_kv, buffer_gate: [B, k, coff*d] carry of unprocessed tokens.
+      prev_kv,  prev_gate  : [B, ratio, coff*d] previous full window (overlap only).
+      pool                 : [B, n_emitted, head_dim] growing pool of compressed rows.
+      buffer_lengths       : per-row int list — number of valid tokens per row in
+                             ``buffer_kv``. None means uniform (= buffer_kv.shape[1]).
+      pool_lengths         : per-row int list — number of valid pool rows per row.
+                             None means uniform (= pool.shape[1]).
+    """
+
+    __slots__ = (
+        "buffer_kv",
+        "buffer_gate",
+        "prev_kv",
+        "prev_gate",
+        "pool",
+        "buffer_lengths",
+        "pool_lengths",
+        "buffer_count",
+        "_new_pool_lengths",
+    )
+
+    def __init__(self):
+        self.buffer_kv = None
+        self.buffer_gate = None
+        self.prev_kv = None
+        self.prev_gate = None
+        self.pool = None
+        self.buffer_lengths = None
+        self.pool_lengths = None
+        # In-place fast path: buffer_kv has shape [B, ratio, coff*d] and
+        # buffer_count tracks the number of valid leading positions.
+        self.buffer_count = 0
+        self._new_pool_lengths = None
+
+
+class DeepseekV4Cache:
+    """Cache for a single compressed-attention layer.
+
+    Wraps a sliding-window KV cache (RotatingKVCache or BatchRotatingKVCache
+    after ``prepare(left_padding|right_padding)``) and tracks the Compressor /
+    Indexer state with per-row length tracking so that variable-length batches
+    (right-padded prefill, multi-request decode after extend) stay correct.
+    """
+
+    def __init__(self, sliding_window: int):
+        self.local = RotatingKVCache(max_size=sliding_window)
+        self._branches: Dict[str, _CompressorBranch] = {
+            _K_COMP: _CompressorBranch(),
+            _K_IDX: _CompressorBranch(),
+        }
+        # Per-step right-padding info captured by ``prepare`` and consumed
+        # by the very next call to ``accumulate_windows``.
+        self._pending_lengths: Optional[List[int]] = None
+
+    # ------------------------------------------------------------------ #
+    # Pass-through API expected by V4Attention and the generator runtime  #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def offset(self):
+        return self.local.offset
+
+    @property
+    def keys(self):
+        return self.local.keys
+
+    @keys.setter
+    def keys(self, value):
+        self.local.keys = value
+
+    @property
+    def values(self):
+        return self.local.values
+
+    @values.setter
+    def values(self, value):
+        self.local.values = value
+
+    def update_and_fetch(self, keys, values):
+        return self.local.update_and_fetch(keys, values)
+
+    def is_trimmable(self):
+        # The compressor pool isn't trimmable in lock-step with the local
+        # cache: rotating it would require recomputing pool rows. Disable.
+        return False
+
+    def trim(self, n):
+        return 0
+
+    def empty(self):
+        return self.local.empty()
+
+    def size(self):
+        return self.local.size()
+
+    @property
+    def nbytes(self):
+        total = self.local.nbytes
+        for branch in self._branches.values():
+            for v in (
+                branch.buffer_kv,
+                branch.buffer_gate,
+                branch.prev_kv,
+                branch.prev_gate,
+                branch.pool,
+            ):
+                if v is not None and hasattr(v, "nbytes"):
+                    total += v.nbytes
+        return total
+
+    @property
+    def state(self):
+        local_state = None if self.local.empty() else self.local.state
+        return (local_state, self._branch_tuple(_K_COMP), self._branch_tuple(_K_IDX))
+
+    @state.setter
+    def state(self, value):
+        local_state, comp, idx = value
+        if local_state is None:
+            self.local.keys = None
+            self.local.values = None
+        else:
+            self.local.state = local_state
+        self._set_branch_tuple(_K_COMP, comp)
+        self._set_branch_tuple(_K_IDX, idx)
+
+    @property
+    def meta_state(self):
+        return self.local.meta_state
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.local.meta_state = value
+
+    def _branch_tuple(self, key):
+        b = self._branches[key]
+        return (
+            b.buffer_kv,
+            b.buffer_gate,
+            b.prev_kv,
+            b.prev_gate,
+            b.pool,
+            b.buffer_lengths,
+            b.pool_lengths,
+            b.buffer_count,
+        )
+
+    def _set_branch_tuple(self, key, value):
+        b = _CompressorBranch()
+        if value is not None:
+            if len(value) == 7:
+                # Backwards compat: old serialized tuples without buffer_count.
+                (
+                    b.buffer_kv,
+                    b.buffer_gate,
+                    b.prev_kv,
+                    b.prev_gate,
+                    b.pool,
+                    b.buffer_lengths,
+                    b.pool_lengths,
+                ) = value
+            else:
+                (
+                    b.buffer_kv,
+                    b.buffer_gate,
+                    b.prev_kv,
+                    b.prev_gate,
+                    b.pool,
+                    b.buffer_lengths,
+                    b.pool_lengths,
+                    b.buffer_count,
+                ) = value
+        self._branches[key] = b
+
+    # ------------------------------------------------------------------ #
+    # Variable-length prepare / finalize                                 #
+    # ------------------------------------------------------------------ #
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        # Right-padding tokens at the end of each row's prompt must NOT
+        # contribute to the compressor pool. Stash the per-row prompt
+        # lengths so the next ``accumulate_windows`` call can clip.
+        if right_padding is not None and max(right_padding) > 0:
+            self._pending_lengths = [int(x) for x in lengths]
+        else:
+            self._pending_lengths = None
+
+        # Left-padding (cache-extend with shorter prompts joining a longer
+        # batch) is handled by swapping the local cache to BatchRotatingKVCache
+        # since RotatingKVCache only supports a uniform offset.
+        if left_padding is not None or (
+            right_padding is not None and max(right_padding) > 0
+        ):
+            target_batch = (
+                len(left_padding) if left_padding is not None
+                else (len(lengths) if lengths is not None else None)
+            )
+            if not isinstance(self.local, BatchRotatingKVCache):
+                if (
+                    target_batch is not None
+                    and self._cache_batch_size(self.local) != target_batch
+                    and self.local.keys is None
+                ):
+                    # Empty cache being prepared for a B-row batch: just allocate
+                    # a fresh BatchRotatingKVCache of that batch size. Avoids
+                    # _batch_rotating_from's "extract 1 row" path which would
+                    # produce a 1-row cache that doesn't fit the prepare call.
+                    self.local = BatchRotatingKVCache(
+                        self.local.max_size, [0] * target_batch
+                    )
+                else:
+                    self.local = self._batch_rotating_from(self.local)
+            self.local.prepare(
+                left_padding=left_padding,
+                lengths=lengths,
+                right_padding=right_padding,
+            )
+
+    def finalize(self):
+        if hasattr(self.local, "finalize"):
+            self.local.finalize()
+        self._pending_lengths = None
+
+    # ------------------------------------------------------------------ #
+    # Filter / extend / extract / merge for batched generation           #
+    # ------------------------------------------------------------------ #
+
+    def filter(self, batch_indices):
+        if hasattr(self.local, "filter"):
+            self.local.filter(batch_indices)
+        elif self.local.keys is not None:
+            self.local.keys = self.local.keys[batch_indices]
+            self.local.values = self.local.values[batch_indices]
+        for branch in self._branches.values():
+            for name in ("buffer_kv", "buffer_gate", "prev_kv", "prev_gate", "pool"):
+                v = getattr(branch, name)
+                if v is not None:
+                    setattr(branch, name, v[batch_indices])
+            branch.buffer_lengths = _filter_lengths(branch.buffer_lengths, batch_indices)
+            branch.pool_lengths = _filter_lengths(branch.pool_lengths, batch_indices)
+
+    def extend(self, other):
+        a_batch = self._cache_batch_size(self.local)
+        b_batch = self._cache_batch_size(other.local)
+        if hasattr(self.local, "extend"):
+            other_local = other.local
+            if not isinstance(other_local, BatchRotatingKVCache):
+                other_local = self._batch_rotating_from(other_local)
+            self.local.extend(other_local)
+        elif (
+            not isinstance(other.local, BatchRotatingKVCache)
+            and self.local.offset == other.local.offset
+            and self.local._idx == other.local._idx
+        ):
+            if self.local.keys is not None or other.local.keys is not None:
+                self.local.keys = self._concat_optional(self.local.keys, other.local.keys)
+                self.local.values = self._concat_optional(self.local.values, other.local.values)
+        else:
+            self.local = self._batch_rotating_from(self.local)
+            other_local = (
+                other.local
+                if isinstance(other.local, BatchRotatingKVCache)
+                else self._batch_rotating_from(other.local)
+            )
+            self.local.extend(other_local)
+
+        for key, b_self in self._branches.items():
+            b_other = other._branches[key]
+            for name in ("buffer_kv", "buffer_gate", "prev_kv", "prev_gate", "pool"):
+                merged = self._concat_batch_state(
+                    getattr(b_self, name),
+                    getattr(b_other, name),
+                    a_batch,
+                    b_batch,
+                )
+                setattr(b_self, name, merged)
+            b_self.buffer_lengths = self._concat_lengths(
+                b_self.buffer_lengths,
+                b_other.buffer_lengths,
+                b_self.buffer_kv,
+                b_other.buffer_kv,
+                a_batch,
+                b_batch,
+            )
+            b_self.pool_lengths = self._concat_lengths(
+                b_self.pool_lengths,
+                b_other.pool_lengths,
+                b_self.pool,
+                b_other.pool,
+                a_batch,
+                b_batch,
+            )
+
+    def extract(self, idx):
+        cache = DeepseekV4Cache(self.local.max_size)
+        cache.local = (
+            self.local.extract(idx)
+            if hasattr(self.local, "extract")
+            else self._extract_local(self.local, idx)
+        )
+        for key, src in self._branches.items():
+            dst = cache._branches[key]
+            for name in ("buffer_kv", "buffer_gate", "prev_kv", "prev_gate", "pool"):
+                v = getattr(src, name)
+                setattr(dst, name, None if v is None else mx.contiguous(v[idx : idx + 1]))
+            for name in ("buffer_lengths", "pool_lengths"):
+                lengths = getattr(src, name)
+                if lengths is None:
+                    setattr(dst, name, None)
+                else:
+                    if isinstance(lengths, mx.array):
+                        lengths = lengths.tolist()
+                    setattr(dst, name, [int(lengths[idx])])
+        return cache
+
+    @classmethod
+    def merge(cls, caches: List["DeepseekV4Cache"]):
+        if not caches:
+            raise ValueError("Cannot merge empty cache list")
+        if not all(c.local.max_size == caches[0].local.max_size for c in caches):
+            raise ValueError("DeepseekV4Cache merge requires the same sliding window")
+        out = cls(caches[0].local.max_size)
+        out.local = cls._merge_local([c.local for c in caches])
+        for key in (_K_COMP, _K_IDX):
+            dst = out._branches[key]
+            for name in ("buffer_kv", "buffer_gate", "prev_kv", "prev_gate", "pool"):
+                tensors = [getattr(c._branches[key], name) for c in caches]
+                setattr(dst, name, cls._merge_batch_state(tensors))
+            dst.buffer_lengths = cls._merge_lengths(
+                [c._branches[key].buffer_lengths for c in caches],
+                [c._branches[key].buffer_kv for c in caches],
+            )
+            dst.pool_lengths = cls._merge_lengths(
+                [c._branches[key].pool_lengths for c in caches],
+                [c._branches[key].pool for c in caches],
+            )
+        return out
+
+    # ------------------------------------------------------------------ #
+    # The two methods Compressor calls during forward                    #
+    # ------------------------------------------------------------------ #
+
+    def accumulate_windows(self, kv, gate, key, ratio, start_pos):
+        """Append (kv, gate) for this forward step to the carry buffer for
+        ``key`` (compressor / indexer) and return the slice that's ready
+        to be folded into ratio-sized windows.
+
+        Returns (ready_kv, ready_gate, pool_base) where:
+          - ready_kv/ready_gate have shape [B, n_full_windows*ratio, coff*d].
+            n_full_windows = max_usable // ratio.
+          - pool_base is the raw position of ``ready_*[:, 0]`` in the input
+            sequence. Either an int (uniform offset) or an mx.array of shape
+            [B] (per-row).
+
+        Side-effects: updates branch.buffer_kv, branch.buffer_gate, and
+        records a pending ``_new_pool_lengths`` list to be consumed by
+        ``update_pool``.
+        """
+        branch = self._branches[key]
+        buf_kv = branch.buffer_kv
+        buf_gate = branch.buffer_gate
+        B, L = kv.shape[:2]
+        chunk_lengths = self._pending_lengths
+
+        # Hot decode path: uniform offsets, S=1, fixed-size buffer of shape
+        # [B, ratio, coff*d] with branch.buffer_count valid leading positions.
+        # In-place slot writes (no concat per step) — matches the old slot-
+        # based decode code's allocation profile.
+        if (
+            branch.buffer_lengths is None
+            and chunk_lengths is None
+            and L == 1
+        ):
+            coff_d = kv.shape[-1]
+            count = branch.buffer_count
+            if buf_kv is None or buf_kv.shape[1] != ratio:
+                # First decode step OR transitioning from variable-length carry
+                # left over from prefill. Pad / allocate to fixed [B, ratio, _].
+                prev_n = 0 if buf_kv is None else buf_kv.shape[1]
+                fixed_kv = mx.zeros((B, ratio, coff_d), dtype=kv.dtype)
+                fixed_gate = mx.zeros((B, ratio, coff_d), dtype=gate.dtype)
+                if prev_n:
+                    fixed_kv[:, :prev_n] = buf_kv
+                    fixed_gate[:, :prev_n] = buf_gate
+                buf_kv = fixed_kv
+                buf_gate = fixed_gate
+                count = prev_n
+            buf_kv[:, count, :] = kv[:, 0, :]
+            buf_gate[:, count, :] = gate[:, 0, :]
+            new_count = count + 1
+            branch._new_pool_lengths = None
+            if new_count < ratio:
+                branch.buffer_kv = buf_kv
+                branch.buffer_gate = buf_gate
+                branch.buffer_count = new_count
+                empty_kv = mx.zeros((B, 0, coff_d), dtype=kv.dtype)
+                empty_gate = mx.zeros((B, 0, coff_d), dtype=gate.dtype)
+                if isinstance(start_pos, mx.array):
+                    pool_base = mx.maximum(start_pos, 0) + 1 - new_count
+                else:
+                    pool_base = max(0, start_pos) + 1 - new_count
+                return empty_kv, empty_gate, pool_base
+            # Emit: full buffer becomes ready_kv. Allocate a fresh empty
+            # buffer for the next round.
+            ready_kv = buf_kv
+            ready_gate = buf_gate
+            branch.buffer_kv = mx.zeros((B, ratio, coff_d), dtype=kv.dtype)
+            branch.buffer_gate = mx.zeros((B, ratio, coff_d), dtype=gate.dtype)
+            branch.buffer_count = 0
+            if isinstance(start_pos, mx.array):
+                pool_base = mx.maximum(start_pos, 0) + 1 - ratio
+            else:
+                pool_base = max(0, start_pos) + 1 - ratio
+            return ready_kv, ready_gate, pool_base
+
+        # Multi-token (prefill / chunked-decode) uniform path: concat carry +
+        # new tokens, slice off full windows. Variable-sized buffer carry.
+        if branch.buffer_lengths is None and chunk_lengths is None:
+            # If we were in the fixed-size in-place state, fold buffer_count
+            # back into a variable-sized [:count] slice before the concat.
+            if buf_kv is not None and buf_kv.shape[1] == ratio and branch.buffer_count < ratio:
+                count = branch.buffer_count
+                buf_kv = buf_kv[:, :count] if count else None
+                buf_gate = buf_gate[:, :count] if count else None
+            if buf_kv is not None and buf_kv.shape[1]:
+                kv = mx.concatenate([buf_kv, kv], axis=1)
+                gate = mx.concatenate([buf_gate, gate], axis=1)
+            usable = (kv.shape[1] // ratio) * ratio
+            branch.buffer_kv = kv[:, usable:] if usable < kv.shape[1] else None
+            branch.buffer_gate = gate[:, usable:] if usable < gate.shape[1] else None
+            branch.buffer_count = 0 if usable >= kv.shape[1] else kv.shape[1] - usable
+            branch._new_pool_lengths = None
+            buf_len = 0 if buf_kv is None else buf_kv.shape[1]
+            if isinstance(start_pos, mx.array):
+                pool_base = mx.maximum(start_pos, 0) - buf_len
+            else:
+                pool_base = max(0, start_pos) - buf_len
+            return kv[:, :usable], gate[:, :usable], pool_base
+
+        # Slow path: per-row variable lengths. Build a max-length buffer,
+        # copy each row's valid tokens in, slice off ready windows per-row.
+        buf_lengths = _as_lengths_list(
+            branch.buffer_lengths, B, 0 if buf_kv is None else buf_kv.shape[1]
+        )
+        chunk_lengths = _as_lengths_list(chunk_lengths, B, L)
+        total_lengths = [
+            bl + min(cl, L) for bl, cl in zip(buf_lengths, chunk_lengths)
+        ]
+        usable_lengths = [(t // ratio) * ratio for t in total_lengths]
+        new_buf_lengths = [t - u for t, u in zip(total_lengths, usable_lengths)]
+        max_total = max(total_lengths, default=0)
+        max_usable = max(usable_lengths, default=0)
+        max_buf = max(new_buf_lengths, default=0)
+
+        combined_kv = mx.zeros((B, max_total, kv.shape[-1]), dtype=kv.dtype)
+        combined_gate = mx.zeros((B, max_total, gate.shape[-1]), dtype=gate.dtype)
+        for i, (bl, cl, tl) in enumerate(
+            zip(buf_lengths, chunk_lengths, total_lengths)
+        ):
+            parts_kv, parts_gate = [], []
+            if bl:
+                parts_kv.append(buf_kv[i : i + 1, :bl])
+                parts_gate.append(buf_gate[i : i + 1, :bl])
+            if cl:
+                parts_kv.append(kv[i : i + 1, : min(cl, L)])
+                parts_gate.append(gate[i : i + 1, : min(cl, L)])
+            if parts_kv:
+                row_kv = parts_kv[0] if len(parts_kv) == 1 else mx.concatenate(
+                    parts_kv, axis=1
+                )
+                row_gate = parts_gate[0] if len(parts_gate) == 1 else mx.concatenate(
+                    parts_gate, axis=1
+                )
+                combined_kv[i : i + 1, :tl] = row_kv
+                combined_gate[i : i + 1, :tl] = row_gate
+
+        ready_kv = combined_kv[:, :max_usable]
+        ready_gate = combined_gate[:, :max_usable]
+        new_buf_kv = mx.zeros((B, max_buf, kv.shape[-1]), dtype=kv.dtype)
+        new_buf_gate = mx.zeros((B, max_buf, gate.shape[-1]), dtype=gate.dtype)
+        for i, (u, bl) in enumerate(zip(usable_lengths, new_buf_lengths)):
+            if bl:
+                new_buf_kv[i : i + 1, :bl] = combined_kv[i : i + 1, u : u + bl]
+                new_buf_gate[i : i + 1, :bl] = combined_gate[i : i + 1, u : u + bl]
+        branch.buffer_kv = new_buf_kv if max_buf > 0 else None
+        branch.buffer_gate = new_buf_gate if max_buf > 0 else None
+        branch.buffer_lengths = new_buf_lengths if max_buf > 0 else None
+        branch._new_pool_lengths = [u // ratio for u in usable_lengths]
+
+        prev_buf_lengths = mx.array(buf_lengths, dtype=mx.float32)
+        if isinstance(start_pos, mx.array):
+            base = mx.maximum(start_pos, 0).astype(mx.float32)
+        else:
+            base = mx.full((B,), max(0, start_pos), dtype=mx.float32)
+        return ready_kv, ready_gate, base - prev_buf_lengths
+
+    def update_pool(self, new_pooled, key):
+        """Append ``new_pooled`` to the pool for ``key``. ``new_pooled`` has
+        shape [B, n_new, head_dim]. Per-row pool lengths are updated based
+        on the ``_new_pool_lengths`` set by the matching ``accumulate_windows``
+        call (or fall through to uniform if there was none).
+        """
+        branch = self._branches[key]
+        new_lengths = branch._new_pool_lengths
+        branch._new_pool_lengths = None
+
+        pool = branch.pool
+        if new_lengths is not None:
+            B = new_pooled.shape[0]
+            cur_lengths = _as_lengths_list(
+                branch.pool_lengths, B, 0 if pool is None else pool.shape[1]
+            )
+            total_lengths = [c + n for c, n in zip(cur_lengths, new_lengths)]
+            max_total = max(total_lengths, default=0)
+            merged = mx.zeros(
+                (B, max_total, new_pooled.shape[-1]), dtype=new_pooled.dtype
+            )
+            for i, (c, n) in enumerate(zip(cur_lengths, new_lengths)):
+                if pool is not None and c:
+                    merged[i : i + 1, :c] = pool[i : i + 1, :c]
+                if n:
+                    merged[i : i + 1, c : c + n] = new_pooled[i : i + 1, :n]
+            branch.pool = merged
+            branch.pool_lengths = total_lengths
+            return merged
+
+        if new_pooled.shape[1] > 0:
+            pool = (
+                new_pooled
+                if pool is None
+                else mx.concatenate([pool, new_pooled], axis=1)
+            )
+            branch.pool = pool
+            branch.pool_lengths = None
+        if pool is None:
+            pool = mx.zeros(
+                (new_pooled.shape[0], 0, new_pooled.shape[-1]), dtype=new_pooled.dtype
+            )
+        return pool
+
+    def pooled_lengths(self, key):
+        return self._branches[key].pool_lengths
+
+    def get_branch(self, key) -> _CompressorBranch:
+        return self._branches[key]
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                            #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _cache_batch_size(local):
+        offset = getattr(local, "offset", 0)
+        if isinstance(offset, mx.array) and offset.ndim:
+            return offset.shape[0]
+        if local.keys is not None:
+            return local.keys.shape[0]
+        return 1
+
+    @staticmethod
+    def _extract_local(local, idx):
+        cache = RotatingKVCache(local.max_size, keep=getattr(local, "keep", 0))
+        if local.keys is not None:
+            keys = local._temporal_order(local.keys)
+            values = local._temporal_order(local.values)
+            cache.keys = mx.contiguous(keys[idx : idx + 1])
+            cache.values = mx.contiguous(values[idx : idx + 1])
+            cache._idx = cache.keys.shape[2]
+        cache.offset = local.offset
+        return cache
+
+    @classmethod
+    def _batch_rotating_from(cls, local):
+        batch = cls._cache_batch_size(local)
+        return BatchRotatingKVCache.merge(
+            [cls._extract_local(local, i) for i in range(batch)]
+        )
+
+    @staticmethod
+    def _concat_optional(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return mx.concatenate([a, b], axis=0)
+
+    @classmethod
+    def _merge_local(cls, locals_):
+        offsets = [l.offset for l in locals_]
+        sizes = [l.size() for l in locals_]
+        uniform = (
+            all(not isinstance(o, mx.array) for o in offsets)
+            and all(o == offsets[0] for o in offsets)
+            and all(s == sizes[0] for s in sizes)
+        )
+        if not uniform:
+            if hasattr(locals_[0], "merge"):
+                return locals_[0].merge(locals_)
+            return BatchRotatingKVCache.merge(locals_)
+        out = RotatingKVCache(locals_[0].max_size, keep=getattr(locals_[0], "keep", 0))
+        out.offset = offsets[0]
+        if sizes[0] == 0:
+            return out
+        out.keys = mx.concatenate(
+            [l._temporal_order(l.keys) for l in locals_], axis=0
+        )
+        out.values = mx.concatenate(
+            [l._temporal_order(l.values) for l in locals_], axis=0
+        )
+        out._idx = out.keys.shape[2]
+        return out
+
+    @staticmethod
+    def _concat_batch_state(a, b, a_batch, b_batch):
+        if a is None and b is None:
+            return None
+        if a is None:
+            a = mx.zeros((a_batch,) + b.shape[1:], dtype=b.dtype)
+        if b is None:
+            b = mx.zeros((b_batch,) + a.shape[1:], dtype=a.dtype)
+        if a.shape[2:] != b.shape[2:]:
+            raise ValueError("DeepseekV4Cache extend: state tail shape mismatch")
+        if a.shape[1] != b.shape[1]:
+            seq_len = max(a.shape[1], b.shape[1])
+            if a.shape[1] != seq_len:
+                pad = mx.zeros((a.shape[0], seq_len, *a.shape[2:]), dtype=a.dtype)
+                pad[:, : a.shape[1]] = a
+                a = pad
+            if b.shape[1] != seq_len:
+                pad = mx.zeros((b.shape[0], seq_len, *b.shape[2:]), dtype=b.dtype)
+                pad[:, : b.shape[1]] = b
+                b = pad
+        return mx.concatenate([a, b], axis=0)
+
+    @staticmethod
+    def _full_lengths(lengths, value, batch_size):
+        if lengths is not None:
+            if isinstance(lengths, mx.array):
+                lengths = lengths.tolist()
+            return [int(x) for x in lengths]
+        length = 0 if value is None else value.shape[1]
+        return [length] * batch_size
+
+    @classmethod
+    def _concat_lengths(cls, a_lengths, b_lengths, a_value, b_value, a_batch, b_batch):
+        a = cls._full_lengths(a_lengths, a_value, a_batch)
+        b = cls._full_lengths(b_lengths, b_value, b_batch)
+        merged = a + b
+        m = max(merged, default=0)
+        return None if all(x == m for x in merged) else merged
+
+    @classmethod
+    def _merge_lengths(cls, lengths, values):
+        per_batch = [
+            cls._full_lengths(l, v, 1)[0] for l, v in zip(lengths, values)
+        ]
+        m = max(per_batch, default=0)
+        return None if all(x == m for x in per_batch) else per_batch
+
+    @staticmethod
+    def _merge_batch_state(values):
+        present = [v for v in values if v is not None]
+        if not present:
+            return None
+        if not all(v.shape[2:] == present[0].shape[2:] for v in present):
+            raise ValueError("DeepseekV4Cache merge: state tail shape mismatch")
+        seq_len = max(v.shape[1] for v in present)
+        shape = present[0].shape
+        dtype = present[0].dtype
+        merged = []
+        for v in values:
+            if v is None:
+                merged.append(mx.zeros((1, seq_len, *shape[2:]), dtype=dtype))
+            else:
+                if v.shape[1] != seq_len:
+                    pad = mx.zeros((v.shape[0], seq_len, *v.shape[2:]), dtype=v.dtype)
+                    pad[:, : v.shape[1]] = v
+                    v = pad
+                merged.append(v)
+        return mx.concatenate(merged, axis=0)
+
+
+# --------------------------------------------------------------------------- #
 # Compressor                                                                  #
 # --------------------------------------------------------------------------- #
 
 
 def _make_overlap_emit_kernel():
-    """Fused kernel for Compressor's overlap-case emit step:
-    slice + concat + softmax + weighted-sum in ONE dispatch.
-
-    Inputs:
-      state_kv    [B, 2*ratio, 2*head_dim]  (input dtype)
-      state_score [B, 2*ratio, 2*head_dim]  (input dtype)
-    Output:
-      y [B, head_dim] (input dtype)  — the compressed row before norm+rope.
-
-    Reference equivalent:
-      first  = state_kv[:, :ratio, :d];       second = state_kv[:, ratio:, d:]
-      merged_kv    = concat([first, second], axis=1)
-      first_s = state_score[:, :ratio, :d];   second_s = state_score[:, ratio:, d:]
-      merged_score = concat([first_s, second_s], axis=1)
-      weights      = softmax(merged_score.fp32, axis=1, precise).astype(merged_kv.dtype)
-      y            = (merged_kv * weights).sum(axis=1)
+    """Single-dispatch overlap emit. Reads state_kv / state_score in the slot
+    layout [B, 2*ratio, 2*head_dim] (prev window in [0..ratio), current window
+    in [ratio..2*ratio)) and runs softmax-weighted-sum entirely in fp32
+    registers, casting to the input dtype only at the end. Used by the decode
+    emit path (S=1) so its output is bit-identical to the pre-refactor code,
+    which used this same kernel.
     """
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
         return None
@@ -507,12 +1189,10 @@ def _make_overlap_emit_kernel():
         float scores[2 * RATIO];
         float kvs[2 * RATIO];
 
-        // First half: rows [0..RATIO), channel d
         for (int i = 0; i < RATIO; ++i) {
             scores[i] = static_cast<float>(ssc[i * (2 * D) + d]);
             kvs[i] = static_cast<float>(skv[i * (2 * D) + d]);
         }
-        // Second half: rows [RATIO..2*RATIO), channel D+d
         for (int i = 0; i < RATIO; ++i) {
             scores[RATIO + i] = static_cast<float>(ssc[(RATIO + i) * (2 * D) + D + d]);
             kvs[RATIO + i] = static_cast<float>(skv[(RATIO + i) * (2 * D) + D + d]);
@@ -526,7 +1206,6 @@ def _make_overlap_emit_kernel():
             s += scores[i];
         }
         float inv_s = 1.0f / s;
-
         float acc = 0.0f;
         for (int i = 0; i < 2 * RATIO; ++i) {
             acc += scores[i] * inv_s * kvs[i];
@@ -545,7 +1224,10 @@ _overlap_emit_kernel = _make_overlap_emit_kernel()
 
 
 def _overlap_emit(state_kv: mx.array, state_score: mx.array, ratio: int) -> mx.array:
-    """Fused overlap-emit; falls back to multi-op path if Metal unavailable."""
+    """Single overlap-emit pool row. Falls back to a pure-MLX equivalent if the
+    Metal kernel isn't available — the fallback's accumulation order differs by
+    a single bf16 ULP, so the kernel path is required for byte-identical
+    parity with the pre-refactor decode code."""
     if _overlap_emit_kernel is None:
         B, _, coff_d = state_kv.shape
         d = coff_d // 2
@@ -573,6 +1255,34 @@ def _overlap_emit(state_kv: mx.array, state_score: mx.array, ratio: int) -> mx.a
         output_shapes=[(B, D)],
         output_dtypes=[state_kv.dtype],
     )[0]
+
+
+@mx.compile
+def _compressor_wkv_gate_split_quant(x, w, s, group_size, bits, split):
+    """Fused mxfp4 wkv_gate matmul + slice into kv/score halves."""
+    kv_gate = mx.quantized_matmul(
+        x, w, scales=s, transpose=True,
+        group_size=group_size, bits=bits, mode="mxfp4",
+    )
+    return kv_gate[..., :split], kv_gate[..., split:]
+
+
+@mx.compile
+def _compressor_split(kv_gate, split):
+    """Slice the wkv_gate output into kv/score halves (compile fuse with the
+    callsite's downstream ops)."""
+    return kv_gate[..., :split], kv_gate[..., split:]
+
+
+@mx.compile
+def _compressor_norm_strided_rope(c, norm_w, norm_eps, offset, rd, scale, freqs):
+    """Fused: RMSNorm + strided rope on the last rd dims."""
+    c = mx.fast.rms_norm(c, norm_w, norm_eps)
+    rotated = mx.fast.rope(
+        c[..., -rd:], rd, traditional=True, base=None,
+        scale=scale, offset=offset, freqs=freqs,
+    )
+    return mx.concatenate([c[..., :-rd], rotated], axis=-1)
 
 
 class Compressor(nn.Module):
@@ -653,210 +1363,178 @@ class Compressor(nn.Module):
         )
         return mx.concatenate([compressed_kv[..., :-rd], rotated], axis=-1)
 
-    def _call_non_overlap(
-        self,
-        x: mx.array,
-        state: "ArraysCache",
-        offset: int,
-        slot_compressed: int,
-        slot_kv_state: int,
-        slot_score_state: int,
-    ) -> Optional[mx.array]:
-        """Concat-buffer pattern (PR #1192 style). Non-overlap only: each
-        emit is independent, no cross-window tokens needed in buffer.
-
-        State layout:
-          slot_kv_state:    [B, buf_len, coff_d] — incomplete-window carry
-          slot_score_state: [B, buf_len, coff_d] — same, for gate scores
-          slot_compressed:  [B, n_emitted, d]    — growing pool of compressed rows
+    def _apply_compressor_rope_per_row(
+        self, compressed_kv: mx.array, pool_base
+    ) -> mx.array:
+        """Per-row RoPE for the variable-length case where ``pool_base`` is
+        an mx.array of shape [B] (one starting raw-token position per row).
+        Each pool row k for batch row b has position ``pool_base[b] + k*ratio``.
         """
-        B, S, _ = x.shape
-        # Single fused matmul, split into kv/score halves.
-        kv_gate = self.wkv_gate(x)
-        kv = kv_gate[..., : self._wkv_gate_split]
-        score = kv_gate[..., self._wkv_gate_split :]
+        rd = self.rope_head_dim
         ratio = self.compress_ratio
-        d = self.head_dim
-
-        buf_kv = state[slot_kv_state]
-        buf_score = state[slot_score_state]
-        buf_len = 0 if buf_kv is None else buf_kv.shape[1]
-        if buf_len:
-            kv = mx.concatenate([buf_kv, kv], axis=1)
-            score = mx.concatenate([buf_score, score], axis=1)
-
-        total = kv.shape[1]
-        usable = (total // ratio) * ratio
-        # Raw-token position of the first token in the concatenated buffer.
-        pool_base = offset - buf_len
-
-        state[slot_kv_state] = kv[:, usable:] if usable < total else None
-        state[slot_score_state] = score[:, usable:] if usable < total else None
-
-        if usable == 0:
-            return None
-
-        W = usable // ratio
-        kv_win = kv[:, :usable].reshape(B, W, ratio, -1)
-        score_win = score[:, :usable].reshape(B, W, ratio, -1) + self.ape.astype(
-            score.dtype
-        )
-        weights = mx.softmax(
-            score_win.astype(mx.float32), axis=2, precise=True
-        ).astype(kv_win.dtype)
-        compressed = (kv_win * weights).sum(axis=2)[..., :d]
-        compressed = self.norm(compressed)
-
-        compressed = self._apply_compressor_rope(compressed, pool_base)
-
-        pool = state[slot_compressed]
-        state[slot_compressed] = (
-            compressed if pool is None else mx.concatenate([pool, compressed], axis=1)
-        )
-        return compressed
+        B, T = compressed_kv.shape[0], compressed_kv.shape[1]
+        # Positions [B, T] = pool_base[:, None] + ratio * arange(T)
+        positions = (
+            pool_base[:, None] + ratio * mx.arange(T, dtype=pool_base.dtype)
+        ).astype(mx.float32)
+        # Apply 2D rope manually: cos/sin from positions, rotate last rd dims.
+        inv = 1.0 / self.rope.freqs[: rd // 2]
+        freqs = positions[..., None] * inv  # [B, T, rd/2]
+        cos = mx.cos(freqs).astype(compressed_kv.dtype)
+        sin = mx.sin(freqs).astype(compressed_kv.dtype)
+        pe = compressed_kv[..., -rd:]
+        pe = pe.reshape(B, T, rd // 2, 2)
+        x0, x1 = pe[..., 0], pe[..., 1]
+        out = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+        pe_out = out.reshape(B, T, rd)
+        return mx.concatenate([compressed_kv[..., :-rd], pe_out], axis=-1)
 
     def __call__(
         self,
         x: mx.array,
-        state: "ArraysCache",
+        cache: "DeepseekV4Cache",
         offset,
-        slot_compressed: int,
-        slot_kv_state: int,
-        slot_score_state: int,
-    ) -> Optional[mx.array]:
-        if isinstance(offset, mx.array):
-            offset = int(offset.max().item())
-        if not self.overlap:
-            return self._call_non_overlap(
-                x, state, offset, slot_compressed, slot_kv_state, slot_score_state
-            )
+        key: str = _K_COMP,
+    ) -> mx.array:
+        """Compute zero or more compressed pool rows for this forward step
+        and append them to ``cache``'s pool for ``key``.
 
+        Returns the (possibly empty) per-row pool tensor. Empty when no row
+        in the batch has accumulated enough tokens to emit. Per-row pool
+        lengths are tracked inside ``cache``; querying via
+        ``cache.pooled_lengths(key)`` returns ``None`` for the uniform case
+        or a length list for the variable-length case.
+        """
         B, S, _ = x.shape
-        # Single fused matmul, split into kv/score halves.
-        kv_gate = self.wkv_gate(x)
-        kv = kv_gate[..., : self._wkv_gate_split]
-        score = kv_gate[..., self._wkv_gate_split :]
         ratio = self.compress_ratio
-        overlap = self.overlap
         d = self.head_dim
         coff_d = self._coff * d
 
-        state_kv = state[slot_kv_state]
-        state_score = state[slot_score_state]
-
-        if state_kv is None:
-            n_slots = self._coff * ratio
-            state_kv = mx.zeros((B, n_slots, coff_d), dtype=kv.dtype)
-            state_score = mx.full((B, n_slots, coff_d), float("-inf"), dtype=score.dtype)
-
-        if offset == 0:
-            # Prefill: split into head_tokens (fully windowable) + tail (goes to state).
-            remainder = S % ratio
-            cutoff = S - remainder
-            out_compressed = None
-
-            if cutoff > 0:
-                # carry: for overlap, we need the _last_ window of the head to
-                # be available as the "previous" window for decode-phase overlap.
-                kv_head = kv[:, :cutoff]  # [B, cutoff, coff_d]
-                score_head = score[:, :cutoff]
-                kv_head = kv_head.reshape(B, cutoff // ratio, ratio, coff_d)
-                score_head = (
-                    score_head.reshape(B, cutoff // ratio, ratio, coff_d) + self.ape
-                )
-                if overlap:
-                    kv_trans = self._overlap_transform_kv(kv_head)
-                    score_trans = self._overlap_transform_score(score_head)
-                    weights = mx.softmax(
-                        score_trans.astype(mx.float32), axis=2, precise=True
-                    ).astype(kv_trans.dtype)
-                    compressed = (kv_trans * weights).sum(axis=2)  # [B, nw, d]
-                else:
-                    weights = mx.softmax(
-                        score_head.astype(mx.float32), axis=2, precise=True
-                    ).astype(kv_head.dtype)
-                    compressed = (kv_head * weights).sum(axis=2)
-                    compressed = compressed[..., :d]
-                compressed = self.norm(compressed)
-                # Apply RoPE: compressed row k anchors at raw position
-                # (k+1)*ratio - 1 for non-overlap, k*ratio + ratio - 1 for overlap
-                # (matches ref: self.freqs_cis[:cutoff:ratio] = positions 0, r, 2r, ... ratio-1 actually...
-                # Reference slices freqs_cis[:cutoff:ratio] which gives positions 0, r, 2r, ...
-                # So compressed row k has position k*ratio.
-                n_rows = compressed.shape[1]
-                compressed = self._apply_compressor_rope(compressed, 0)
-                out_compressed = compressed
-                buf = state[slot_compressed]
-                state[slot_compressed] = (
-                    compressed if buf is None else mx.concatenate([buf, compressed], axis=1)
-                )
-
-            # Stash tail into state
-            if remainder > 0:
-                tail_kv = kv[:, cutoff:, :]
-                tail_score = score[:, cutoff:, :] + self.ape[:remainder].astype(
-                    score.dtype
-                )
-                start_slot = ratio if overlap else 0
-                state_kv[:, start_slot : start_slot + remainder, :] = tail_kv
-                state_score[:, start_slot : start_slot + remainder, :] = tail_score
-
-            # On overlap, also stash the last full window's rows for future overlap.
-            if overlap and cutoff > 0:
-                prev_kv = kv[:, cutoff - ratio : cutoff, :]
-                prev_score = score[:, cutoff - ratio : cutoff, :] + self.ape.astype(
-                    score.dtype
-                )
-                state_kv[:, :ratio, :] = prev_kv
-                state_score[:, :ratio, :] = prev_score
-
-            state[slot_kv_state] = state_kv
-            state[slot_score_state] = state_score
-            return out_compressed
-
-        # Decode path: offset > 0. Typically S=1 (single-step decode) but can be
-        # S>1 for chunked prefill continuations (e.g. prefix cache + new prompt
-        # tokens). Loop one token at a time so the accumulator/emit logic stays
-        # correct.
-        last_compressed = None
-        # Cache ape pre-cast to score.dtype once per decode call (same dtype
-        # across all i in S; saves an .astype dispatch per step).
-        ape_cast = self.ape if self.ape.dtype == score.dtype else self.ape.astype(score.dtype)
-        for i in range(S):
-            step_offset = offset + i
-            pos_in_window = step_offset % ratio
-            slot = ratio + pos_in_window  # overlap branch only; non-overlap short-circuited
-            state_kv[:, slot, :] = kv[:, i, :]
-            state_score[:, slot, :] = score[:, i, :] + ape_cast[pos_in_window]
-
-            if ((step_offset + 1) % ratio) != 0:
-                continue
-
-            if overlap:
-                # Fused kernel: slice + concat + softmax + weighted-sum in one dispatch.
-                compressed = _overlap_emit(state_kv, state_score, ratio)[:, None, :]
-            else:
-                weights = mx.softmax(
-                    state_score.astype(mx.float32), axis=1, precise=True
-                ).astype(state_kv.dtype)
-                compressed = (state_kv * weights).sum(axis=1, keepdims=True)
-                compressed = compressed[..., :d]
-            compressed = self.norm(compressed)
-            compressed = self._apply_compressor_rope(compressed, step_offset + 1 - ratio)
-            last_compressed = compressed
-            buf = state[slot_compressed]
-            state[slot_compressed] = (
-                compressed if buf is None else mx.concatenate([buf, compressed], axis=1)
+        # Single fused matmul + slice into kv/score halves. Quantized mxfp4
+        # path collapses the two ops into one dispatch; everything else
+        # (bf16, affine-quantized, etc.) goes through the layer's normal
+        # __call__ and the slice fuses into the downstream graph.
+        wg = self.wkv_gate
+        if isinstance(wg, nn.QuantizedLinear) and wg.mode == "mxfp4":
+            kv, score = _compressor_wkv_gate_split_quant(
+                x, wg.weight, wg.scales, wg.group_size, wg.bits, self._wkv_gate_split,
             )
-            if overlap:
-                state_kv[:, :ratio, :] = state_kv[:, ratio:, :]
-                state_score[:, :ratio, :] = state_score[:, ratio:, :]
+        else:
+            kv, score = _compressor_split(wg(x), self._wkv_gate_split)
 
-        out_compressed = last_compressed
+        # Append to the carry buffer; pull out the slice that's ready to be
+        # folded into ratio-sized windows. ``pool_base`` is the raw-token
+        # position of the first ready token (int for uniform offsets, [B]
+        # mx.array per-row for variable-length).
+        ready_kv, ready_score, pool_base = cache.accumulate_windows(
+            kv, score, key, ratio, offset
+        )
 
-        state[slot_kv_state] = state_kv
-        state[slot_score_state] = state_score
-        return out_compressed
+        # Always run the emit path (with shape-stable empty tensors) so the
+        # graph stays consistent. For overlap layers we additionally need the
+        # previous full window's data; that lives in branch.prev_kv / prev_gate
+        # and is updated as we emit.
+        branch = cache.get_branch(key)
+        max_usable = ready_kv.shape[1]
+        if max_usable == 0:
+            # No new rows this step. Skip the update_pool call entirely
+            # (saves an mx.zeros allocation + a no-op concat per non-emit
+            # step in every compress!=0 layer — significant on Flash where
+            # ~90% of layers are compress!=0).
+            pool = branch.pool
+            if pool is None:
+                pool = mx.zeros((B, 0, d), dtype=x.dtype)
+            return pool
+
+        W = max_usable // ratio
+        kv_win = ready_kv.reshape(B, W, ratio, coff_d)
+        score_win = ready_score.reshape(B, W, ratio, coff_d) + self.ape.astype(
+            ready_score.dtype
+        )
+
+        is_decode_emit = self.overlap and S < ratio and W == 1
+        if is_decode_emit:
+            # PR 1192 parity test: skip prev-window carry across calls.
+            # First-half slots are zero / -inf (gate masked out by softmax),
+            # so each pool row is computed from just the current window's
+            # 4 tokens instead of 4 prev + 4 current. If output cleans up
+            # with this, our cross-call prev-carry is the source of garbage.
+            buf_score_with_ape = score_win[:, 0, :, :]
+            cur_kv = kv_win[:, 0, :, :]
+            prev_kv = mx.zeros_like(cur_kv)
+            prev_gate = mx.full(cur_kv.shape, float("-inf"), dtype=cur_kv.dtype)
+            state_kv = mx.concatenate([prev_kv, cur_kv], axis=1)
+            state_score = mx.concatenate([prev_gate, buf_score_with_ape], axis=1)
+            new_pooled = _overlap_emit(state_kv, state_score, ratio)[:, None, :]
+        elif self.overlap:
+            kv_trans = self._overlap_transform_kv_runtime(kv_win, None)
+            score_trans = self._overlap_transform_score_runtime(score_win, None)
+            weights = mx.softmax(
+                score_trans.astype(mx.float32), axis=2, precise=True
+            ).astype(kv_trans.dtype)
+            new_pooled = (kv_trans * weights).sum(axis=2)
+        else:
+            weights = mx.softmax(
+                score_win.astype(mx.float32), axis=2, precise=True
+            ).astype(kv_win.dtype)
+            new_pooled = (kv_win * weights).sum(axis=2)[..., :d]
+
+        if isinstance(pool_base, mx.array) and pool_base.ndim:
+            # Per-row positions — can't use mx.fast.rope (it only takes a
+            # scalar offset). Fall through to manual norm + per-row rope.
+            new_pooled = self.norm(new_pooled)
+            new_pooled = self._apply_compressor_rope_per_row(new_pooled, pool_base)
+        else:
+            # Hot uniform path — fused RMSNorm + strided rope.
+            new_pooled = _compressor_norm_strided_rope(
+                new_pooled,
+                self.norm.weight,
+                self.norm.eps,
+                int(pool_base) // ratio,
+                self.rope_head_dim,
+                float(ratio),
+                self.rope.freqs,
+            )
+        return cache.update_pool(new_pooled, key)
+
+    def _overlap_transform_kv_runtime(
+        self, kv_win: mx.array, prev_kv: Optional[mx.array]
+    ) -> mx.array:
+        """Build [B, W, 2*ratio, d] from current windows + previous-window carry.
+
+        kv_win  : [B, W, ratio, 2*d] — current windows; first ``d`` channels are
+                  the "previous-half" (used for the next window), last ``d`` are
+                  the "current-half" (used for this window's output).
+        prev_kv : [B, ratio, 2*d] — last window from a previous call, or None.
+
+        Output [b, w, 2*ratio, d]:
+          - rows [ratio..2*ratio): kv_win[b, w, :, d:]   (always)
+          - rows [0..ratio):       kv_win[b, w-1, :, :d] for w >= 1
+                                   prev_kv[b, :, :d]      for w == 0 (if prev_kv)
+                                   zeros                  otherwise
+        """
+        B, W, R, _ = kv_win.shape
+        d = self.head_dim
+        out = mx.zeros((B, W, 2 * R, d), dtype=kv_win.dtype)
+        out[:, :, R:, :] = kv_win[:, :, :, d:]
+        if W >= 2:
+            out[:, 1:, :R, :] = kv_win[:, :-1, :, :d]
+        if prev_kv is not None:
+            out[:, 0, :R, :] = prev_kv[:, :, :d]
+        return out
+
+    def _overlap_transform_score_runtime(
+        self, score_win: mx.array, prev_score: Optional[mx.array]
+    ) -> mx.array:
+        B, W, R, _ = score_win.shape
+        d = self.head_dim
+        out = mx.full((B, W, 2 * R, d), float("-inf"), dtype=score_win.dtype)
+        out[:, :, R:, :] = score_win[:, :, :, d:]
+        if W >= 2:
+            out[:, 1:, :R, :] = score_win[:, :-1, :, :d]
+        if prev_score is not None:
+            out[:, 0, :R, :] = prev_score[:, :, :d]
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -903,27 +1581,21 @@ class Indexer(nn.Module):
         self,
         x: mx.array,
         qr: mx.array,
-        state: "ArraysCache",
+        cache: "DeepseekV4Cache",
         offset,
     ) -> Optional[mx.array]:
         """Update the Indexer's own compressed buffer and return
         ``top_idxs [B, S, k]`` (``k = min(index_topk, pooled_len)``) into that
         buffer. Returns ``None`` if no compressed rows exist yet. Indices are
-        always in ``[0, pooled_len)``; no ``-1`` padding, no explicit
-        future-masking at the Indexer level — causal visibility of the main
-        attention's compressed portion is enforced by
-        ``_compressed_visibility`` during prefill.
+        always in ``[0, pooled_len)``; no ``-1`` padding. Per-row pool
+        lengths (variable-length batch case) are masked by zeroing scores
+        for indices >= length[row] before topk so each row's selection
+        stays inside its valid pool.
         """
         B, S, _ = x.shape
         rd = self.rope_head_dim
 
-        self.compressor(
-            x, state, offset,
-            slot_compressed=_C_IDX_COMPRESSED,
-            slot_kv_state=_C_IDX_KV_STATE,
-            slot_score_state=_C_IDX_SCORE_STATE,
-        )
-        idx_kv = state[_C_IDX_COMPRESSED]
+        idx_kv = self.compressor(x, cache, offset, key=_K_IDX)
         if idx_kv is None or idx_kv.shape[1] == 0:
             return None
 
@@ -938,6 +1610,17 @@ class Indexer(nn.Module):
         score = mx.maximum(score, 0)  # ReLU
         # Reduce over n_heads as a matmul: [B,S,1,n_heads] @ [B,S,n_heads,T] → [B,S,T]
         score = (per_head_weights[:, :, None, :] @ score).squeeze(2)
+
+        # Per-row pool length masking — zero scores for invalid pool slots so
+        # topk doesn't pick padding zeros from short rows.
+        pool_lengths = cache.pooled_lengths(_K_IDX)
+        if pool_lengths is not None:
+            lengths_a = mx.array(pool_lengths, dtype=mx.int32)
+            valid = (
+                mx.arange(idx_kv.shape[1], dtype=mx.int32)[None, None, :]
+                < lengths_a[:, None, None]
+            )
+            score = mx.where(valid, score, mx.array(-1e30, dtype=score.dtype))
 
         k = min(self.index_topk, idx_kv.shape[1])
         return mx.argpartition(-score, kth=k - 1, axis=-1)[..., :k].astype(
@@ -1000,6 +1683,110 @@ def _compressed_visibility(
     k = mx.arange(compressed_len, dtype=mx.int32)
     comp_visible = (k + 1)[None, None, :] * ratio <= (q_pos + 1)[:, :, None]
     return comp_visible[:, None, :, :]
+
+
+# Attention-side compile fuses (per-layer cost reduction). These collapse the
+# sequence  matmul → reshape/transpose/slice → norm → (rope)  into single
+# compiled kernels so each prefill attention call shaves several dispatches.
+# Quantized variants take the QuantizedLinear's (weight, scales, group_size,
+# bits) tuple and call mx.quantized_matmul directly — letting the same
+# compile graph cover both the matmul and the post-ops.
+
+
+@mx.compile
+def _attn_wqkv_quant_split_norm(x, w, s, group_size, bits, q_w, kv_w, q_lora, eps):
+    """Fused mxfp4 wqkv_a matmul + slice + 2 RMSNorms (q half + kv half)."""
+    qkv_a = mx.quantized_matmul(
+        x, w, scales=s, transpose=True,
+        group_size=group_size, bits=bits, mode="mxfp4",
+    )
+    qr = mx.fast.rms_norm(qkv_a[..., :q_lora], q_w, eps)
+    kv = mx.fast.rms_norm(qkv_a[..., q_lora:], kv_w, eps)
+    return qr, kv
+
+
+@mx.compile
+def _attn_qkv_split_norm(qkv_a, q_w, kv_w, q_lora, eps):
+    """Non-quant variant: slice + 2 RMSNorms."""
+    qr = mx.fast.rms_norm(qkv_a[..., :q_lora], q_w, eps)
+    kv = mx.fast.rms_norm(qkv_a[..., q_lora:], kv_w, eps)
+    return qr, kv
+
+
+@mx.compile
+def _attn_q_proj_quant_norm(qr, w, s, group_size, bits, n_heads, head_dim, eps):
+    """Fused mxfp4 wq_b matmul + reshape/transpose to [B, n_heads, S, head_dim]
+    + per-head RMSNorm (no learned weight)."""
+    q = mx.quantized_matmul(
+        qr, w, scales=s, transpose=True,
+        group_size=group_size, bits=bits, mode="mxfp4",
+    )
+    B, S = q.shape[0], q.shape[1]
+    q = q.reshape(B, S, n_heads, head_dim).transpose(0, 2, 1, 3)
+    return mx.fast.rms_norm(q, None, eps)
+
+
+@mx.compile
+def _attn_q_proj_norm(q_flat, n_heads, head_dim, eps):
+    """Non-quant variant: reshape/transpose + per-head RMSNorm."""
+    B, S = q_flat.shape[0], q_flat.shape[1]
+    q = q_flat.reshape(B, S, n_heads, head_dim).transpose(0, 2, 1, 3)
+    return mx.fast.rms_norm(q, None, eps)
+
+
+@mx.compile
+def _attn_qkv_partial_rope(q, kv, offset, rd, freqs):
+    """Fused partial-RoPE on the trailing rd dims of q [B,H,S,D] and kv [B,S,D].
+    Slice + rope + concat × 2 → 2 dispatches collapse to 2 compiled kernels."""
+    q_pe = mx.fast.rope(
+        q[..., -rd:], rd, traditional=True, base=None,
+        scale=1.0, offset=offset, freqs=freqs,
+    )
+    q = mx.concatenate([q[..., :-rd], q_pe], axis=-1)
+    kv_pe = mx.fast.rope(
+        kv[..., -rd:], rd, traditional=True, base=None,
+        scale=1.0, offset=offset, freqs=freqs,
+    )
+    kv = mx.concatenate([kv[..., :-rd], kv_pe], axis=-1)
+    return q, kv
+
+
+@mx.compile
+def _attn_inv_rope_flatten(o, offset, rd, freqs, flat_dim):
+    """Inverse-RoPE on trailing rd dims + transpose-and-reshape to
+    ``[B, S, n_heads*head_dim]`` for the wo_a input."""
+    pe = mx.fast.rope(
+        o[..., -rd:], rd, traditional=True, base=None,
+        scale=-1.0, offset=offset, freqs=freqs,
+    )
+    o = mx.concatenate([o[..., :-rd], pe], axis=-1)
+    o = o.transpose(0, 2, 1, 3)
+    return o.reshape(o.shape[0], o.shape[1], flat_dim)
+
+
+@mx.compile
+def _attn_wo_chain_quant(
+    o, woa_w, woa_s, wob_w, wob_s, n_groups, o_lora_rank,
+    woa_group_size, woa_bits, wob_group_size, wob_bits,
+):
+    """Fused: grouped wo_a mxfp4 matmul + transpose-reshape + wo_b mxfp4 matmul.
+    Replaces the separate _grouped_output_projection + self.wo_b(...) calls
+    with a single compile graph (one fewer dispatch per layer per call).
+    """
+    B, S, F = o.shape
+    group_feat = F // n_groups
+    o_g = o.reshape(B, S, n_groups, group_feat).transpose(2, 0, 1, 3)
+    weight = woa_w.reshape(n_groups, o_lora_rank, -1)[:, None]
+    scales = woa_s.reshape(n_groups, o_lora_rank, -1)[:, None]
+    y = mx.quantized_matmul(
+        o_g, weight, scales=scales, transpose=True,
+        group_size=woa_group_size, bits=woa_bits, mode="mxfp4",
+    )
+    y = y.transpose(1, 2, 0, 3).reshape(B, S, n_groups * o_lora_rank)
+    return mx.quantized_matmul(
+        y, wob_w, scales=wob_s, transpose=True,
+        group_size=wob_group_size, bits=wob_bits, mode="mxfp4",
+    )
 
 
 class V4Attention(nn.Module):
@@ -1116,23 +1903,40 @@ class V4Attention(nn.Module):
         B, S, _ = x.shape
         rd = self.rope_head_dim
 
-        # Q
-        qkv_a = self.wqkv_a(x)
-        qr = self.q_norm(qkv_a[..., : self.q_lora_rank])
-        q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = mx.fast.rms_norm(q, None, self.eps)
-
-        # single-head KV (MQA with num_kv_heads=1)
-        kv = self.kv_norm(qkv_a[..., self.q_lora_rank :])  # [B, S, head_dim]
-
-        # Compressed-attention layers carry CacheList(RotatingKVCache, ArraysCache(6)).
-        # Pure sliding-window layers carry a plain RotatingKVCache.
-        if self.compress_ratio and cache is not None:
-            win_cache = cache.caches[0]
-            state_cache = cache.caches[1]
+        # Fused: wqkv_a matmul + slice + 2 RMSNorms (q half + kv half).
+        wqkv = self.wqkv_a
+        if isinstance(wqkv, nn.QuantizedLinear) and wqkv.mode == "mxfp4":
+            qr, kv = _attn_wqkv_quant_split_norm(
+                x, wqkv.weight, wqkv.scales, wqkv.group_size, wqkv.bits,
+                self.q_norm.weight, self.kv_norm.weight,
+                self.q_lora_rank, self.eps,
+            )
         else:
-            win_cache = cache
-            state_cache = None
+            qkv_a = wqkv(x)
+            qr, kv = _attn_qkv_split_norm(
+                qkv_a, self.q_norm.weight, self.kv_norm.weight,
+                self.q_lora_rank, self.eps,
+            )
+
+        # Fused: wq_b matmul + reshape/transpose + per-head RMSNorm.
+        wqb = self.wq_b
+        if isinstance(wqb, nn.QuantizedLinear) and wqb.mode == "mxfp4":
+            q = _attn_q_proj_quant_norm(
+                qr, wqb.weight, wqb.scales, wqb.group_size, wqb.bits,
+                self.n_heads, self.head_dim, self.eps,
+            )
+        else:
+            q = _attn_q_proj_norm(wqb(qr), self.n_heads, self.head_dim, self.eps)
+
+        # All layers carry a DeepseekV4Cache (per make_cache); the Compressor
+        # / Indexer branches are only used for compress_ratio != 0 layers.
+        # The local sliding-window cache may be RotatingKVCache (uniform-batch
+        # path) or BatchRotatingKVCache (after prepare with right_padding) —
+        # both expose the same update_and_fetch / offset interface.
+        v4_cache: Optional[DeepseekV4Cache] = (
+            cache if isinstance(cache, DeepseekV4Cache) else None
+        )
+        win_cache = v4_cache.local if v4_cache is not None else cache
         offset = win_cache.offset if win_cache is not None else 0
         # BatchRotatingKVCache stores offset as an mx.array and mutates it
         # in place via ``self.offset += S`` during update_and_fetch. Snapshot
@@ -1141,43 +1945,28 @@ class V4Attention(nn.Module):
         if isinstance(offset, mx.array):
             offset = offset + 0
 
-        # RoPE (only the last rd dims)
-        q_nope, q_pe = q[..., : -rd], q[..., -rd:]
-        q_pe = self.rope(q_pe, offset=offset)
-        q = mx.concatenate([q_nope, q_pe], axis=-1)
-
-        kv_nope, kv_pe = kv[..., : -rd], kv[..., -rd:]
-        kv_pe = self.rope(kv_pe, offset=offset)  # RoPE works on 3D [B, S, rd]
-        kv = mx.concatenate([kv_nope, kv_pe], axis=-1)  # [B, S, D]
+        # Fused: partial-RoPE on q + kv in one compiled call.
+        q, kv = _attn_qkv_partial_rope(q, kv, offset, rd, self.rope.freqs)
 
         if self.compress_ratio:
-            if state_cache is None:
-                win_cache = RotatingKVCache(max_size=self.window)
-                state_cache = ArraysCache(_N_COMPRESSED_SLOTS)
+            if v4_cache is None:
+                v4_cache = DeepseekV4Cache(self.window)
+                win_cache = v4_cache.local
             k4 = kv[:, None, :, :]
-            # Use the cache's own return value — ring-ordered post-wrap, but
-            # that's fine for S=1 where all cached tokens are valid context and
-            # for S>1 where ``_update_concat`` has already reordered to
-            # temporal internally. No extra ``_temporal_order`` roll per layer.
             win_keys, _ = win_cache.update_and_fetch(k4, k4)
             window_kv = win_keys.squeeze(1)
-            _ = self.compressor(
-                x, state_cache, offset,
-                slot_compressed=_C_COMPRESSED,
-                slot_kv_state=_C_COMP_KV_STATE,
-                slot_score_state=_C_COMP_SCORE_STATE,
-            )
+            self.compressor(x, v4_cache, offset, key=_K_COMP)
             indexer_topk = (
-                self.indexer(x, qr, state_cache, offset)
+                self.indexer(x, qr, v4_cache, offset)
                 if self.compress_ratio == 4
                 else None
             )
-            compressed = state_cache[_C_COMPRESSED]
+            compressed = v4_cache.get_branch(_K_COMP).pool
             compressed_len = 0 if compressed is None else compressed.shape[1]
         else:
             k = kv[:, None, :, :]
-            if cache is not None:
-                k_ret, _ = cache.update_and_fetch(k, k)
+            if win_cache is not None:
+                k_ret, _ = win_cache.update_and_fetch(k, k)
                 window_kv = k_ret.squeeze(1)
             else:
                 window_kv = kv
@@ -1245,11 +2034,24 @@ class V4Attention(nn.Module):
             sinks=self._sink_for(q.dtype),
         )
 
-        o_nope, o_pe = o[..., : -rd], o[..., -rd:]
-        o_pe = self.rope(o_pe, offset=offset, inverse=True)
-        o = mx.concatenate([o_nope, o_pe], axis=-1)
-
-        o = o.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * self.head_dim)
+        # Fused: inverse-RoPE on the trailing rd dims + transpose-and-reshape
+        # to [B, S, n_heads*head_dim] for wo_a.
+        o = _attn_inv_rope_flatten(
+            o, offset, rd, self.rope.freqs, self.n_heads * self.head_dim
+        )
+        # Both wo_a and wo_b mxfp4 → single compile graph for the chain.
+        if (
+            isinstance(self.wo_a, nn.QuantizedLinear) and self.wo_a.mode == "mxfp4"
+            and isinstance(self.wo_b, nn.QuantizedLinear) and self.wo_b.mode == "mxfp4"
+        ):
+            return _attn_wo_chain_quant(
+                o,
+                self.wo_a.weight, self.wo_a.scales,
+                self.wo_b.weight, self.wo_b.scales,
+                self.n_groups, self.o_lora_rank,
+                self.wo_a.group_size, self.wo_a.bits,
+                self.wo_b.group_size, self.wo_b.bits,
+            )
         o = self._grouped_output_projection(o)
         return self.wo_b(o)
 
@@ -1342,7 +2144,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "sigmoid":
         return mx.sigmoid(scores)
     # sqrtsoftplus = sqrt(softplus(x)) = sqrt(logaddexp(x, 0))
-    return mx.sqrt(mx.logaddexp(scores, mx.zeros_like(scores)))
+    return mx.sqrt(mx.logaddexp(scores, 0))
 
 
 @mx.compile
@@ -1441,38 +2243,6 @@ class MoEGate(nn.Module):
         return inds, weights
 
 
-@mx.compile
-def _switch_glu_fused(x, inds, gw, gs, uw, us, dw, ds, group_size, bits, limit):
-    """Fused gate + up + (clipped silu) + down for SwitchGLU mxfp4. Saves
-    ~60us per layer over the unfused 4-dispatch path at b=1, K=6, hidden=4096."""
-    xe = x[:, :, None, None, :]
-    g = mx.gather_qmm(xe, gw, gs, None, rhs_indices=inds, transpose=True,
-                      group_size=group_size, bits=bits, mode="mxfp4")
-    u = mx.gather_qmm(xe, uw, us, None, rhs_indices=inds, transpose=True,
-                      group_size=group_size, bits=bits, mode="mxfp4")
-    if limit and limit > 0:
-        g = mx.minimum(g, limit)
-        u = mx.clip(u, -limit, limit)
-    a = nn.silu(g) * u
-    return mx.gather_qmm(a, dw, ds, None, rhs_indices=inds, transpose=True,
-                         group_size=group_size, bits=bits, mode="mxfp4").squeeze(-2)
-
-
-@mx.compile
-def _mlp_forward_quant(x, gw, gs, uw, us, dw, ds, group_size, bits, limit):
-    """Fused gate + up + swiglu + down for quantized MLP. Saves ~60us/call."""
-    g = mx.quantized_matmul(x, gw, scales=gs, transpose=True,
-                            group_size=group_size, bits=bits, mode="mxfp4")
-    u = mx.quantized_matmul(x, uw, scales=us, transpose=True,
-                            group_size=group_size, bits=bits, mode="mxfp4")
-    if limit and limit > 0:
-        g = mx.minimum(g, limit)
-        u = mx.clip(u, -limit, limit)
-    a = nn.silu(g) * u
-    return mx.quantized_matmul(a, dw, scales=ds, transpose=True,
-                                group_size=group_size, bits=bits, mode="mxfp4")
-
-
 class DeepseekV4MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float = 0.0):
         super().__init__()
@@ -1482,15 +2252,6 @@ class DeepseekV4MLP(nn.Module):
         self.swiglu_limit = swiglu_limit
 
     def __call__(self, x: mx.array) -> mx.array:
-        if isinstance(self.gate_proj, nn.QuantizedLinear) and self.gate_proj.mode == "mxfp4":
-            return _mlp_forward_quant(
-                x,
-                self.gate_proj.weight, self.gate_proj.scales,
-                self.up_proj.weight, self.up_proj.scales,
-                self.down_proj.weight, self.down_proj.scales,
-                self.gate_proj.group_size, self.gate_proj.bits,
-                self.swiglu_limit,
-            )
         return self.down_proj(
             _limited_swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
         )
@@ -1526,19 +2287,12 @@ class DeepseekV4MoE(nn.Module):
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
         inds, weights = self.gate(x, input_ids)
-        y = _switch_glu_fused(
-            x,
-            inds,
-            self.switch_mlp.gate_proj.weight,
-            self.switch_mlp.gate_proj.scales,
-            self.switch_mlp.up_proj.weight,
-            self.switch_mlp.up_proj.scales,
-            self.switch_mlp.down_proj.weight,
-            self.switch_mlp.down_proj.scales,
-            self.switch_mlp.gate_proj.group_size,
-            self.switch_mlp.gate_proj.bits,
-            self.switch_mlp.activation.limit,
-        )
+        # Use upstream SwitchGLU.__call__ — its sort_threshold=64 path gates
+        # ``sorted_indices=True`` on gather_qmm during prefill (indices.size
+        # = S * top_k >> 64), which dispatches to a much faster Metal kernel
+        # than the unsorted path. A custom @mx.compile fuse here bypasses
+        # that and tanks prefill (Optimizations 7→8 regression).
+        y = self.switch_mlp(x, inds)
         # Combine as matmul [B,S,1,top_k] @ [B,S,top_k,hidden] → [B,S,hidden].
         y = (weights[:, :, None, :] @ y).squeeze(2).astype(y.dtype)
         if hasattr(self, "shared_experts"):
@@ -1665,20 +2419,9 @@ class Model(nn.Module):
         return pred
 
     def make_cache(self):
-        caches = []
-        for layer in self.layers:
-            r = layer.attn.compress_ratio
-            if r == 0:
-                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
-            else:
-                # Compose the compressed-attention layer's state from existing
-                # cache primitives: a RotatingKVCache for the sliding window
-                # (offset tracking, trim, ring-buffer memory) plus a 6-slot
-                # ArraysCache for the Compressor/Indexer buffers.
-                win = RotatingKVCache(max_size=self.args.sliding_window)
-                state = ArraysCache(6)
-                caches.append(CacheList(win, state))
-        return caches
+        return [
+            DeepseekV4Cache(self.args.sliding_window) for _ in self.layers
+        ]
 
     # --------------------------------------------------------------------- #
     # Weight loading                                                        #
