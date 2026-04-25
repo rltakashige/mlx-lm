@@ -705,7 +705,7 @@ class Compressor(nn.Module):
             score_win.astype(mx.float32), axis=2, precise=True
         ).astype(kv_win.dtype)
         compressed = (kv_win * weights).sum(axis=2)[..., :d]
-        compressed = self.norm(compressed.astype(x.dtype))
+        compressed = self.norm(compressed)
 
         compressed = self._apply_compressor_rope(compressed, pool_base)
 
@@ -777,7 +777,7 @@ class Compressor(nn.Module):
                     ).astype(kv_head.dtype)
                     compressed = (kv_head * weights).sum(axis=2)
                     compressed = compressed[..., :d]
-                compressed = self.norm(compressed.astype(x.dtype))
+                compressed = self.norm(compressed)
                 # Apply RoPE: compressed row k anchors at raw position
                 # (k+1)*ratio - 1 for non-overlap, k*ratio + ratio - 1 for overlap
                 # (matches ref: self.freqs_cis[:cutoff:ratio] = positions 0, r, 2r, ... ratio-1 actually...
@@ -819,14 +819,15 @@ class Compressor(nn.Module):
         # tokens). Loop one token at a time so the accumulator/emit logic stays
         # correct.
         last_compressed = None
+        # Cache ape pre-cast to score.dtype once per decode call (same dtype
+        # across all i in S; saves an .astype dispatch per step).
+        ape_cast = self.ape if self.ape.dtype == score.dtype else self.ape.astype(score.dtype)
         for i in range(S):
             step_offset = offset + i
             pos_in_window = step_offset % ratio
             slot = ratio + pos_in_window  # overlap branch only; non-overlap short-circuited
             state_kv[:, slot, :] = kv[:, i, :]
-            state_score[:, slot, :] = score[:, i, :] + self.ape[pos_in_window].astype(
-                score.dtype
-            )
+            state_score[:, slot, :] = score[:, i, :] + ape_cast[pos_in_window]
 
             if ((step_offset + 1) % ratio) != 0:
                 continue
@@ -840,7 +841,7 @@ class Compressor(nn.Module):
                 ).astype(state_kv.dtype)
                 compressed = (state_kv * weights).sum(axis=1, keepdims=True)
                 compressed = compressed[..., :d]
-            compressed = self.norm(compressed.astype(x.dtype))
+            compressed = self.norm(compressed)
             compressed = self._apply_compressor_rope(compressed, step_offset + 1 - ratio)
             last_compressed = compressed
             buf = state[slot_compressed]
@@ -1059,6 +1060,16 @@ class V4Attention(nn.Module):
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio, self.rope)
 
+        # Cache for attn_sink cast (lazy; populated on first forward).
+        self._sink_cache_dtype = None
+        self._sink_cache = None
+
+    def _sink_for(self, dtype) -> mx.array:
+        if self._sink_cache is None or self._sink_cache_dtype is not dtype:
+            self._sink_cache = self.attn_sink.astype(dtype)
+            self._sink_cache_dtype = dtype
+        return self._sink_cache
+
     def _grouped_output_projection(self, out: mx.array) -> mx.array:
         """Grouped low-rank projection via wo_a. Handles both dense and quantized.
 
@@ -1231,7 +1242,7 @@ class V4Attention(nn.Module):
         o = scaled_dot_product_attention(
             q, kv_all_4d, kv_all_4d,
             cache=None, scale=self.scale, mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
+            sinks=self._sink_for(q.dtype),
         )
 
         o_nope, o_pe = o[..., : -rd], o[..., -rd:]
