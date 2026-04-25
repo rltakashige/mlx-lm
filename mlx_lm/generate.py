@@ -1295,12 +1295,15 @@ class GenerationBatch:
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
-        self.samplers.extend(batch.samplers)
-        self.logits_processors.extend(batch.logits_processors)
+        if self.samplers is not None and batch.samplers is not None:
+            self.samplers.extend(batch.samplers)
+        if self.logits_processors is not None and batch.logits_processors is not None:
+            self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.state_machines.extend(batch.state_machines)
-        # _next_logprobs may be stored as either an mx.array (fast path) or
-        # a list (output / pre-first-step). Normalize before concatenating.
+        # _current_logprobs and _next_logprobs may each be either an mx.array
+        # (set during _step from the previous step's logprobs) or a list
+        # (initial state before the first step). Normalize before concat.
         def _as_array(lp):
             return lp if isinstance(lp, mx.array) else (
                 mx.stack(lp) if lp else None
@@ -1313,8 +1316,14 @@ class GenerationBatch:
             self._current_tokens = mx.concatenate(
                 [self._current_tokens, batch._current_tokens]
             )
-            # _current_logprobs is always a list (post-_step output form).
-            self._current_logprobs.extend(batch._current_logprobs)
+            a = _as_array(self._current_logprobs)
+            b = _as_array(batch._current_logprobs)
+            if a is None:
+                self._current_logprobs = b if b is not None else []
+            elif b is None:
+                self._current_logprobs = a
+            else:
+                self._current_logprobs = mx.concatenate([a, b], axis=0)
         if self._next_tokens is None:
             self._next_tokens = batch._next_tokens
             self._next_logprobs = batch._next_logprobs
@@ -1323,7 +1332,7 @@ class GenerationBatch:
             a = _as_array(self._next_logprobs)
             b = _as_array(batch._next_logprobs)
             if a is None:
-                self._next_logprobs = b
+                self._next_logprobs = b if b is not None else []
             elif b is None:
                 self._next_logprobs = a
             else:
