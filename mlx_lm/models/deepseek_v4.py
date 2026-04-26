@@ -352,6 +352,179 @@ def _hc_expand_ops(
     return y.astype(f_out.dtype)
 
 
+def _make_hc_sinkhorn_collapse_kernel():
+    """Single-dispatch fused sinkhorn + collapse (from PR 1192).
+
+    Combines what was two dispatches (sinkhorn → emit pre/post/comb, then
+    collapse pre·x → bf16) into one Metal kernel:
+
+      Phase 1 — simdgroup 0 runs the branchless sinkhorn on HC=4 lanes,
+                writing post (fp32, HC) and comb (fp32, HC*HC) to outputs and
+                pre to threadgroup memory.
+      Phase 2 — all 256 threads do the bfloat16 collapse against pre,
+                streaming bfloat4 reads/writes for D-divisible-by-4.
+
+    HC is hardcoded to 4 via float4 vectorization (matches DSV4 hc_mult=4 for
+    both Flash and Pro). For other HC values the kernel returns None and the
+    caller falls back to the separate sinkhorn-then-collapse path.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+    source = """
+        uint tid  = thread_position_in_threadgroup.x;
+        uint row  = threadgroup_position_in_grid.x;
+        uint lane = tid % 32;
+        uint sg   = tid / 32;
+
+        constexpr int MIX      = (2 + HC) * HC;
+        constexpr int BASE_OFF = 2 * HC;
+
+        const device float* mix      = (const device float*)mixes + row * MIX;
+        device float*       post_out = (device float*)post + row * HC;
+        device float*       comb_out = (device float*)comb + row * HC * HC;
+
+        threadgroup float pre_shared[HC];
+
+        if (sg == 0) {
+            const float pre_scale  = scale[0];
+            const float post_scale = scale[1];
+            const float comb_scale = scale[2];
+            const float epsv       = eps[0];
+
+            const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+            const uint  llane  = metal::min(lane, (uint)(HC - 1));
+
+            float pre_z  = mix[llane]      * pre_scale  + base[llane];
+            float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+            float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + epsv;
+            float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+            if (lane < (uint)HC) {
+                pre_shared[lane] = pre_v;
+                post_out[lane]   = post_v;
+            }
+
+            float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC)
+                            * comb_scale
+                      + *(const device float4*)(base + BASE_OFF + llane * HC))
+                     * active;
+
+            float row_max = metal::max(metal::max(v.x, v.y),
+                                       metal::max(v.z, v.w));
+            float4 e = metal::fast::exp(v - row_max) * active;
+            float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + epsv))
+                     + epsv * active;
+
+            float4 col_inv = 1.0f / (float4(
+                simd_sum(r.x), simd_sum(r.y),
+                simd_sum(r.z), simd_sum(r.w)
+            ) + epsv);
+            r *= col_inv;
+
+            for (int iter = 1; iter < ITERS; ++iter) {
+                r *= (1.0f / (r.x + r.y + r.z + r.w + epsv)) * active;
+                col_inv = 1.0f / (float4(
+                    simd_sum(r.x), simd_sum(r.y),
+                    simd_sum(r.z), simd_sum(r.w)
+                ) + epsv);
+                r *= col_inv;
+            }
+
+            if (lane < (uint)HC) {
+                *(device float4*)(comb_out + lane * HC) = r;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float p0 = pre_shared[0];
+        const float p1 = pre_shared[1];
+        const float p2 = pre_shared[2];
+        const float p3 = pre_shared[3];
+
+        const device bfloat16_t* x_row  = (const device bfloat16_t*)x_in
+                                         + row * (HC * D);
+        device bfloat16_t*       out_row = (device bfloat16_t*)collapsed
+                                         + row * D;
+
+        using bf4 = vec<bfloat16_t, 4>;
+        const device bf4* x_row0 = (const device bf4*)(x_row + 0*D);
+        const device bf4* x_row1 = (const device bf4*)(x_row + 1*D);
+        const device bf4* x_row2 = (const device bf4*)(x_row + 2*D);
+        const device bf4* x_row3 = (const device bf4*)(x_row + 3*D);
+        device bf4*       out4   = (device bf4*)out_row;
+
+        constexpr uint D4 = (uint)D / 4;
+
+        for (uint d4 = tid; d4 < D4; d4 += 256) {
+            float4 x0 = float4(x_row0[d4]);
+            float4 x1 = float4(x_row1[d4]);
+            float4 x2 = float4(x_row2[d4]);
+            float4 x3 = float4(x_row3[d4]);
+
+            float4 result = fma(float4(p0), x0,
+                            fma(float4(p1), x1,
+                            fma(float4(p2), x2, float4(p3) * x3)));
+
+            out4[d4] = bf4(result);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="deepseek_v4_hc_sinkhorn_collapse",
+        input_names=["mixes", "scale", "base", "eps", "x_in"],
+        output_names=["post", "comb", "collapsed"],
+        source=source,
+    )
+
+
+_hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
+
+
+def hc_sinkhorn_collapse(mixes, scale, base, x, hc_mult, sinkhorn_iters, eps):
+    """Fused sinkhorn + collapse. Returns (collapsed_bf16, post_fp32, comb_fp32).
+
+    Falls back to the separate sinkhorn + matmul-collapse path when:
+      - The Metal kernel is unavailable (CPU / non-Metal device).
+      - hc_mult != 4 (kernel uses float4 vectorization).
+      - x dtype isn't bfloat16 (kernel hardcodes bfloat16_t loads/stores).
+      - x's last dim D % 4 != 0 (kernel uses bfloat4 streaming).
+    """
+    B, S, hc, D = x.shape
+    use_kernel = (
+        _hc_sinkhorn_collapse_kernel is not None
+        and hc == 4
+        and hc_mult == 4
+        and x.dtype == mx.bfloat16
+        and D % 4 == 0
+    )
+    if not use_kernel:
+        if not isinstance(eps, mx.array):
+            eps_arr = mx.array([eps], dtype=mx.float32)
+        else:
+            eps_arr = eps
+        pre, post, comb = hc_split_sinkhorn(
+            mixes, scale, base, hc_mult, sinkhorn_iters, eps_arr
+        )
+        collapsed = (pre[:, :, None, :] @ x.astype(mx.float32)).squeeze(2).astype(x.dtype)
+        return collapsed, post, comb
+
+    eps_arr = eps if isinstance(eps, mx.array) else mx.array([eps], dtype=mx.float32)
+    n_rows = mixes.size // ((2 + hc_mult) * hc_mult)
+    post, comb, collapsed = _hc_sinkhorn_collapse_kernel(
+        inputs=[mixes, scale, base, eps_arr, x],
+        template=[("HC", hc_mult), ("ITERS", sinkhorn_iters), ("D", D)],
+        grid=(n_rows * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[
+            (*mixes.shape[:-1], hc_mult),
+            (*mixes.shape[:-1], hc_mult, hc_mult),
+            (*x.shape[:-2], D),
+        ],
+        output_dtypes=[mx.float32, mx.float32, x.dtype],
+    )
+    return collapsed, post, comb
+
+
 class HyperConnection(nn.Module):
     """Per-block mHC: projects an ``[..., hc, D]`` state to ``pre``/``post``/``comb``.
 
@@ -387,20 +560,20 @@ class HyperConnection(nn.Module):
     def hc_pre(self, x: mx.array):
         # x: [B, S, hc, D]  ->  (y [B, S, D], post [B, S, hc], comb [B, S, hc, hc])
         B, S, hc, D = x.shape
-        dtype = x.dtype
-        # fast.rms_norm is a fused kernel; normalizing before the matmul is
-        # equivalent to (xf @ fn.T) * rsqrt(...) since the scale is scalar/row.
+        # mx.fast.rms_norm is Apple's optimized Metal kernel for the RMS+rsqrt
+        # path; replacing it with a hand-rolled compile-fuse regresses prefill
+        # because the manual rsqrt(mean(x*x)) chain doesn't dispatch to the
+        # same fused kernel as fast.rms_norm.
         xf = mx.fast.rms_norm(
             x.reshape(B, S, hc * D).astype(mx.float32), None, self.norm_eps
         )
         mixes = xf @ self.fn.T
-        pre, post, comb = hc_split_sinkhorn(
-            mixes, self.scale, self.base, hc, self.sinkhorn_iters, self._eps_arr
+        # Fused sinkhorn + collapse — single Metal dispatch when HC=4 and x is
+        # bf16; falls back to separate sinkhorn-then-matmul-collapse otherwise.
+        return hc_sinkhorn_collapse(
+            mixes, self.scale, self.base, x,
+            self.hc_mult, self.sinkhorn_iters, self._eps_arr,
         )
-        # Collapse as matmul [B,S,1,hc] @ [B,S,hc,D] → [B,S,1,D]; faster than
-        # broadcast-mul + sum at real hidden sizes (~20% at hidden=4096, b=1).
-        y = (pre[:, :, None, :] @ x.astype(mx.float32)).squeeze(2)
-        return y.astype(dtype), post, comb
 
     def hc_post(
         self,
@@ -432,13 +605,14 @@ class HyperHead(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         B, S, hc, D = x.shape
-        dtype = x.dtype
+        # Use mx.fast.rms_norm rather than a manual rsqrt(mean(x*x)) compile
+        # fuse — the optimized Metal kernel is meaningfully faster on prefill.
         xf = mx.fast.rms_norm(
             x.reshape(B, S, hc * D).astype(mx.float32), None, self.norm_eps
         )
         mixes = xf @ self.fn.T
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
-        return (pre[:, :, None, :] @ x.astype(mx.float32)).squeeze(2).astype(dtype)
+        return (pre[:, :, None, :] @ x.astype(mx.float32)).squeeze(2).astype(x.dtype)
 
 
 # --------------------------------------------------------------------------- #
