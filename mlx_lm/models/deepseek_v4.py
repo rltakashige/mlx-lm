@@ -346,13 +346,9 @@ def _hc_expand_ops(
     post: mx.array,  # [B, S, hc]         fp32
     comb: mx.array,  # [B, S, hc, hc]     fp32
 ):
-    """y[b,s,h,d] = post[h] * f_out[d] + sum_j(comb[h,j] * residual[j,d]).
-
-    Compiled so the broadcast-mul, matmul, and add fuse into fewer kernels
-    (saves ~30us/call at hidden=4096, b=1).
-    """
+    """y[b,s,j,d] = post[j] * f_out[d] + sum_i(comb[i,j] * residual[i,d])."""
     y = post[..., None] * f_out[:, :, None, :]
-    y = y + mx.matmul(comb, residual.astype(mx.float32))
+    y = y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))
     return y.astype(f_out.dtype)
 
 
@@ -1454,25 +1450,29 @@ class Compressor(nn.Module):
 
         is_decode_emit = self.overlap and S < ratio and W == 1
         if is_decode_emit:
-            # PR 1192 parity test: skip prev-window carry across calls.
-            # First-half slots are zero / -inf (gate masked out by softmax),
-            # so each pool row is computed from just the current window's
-            # 4 tokens instead of 4 prev + 4 current. If output cleans up
-            # with this, our cross-call prev-carry is the source of garbage.
             buf_score_with_ape = score_win[:, 0, :, :]
             cur_kv = kv_win[:, 0, :, :]
-            prev_kv = mx.zeros_like(cur_kv)
-            prev_gate = mx.full(cur_kv.shape, float("-inf"), dtype=cur_kv.dtype)
+            prev_kv = branch.prev_kv
+            prev_gate = branch.prev_gate
+            if prev_kv is None:
+                prev_kv = mx.zeros_like(cur_kv)
+                prev_gate = mx.full(cur_kv.shape, float("-inf"), dtype=cur_kv.dtype)
             state_kv = mx.concatenate([prev_kv, cur_kv], axis=1)
             state_score = mx.concatenate([prev_gate, buf_score_with_ape], axis=1)
             new_pooled = _overlap_emit(state_kv, state_score, ratio)[:, None, :]
+            branch.prev_kv = cur_kv
+            branch.prev_gate = buf_score_with_ape
         elif self.overlap:
-            kv_trans = self._overlap_transform_kv_runtime(kv_win, None)
-            score_trans = self._overlap_transform_score_runtime(score_win, None)
+            prev_kv = branch.prev_kv
+            prev_score = branch.prev_gate
+            kv_trans = self._overlap_transform_kv_runtime(kv_win, prev_kv)
+            score_trans = self._overlap_transform_score_runtime(score_win, prev_score)
             weights = mx.softmax(
                 score_trans.astype(mx.float32), axis=2, precise=True
             ).astype(kv_trans.dtype)
             new_pooled = (kv_trans * weights).sum(axis=2)
+            branch.prev_kv = kv_win[:, -1, :, :]
+            branch.prev_gate = score_win[:, -1, :, :]
         else:
             weights = mx.softmax(
                 score_win.astype(mx.float32), axis=2, precise=True
