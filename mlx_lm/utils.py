@@ -58,6 +58,26 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 
+def _compressed_tensors_quantization(config):
+    if config.get("format") != "mxfp4-pack-quantized":
+        return {"group_size": 32, "bits": 4, "mode": "affine"}
+
+    groups = config.get("config_groups", {})
+    weights_config = next(
+        (
+            group["weights"]
+            for group in groups.values()
+            if group.get("weights") is not None
+        ),
+        {},
+    )
+    return {
+        "group_size": weights_config.get("group_size", 32),
+        "bits": weights_config.get("num_bits", 4),
+        "mode": "mxfp4",
+    }
+
+
 def _parse_size(x):
     sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
     split = 0
@@ -459,7 +479,7 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            quantization = _compressed_tensors_quantization(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)

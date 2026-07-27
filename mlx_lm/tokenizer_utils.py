@@ -1,3 +1,4 @@
+import base64
 import importlib
 import json
 import warnings
@@ -162,8 +163,9 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _byte_decoder = None
     _space_matches = (".", "?", "!", ",", "n't", "'m", "'s", "'ve", "'re")
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, trim_initial_space=True):
         self.clean_spaces = tokenizer.clean_up_tokenization_spaces
+        self.trim_initial_space = trim_initial_space
 
         # Extract the tokens in a list from id to text
         self.tokenmap = [None] * len(tokenizer.vocab)
@@ -185,8 +187,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     def _decode_bytes(self, seq):
         barr = bytearray()
         for c in seq:
-            res = self._byte_decoder.get(c, False)
-            if res:
+            res = self._byte_decoder.get(c)
+            if res is not None:
                 barr.append(res)
             else:
                 barr.extend(bytes(c, "utf-8"))
@@ -197,7 +199,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             return current_text
         elif current_text[0] != " ":
             return current_text
-        elif not self.text:
+        elif not self.text and self.trim_initial_space:
             return current_text[1:]
         elif self.clean_spaces and current_text[1:].startswith(self._space_matches):
             return current_text[1:]
@@ -218,10 +220,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             self._unflushed = ""
 
     def finalize(self):
-        current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
-            "utf-8",
-            "replace",
-        )
+        current_text = self._decode_bytes(self._unflushed)
         self.text += self._maybe_trim_space(current_text)
         self._unflushed = ""
 
@@ -255,6 +254,16 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
 def _infer_thinking(tokenizer):
     vocab = tokenizer.get_vocab()
+    if tokenizer.__class__.__name__ == "_KimiK3TokenizerFast":
+        think_start = "<|open|>think<|sep|>"
+        think_end = "<|close|>think<|sep|>"
+        return (
+            think_start,
+            think_end,
+            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+        )
+
     THINK_TOKENS = [
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
@@ -317,7 +326,9 @@ class TokenizerWrapper:
 
         self._chat_template = chat_template
         self.has_chat_template = (
-            tokenizer.chat_template is not None or chat_template is not None
+            tokenizer.chat_template is not None
+            or chat_template is not None
+            or bool(getattr(tokenizer, "has_chat_template", False))
         )
         self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
@@ -505,6 +516,436 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
 AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
 
 
+_KIMI_K3_NUM_RESERVED_TOKENS = 256
+_KIMI_K3_OPEN_TOKEN = "<|open|>"
+_KIMI_K3_CLOSE_TOKEN = "<|close|>"
+_KIMI_K3_SEPARATOR_TOKEN = "<|sep|>"
+_KIMI_K3_END_OF_MESSAGE_TOKEN = "<|end_of_msg|>"
+_KIMI_K3_THINKING_EFFORTS = {"low", "high", "max"}
+_KIMI_K3_PATTERN = "|".join(
+    [
+        r"""[\p{Han}]+""",
+        r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+        r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+        r"""\p{N}{1,3}""",
+        r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
+        r"""\s*[\r\n]+""",
+        r"""\s+(?!\S)""",
+        r"""\s+""",
+    ]
+)
+
+
+class _KimiK3TokenizerFast(PreTrainedTokenizerFast):
+    has_chat_template = True
+
+    @staticmethod
+    def _open_tag(tag, attrs=()):
+        attributes = "".join(
+            f' {key}="{str(value).replace("&", "&amp;").replace(chr(34), "&quot;")}"'
+            for key, value in attrs
+        )
+        return f"{_KIMI_K3_OPEN_TOKEN}{tag}{attributes}{_KIMI_K3_SEPARATOR_TOKEN}"
+
+    @staticmethod
+    def _close_tag(tag):
+        return f"{_KIMI_K3_CLOSE_TOKEN}{tag}{_KIMI_K3_SEPARATOR_TOKEN}"
+
+    def _validate_plain_text(self, text):
+        for token_id in range(
+            len(self) - _KIMI_K3_NUM_RESERVED_TOKENS,
+            len(self),
+        ):
+            token = self.convert_ids_to_tokens(token_id)
+            if token and token in text:
+                raise ValueError(
+                    "Kimi K3 chat text contains a reserved control token; "
+                    "pass it as a raw prompt only if that is intentional"
+                )
+
+    def apply_chat_template(
+        self,
+        conversation,
+        tools=None,
+        add_generation_prompt=True,
+        tokenize=False,
+        padding=False,
+        truncation=False,
+        max_length=None,
+        return_tensors=None,
+        return_dict=False,
+        **kwargs,
+    ):
+        """Render K3's text-only XTML conversation format without remote code.
+
+        ``continue_final_message`` intentionally remains unsupported: K3's
+        official renderer does not implement assistant prefilling semantics.
+        """
+        if tools:
+            raise ValueError(
+                "Kimi K3 tool rendering is unavailable in the safe local "
+                "tokenizer fallback"
+            )
+        if kwargs.get("continue_final_message"):
+            raise ValueError(
+                "Kimi K3 continue_final_message is unavailable in the safe "
+                "local tokenizer fallback"
+            )
+
+        is_batched = (
+            isinstance(conversation, list)
+            and bool(conversation)
+            and isinstance(conversation[0], list)
+        )
+        conversations = conversation if is_batched else [conversation]
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if "thinking" in kwargs:
+            # Match K3's explicit ``thinking`` argument: None is falsy.
+            thinking = bool(kwargs["thinking"])
+        elif "enable_thinking" in kwargs and kwargs["enable_thinking"] is not None:
+            thinking = bool(kwargs["enable_thinking"])
+        else:
+            # MLX/Exo use ``enable_thinking`` as a cross-model alias. Keep an
+            # omitted/None alias equivalent to K3's default ``thinking=True``,
+            # except for the standard ``reasoning_effort="none"`` shorthand.
+            thinking = reasoning_effort != "none"
+        # Match K3's serving renderer: the native ``thinking_effort`` kwarg
+        # takes precedence over the standard ``reasoning_effort`` alias.
+        thinking_effort = kwargs.get(
+            "thinking_effort",
+            "max" if reasoning_effort is None else reasoning_effort,
+        )
+        if thinking and thinking_effort is not None:
+            if thinking_effort not in _KIMI_K3_THINKING_EFFORTS:
+                raise ValueError(
+                    f"Unsupported thinking_effort={thinking_effort!r}; "
+                    "supported values are ['high', 'low', 'max']."
+                )
+
+        prompts = []
+        for messages in conversations:
+            parts = []
+            if thinking and thinking_effort is not None:
+                parts.extend(
+                    [
+                        self._open_tag(
+                            "message",
+                            [("role", "system"), ("type", "thinking-effort")],
+                        ),
+                        "`thinking_effort` guides on how much to think in your "
+                        "thinking channel (not including the response channel), "
+                        "supported values include `low`, `medium`, `high`, and "
+                        "`max`.\n"
+                        "Now the system is invoked with "
+                        f"`thinking_effort={thinking_effort}`.",
+                        self._close_tag("message"),
+                        _KIMI_K3_END_OF_MESSAGE_TOKEN,
+                    ]
+                )
+
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise ValueError("Kimi K3 chat messages must be dictionaries")
+                role = message.get("role")
+                if role not in ("system", "user", "assistant"):
+                    raise ValueError(
+                        f"Kimi K3 role {role!r} is unavailable in the safe "
+                        "text-only tokenizer fallback"
+                    )
+
+                attrs = [("role", role)]
+                if message.get("name"):
+                    self._validate_plain_text(str(message["name"]))
+                    attrs.append(("name", message["name"]))
+                content = message.get("content", "")
+                if not isinstance(content, str):
+                    raise ValueError(
+                        "Kimi K3 multimodal chat content is unavailable in the "
+                        "safe text-only tokenizer fallback"
+                    )
+                self._validate_plain_text(content)
+
+                parts.append(self._open_tag("message", attrs))
+                if role == "assistant":
+                    if message.get("tool_calls"):
+                        raise ValueError(
+                            "Kimi K3 tool rendering is unavailable in the safe "
+                            "local tokenizer fallback"
+                        )
+                    if thinking:
+                        reasoning = message.get("reasoning_content") or message.get(
+                            "reasoning", ""
+                        )
+                        self._validate_plain_text(str(reasoning))
+                        parts.extend(
+                            [
+                                self._open_tag("think"),
+                                str(reasoning),
+                                self._close_tag("think"),
+                            ]
+                        )
+                    parts.extend(
+                        [
+                            self._open_tag("response"),
+                            content,
+                            self._close_tag("response"),
+                        ]
+                    )
+                else:
+                    parts.append(content)
+                parts.extend(
+                    [
+                        self._close_tag("message"),
+                        _KIMI_K3_END_OF_MESSAGE_TOKEN,
+                    ]
+                )
+
+            if add_generation_prompt:
+                parts.append(self._open_tag("message", [("role", "assistant")]))
+                parts.append(self._open_tag("think" if thinking else "response"))
+            prompts.append("".join(parts))
+
+        if not tokenize:
+            return prompts if is_batched else prompts[0]
+
+        encoded_inputs = [
+            self.encode(prompt, add_special_tokens=False) for prompt in prompts
+        ]
+        if truncation and max_length is not None:
+            encoded_inputs = [ids[:max_length] for ids in encoded_inputs]
+
+        needs_batch_encoding = (
+            is_batched or padding or return_tensors is not None or return_dict
+        )
+        if not needs_batch_encoding:
+            return encoded_inputs[0]
+
+        features = [
+            {
+                "input_ids": ids,
+                "attention_mask": [1] * len(ids),
+            }
+            for ids in encoded_inputs
+        ]
+        batch = self.pad(
+            features,
+            padding=padding,
+            max_length=max_length if padding else None,
+            return_attention_mask=True,
+            return_tensors=return_tensors,
+        )
+        if return_dict:
+            return batch
+        if is_batched:
+            return batch["input_ids"]
+        if return_tensors is None:
+            return batch["input_ids"][0]
+        return batch["input_ids"]
+
+
+def _read_tokenizer_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fid:
+            return json.load(fid)
+    except (OSError, JSONDecodeError):
+        return None
+
+
+def _is_local_kimi_k3_tokenizer(model_path):
+    model_config = _read_tokenizer_json(model_path / "config.json")
+    tokenizer_config = _read_tokenizer_json(model_path / "tokenizer_config.json")
+    if not isinstance(model_config, dict) or not isinstance(tokenizer_config, dict):
+        return False
+
+    text_config = model_config.get("text_config")
+    auto_map_config = tokenizer_config.get("auto_map")
+    if not isinstance(text_config, dict) or not isinstance(auto_map_config, dict):
+        return False
+
+    auto_map = auto_map_config.get("AutoTokenizer")
+    if isinstance(auto_map, (list, tuple)):
+        auto_map = auto_map[0] if auto_map else None
+
+    return (
+        model_config.get("model_type") == "kimi_k3"
+        and text_config.get("model_type") == "kimi_linear"
+        and tokenizer_config.get("tokenizer_class") == "TikTokenTokenizer"
+        and auto_map == "tokenization_kimi.TikTokenTokenizer"
+        and (model_path / "tiktoken.model").is_file()
+    )
+
+
+def _load_local_tiktoken_ranks(vocab_file):
+    ranks = {}
+    rank_values = set()
+    with open(vocab_file, "rb") as fid:
+        for line_number, line in enumerate(fid, start=1):
+            if not line.strip():
+                continue
+            try:
+                encoded_token, rank_text = line.split()
+                token = base64.b64decode(encoded_token, validate=True)
+                rank = int(rank_text)
+            except (ValueError, TypeError) as error:
+                raise ValueError(
+                    f"Invalid tiktoken.model entry on line {line_number}"
+                ) from error
+
+            if not token or token in ranks or rank in rank_values:
+                raise ValueError(
+                    f"Duplicate or empty tiktoken.model entry on line {line_number}"
+                )
+            ranks[token] = rank
+            rank_values.add(rank)
+
+    if rank_values != set(range(len(ranks))):
+        raise ValueError("tiktoken.model ranks must be contiguous from zero")
+    return ranks
+
+
+def _build_local_kimi_k3_tokenizer(model_path, tokenizer_config_extra=None):
+    from tokenizers import (
+        AddedToken,
+        Regex,
+        Tokenizer,
+        decoders,
+        pre_tokenizers,
+        processors,
+    )
+    from tokenizers.models import BPE
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    model_config = _read_tokenizer_json(model_path / "config.json")
+    tokenizer_config = _read_tokenizer_json(model_path / "tokenizer_config.json")
+    if not isinstance(model_config, dict) or not isinstance(tokenizer_config, dict):
+        raise ValueError("Kimi K3 tokenizer configuration is missing or invalid")
+
+    mergeable_ranks = _load_local_tiktoken_ranks(model_path / "tiktoken.model")
+    num_base_tokens = len(mergeable_ranks)
+    expected_vocab_size = num_base_tokens + _KIMI_K3_NUM_RESERVED_TOKENS
+    if model_config.get("text_config", {}).get("vocab_size") != expected_vocab_size:
+        raise ValueError(
+            "Kimi K3 tokenizer vocabulary does not match text_config.vocab_size"
+        )
+
+    added_tokens_decoder = tokenizer_config.get("added_tokens_decoder", {})
+    try:
+        added_tokens_decoder = {
+            int(token_id): metadata
+            for token_id, metadata in added_tokens_decoder.items()
+        }
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("Kimi K3 added_tokens_decoder is invalid") from error
+
+    first_reserved_id = num_base_tokens
+    last_reserved_id = expected_vocab_size
+    if any(
+        token_id < first_reserved_id or token_id >= last_reserved_id
+        for token_id in added_tokens_decoder
+    ):
+        raise ValueError("Kimi K3 added token ID is outside the reserved range")
+
+    byte_encoder = bytes_to_unicode()
+
+    def token_bytes_to_string(token):
+        return "".join(byte_encoder[byte] for byte in token)
+
+    vocab = {
+        token_bytes_to_string(token): rank for token, rank in mergeable_ranks.items()
+    }
+    added_tokens = []
+    for token_id in range(first_reserved_id, last_reserved_id):
+        metadata = added_tokens_decoder.get(token_id, {})
+        content = metadata.get("content", f"<|reserved_token_{token_id}|>")
+        if content in vocab:
+            raise ValueError(f"Duplicate Kimi K3 token content {content!r}")
+        vocab[content] = token_id
+        added_tokens.append(
+            AddedToken(
+                content,
+                single_word=metadata.get("single_word", False),
+                lstrip=metadata.get("lstrip", False),
+                rstrip=metadata.get("rstrip", False),
+                normalized=metadata.get("normalized", False),
+                special=metadata.get("special", False),
+            )
+        )
+
+    merges_with_ranks = []
+    for token, rank in mergeable_ranks.items():
+        if len(token) == 1:
+            continue
+        local_merges = []
+        for split_index in range(1, len(token)):
+            left, right = token[:split_index], token[split_index:]
+            if left in mergeable_ranks and right in mergeable_ranks:
+                local_merges.append(
+                    (
+                        mergeable_ranks[left],
+                        mergeable_ranks[right],
+                        left,
+                        right,
+                    )
+                )
+        for _, _, left, right in sorted(local_merges):
+            merges_with_ranks.append((rank, left, right))
+
+    merges = [
+        (token_bytes_to_string(left), token_bytes_to_string(right))
+        for _, left, right in sorted(merges_with_ranks, key=lambda item: item[0])
+    ]
+    backend = Tokenizer(BPE(vocab, merges, fuse_unk=False))
+    if hasattr(backend.model, "ignore_merges"):
+        backend.model.ignore_merges = True
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(
+                Regex(_KIMI_K3_PATTERN),
+                behavior="isolated",
+                invert=False,
+            ),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+    backend.decoder = decoders.ByteLevel()
+    backend.post_processor = processors.ByteLevel(trim_offsets=False)
+    backend.add_tokens(added_tokens)
+
+    init_kwargs = {
+        "tokenizer_object": backend,
+        "bos_token": tokenizer_config.get("bos_token"),
+        "eos_token": tokenizer_config.get("eos_token"),
+        "unk_token": tokenizer_config.get("unk_token"),
+        "pad_token": tokenizer_config.get("pad_token"),
+        "additional_special_tokens": tokenizer_config.get(
+            "additional_special_tokens", []
+        ),
+        "clean_up_tokenization_spaces": tokenizer_config.get(
+            "clean_up_tokenization_spaces", False
+        ),
+        "model_max_length": tokenizer_config.get("model_max_length"),
+    }
+    tokenizer_config_extra = tokenizer_config_extra or {}
+    for key in (
+        "padding_side",
+        "truncation_side",
+        "model_max_length",
+        "clean_up_tokenization_spaces",
+    ):
+        if key in tokenizer_config_extra:
+            init_kwargs[key] = tokenizer_config_extra[key]
+
+    tokenizer = _KimiK3TokenizerFast(**init_kwargs)
+    if (
+        tokenizer.vocab_size != expected_vocab_size
+        or len(tokenizer) != expected_vocab_size
+    ):
+        raise ValueError(
+            "Kimi K3 fast tokenizer vocabulary was constructed incorrectly"
+        )
+    return tokenizer
+
+
 def _match(a, b):
     if type(a) != type(b):
         return False
@@ -612,48 +1053,82 @@ def load(
     chat_template = None
 
     tokenizer_config_extra = tokenizer_config_extra or {}
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, **tokenizer_config_extra
-        )
-    except (AttributeError, ValueError) as e:
-        # Transformers may not recognize brand-new model_types (e.g. deepseek_v4
-        # before a transformers release adds it). Fall back to a generic
-        # tokenizer built from the tokenizer.json in the repo.
-        if "config" in tokenizer_config_extra:
-            raise
-        from transformers import PretrainedConfig
-
-        stub_kwargs: Dict[str, Any] = {}
-        model_config_file = model_path / "config.json"
-        if model_config_file.exists():
-            try:
-                with open(model_config_file, "r") as f:
-                    raw = json.load(f)
-                for key in (
-                    "model_type",
-                    "max_position_embeddings",
-                    "vocab_size",
-                    "bos_token_id",
-                    "eos_token_id",
-                    "pad_token_id",
-                ):
-                    if key in raw:
-                        stub_kwargs[key] = raw[key]
-            except (OSError, JSONDecodeError):
-                pass
-
+    is_local_kimi_k3 = _is_local_kimi_k3_tokenizer(model_path)
+    if is_local_kimi_k3:
         warnings.warn(
-            "Falling back to a generic tokenizer because Transformers does "
-            f"not recognize this model config yet: {e}",
+            "Loading Kimi K3's tokenizer from local data without executing "
+            "the checkpoint's custom Python. The safe fallback supports "
+            "text-only XTML chat rendering; tools and media are unavailable.",
             RuntimeWarning,
             stacklevel=2,
         )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            config=PretrainedConfig(**stub_kwargs),
-            **tokenizer_config_extra,
+        tokenizer = _build_local_kimi_k3_tokenizer(model_path, tokenizer_config_extra)
+        detokenizer_class = partial(
+            BPEStreamingDetokenizer,
+            trim_initial_space=False,
         )
+        if eos_token_ids is None:
+            model_config = _read_tokenizer_json(model_path / "config.json")
+            configured_eos = model_config.get("eos_token_id")
+            if configured_eos is None:
+                configured_eos = model_config.get("text_config", {}).get("eos_token_id")
+            if isinstance(configured_eos, int):
+                configured_eos = [configured_eos]
+            elif configured_eos is not None:
+                if not isinstance(configured_eos, (list, tuple)) or not all(
+                    isinstance(token_id, int) for token_id in configured_eos
+                ):
+                    raise ValueError("Kimi K3 eos_token_id must contain integer IDs")
+                configured_eos = list(configured_eos)
+            if configured_eos is not None and any(
+                token_id < 0 or token_id >= len(tokenizer)
+                for token_id in configured_eos
+            ):
+                raise ValueError("Kimi K3 eos_token_id is outside the vocabulary")
+            eos_token_ids = configured_eos
+    else:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, **tokenizer_config_extra
+            )
+        except (AttributeError, ValueError) as e:
+            # Transformers may not recognize brand-new model_types (e.g.
+            # deepseek_v4 before a transformers release adds it). Fall back
+            # to a generic tokenizer built from tokenizer.json in the repo.
+            if "config" in tokenizer_config_extra:
+                raise
+            from transformers import PretrainedConfig
+
+            stub_kwargs: Dict[str, Any] = {}
+            model_config_file = model_path / "config.json"
+            if model_config_file.exists():
+                try:
+                    with open(model_config_file, "r") as f:
+                        raw = json.load(f)
+                    for key in (
+                        "model_type",
+                        "max_position_embeddings",
+                        "vocab_size",
+                        "bos_token_id",
+                        "eos_token_id",
+                        "pad_token_id",
+                    ):
+                        if key in raw:
+                            stub_kwargs[key] = raw[key]
+                except (OSError, JSONDecodeError):
+                    pass
+
+            warnings.warn(
+                "Falling back to a generic tokenizer because Transformers "
+                f"does not recognize this model config yet: {e}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                config=PretrainedConfig(**stub_kwargs),
+                **tokenizer_config_extra,
+            )
 
     tokenizer_config = tokenizer.init_kwargs
 
