@@ -252,11 +252,18 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         cls._byte_decoder = char_to_bytes
 
 
-def _infer_thinking(tokenizer):
-    vocab = tokenizer.get_vocab()
-    if tokenizer.__class__.__name__ == "_KimiK3TokenizerFast":
-        think_start = "<|open|>think<|sep|>"
-        think_end = "<|close|>think<|sep|>"
+def _infer_thinking(tokenizer, thinking_markers=None):
+    if (
+        thinking_markers is None
+        and tokenizer.__class__.__name__ == "_KimiK3TokenizerFast"
+    ):
+        thinking_markers = (
+            "<|open|>think<|sep|>",
+            "<|close|>think<|sep|>",
+        )
+
+    if thinking_markers is not None:
+        think_start, think_end = thinking_markers
         return (
             think_start,
             think_end,
@@ -264,6 +271,7 @@ def _infer_thinking(tokenizer):
             tuple(tokenizer.encode(think_end, add_special_tokens=False)),
         )
 
+    vocab = tokenizer.get_vocab()
     THINK_TOKENS = [
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
@@ -309,6 +317,7 @@ class TokenizerWrapper:
         tool_call_start=None,
         tool_call_end=None,
         tool_parser=None,
+        thinking_markers=None,
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
@@ -322,7 +331,7 @@ class TokenizerWrapper:
             self._think_end,
             self._think_start_tokens,
             self._think_end_tokens,
-        ) = _infer_thinking(tokenizer)
+        ) = _infer_thinking(tokenizer, thinking_markers)
 
         self._chat_template = chat_template
         self.has_chat_template = (
@@ -1054,7 +1063,11 @@ def load(
 
     tokenizer_config_extra = tokenizer_config_extra or {}
     is_local_kimi_k3 = _is_local_kimi_k3_tokenizer(model_path)
-    if is_local_kimi_k3:
+    use_safe_kimi_k3 = (
+        is_local_kimi_k3
+        and tokenizer_config_extra.get("trust_remote_code") is not True
+    )
+    if use_safe_kimi_k3:
         warnings.warn(
             "Loading Kimi K3's tokenizer from local data without executing "
             "the checkpoint's custom Python. The safe fallback supports "
@@ -1067,25 +1080,6 @@ def load(
             BPEStreamingDetokenizer,
             trim_initial_space=False,
         )
-        if eos_token_ids is None:
-            model_config = _read_tokenizer_json(model_path / "config.json")
-            configured_eos = model_config.get("eos_token_id")
-            if configured_eos is None:
-                configured_eos = model_config.get("text_config", {}).get("eos_token_id")
-            if isinstance(configured_eos, int):
-                configured_eos = [configured_eos]
-            elif configured_eos is not None:
-                if not isinstance(configured_eos, (list, tuple)) or not all(
-                    isinstance(token_id, int) for token_id in configured_eos
-                ):
-                    raise ValueError("Kimi K3 eos_token_id must contain integer IDs")
-                configured_eos = list(configured_eos)
-            if configured_eos is not None and any(
-                token_id < 0 or token_id >= len(tokenizer)
-                for token_id in configured_eos
-            ):
-                raise ValueError("Kimi K3 eos_token_id is outside the vocabulary")
-            eos_token_ids = configured_eos
     else:
         try:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -1130,6 +1124,26 @@ def load(
                 **tokenizer_config_extra,
             )
 
+    if is_local_kimi_k3 and eos_token_ids is None:
+        model_config = _read_tokenizer_json(model_path / "config.json")
+        configured_eos = model_config.get("eos_token_id")
+        if configured_eos is None:
+            configured_eos = model_config.get("text_config", {}).get("eos_token_id")
+        if isinstance(configured_eos, int):
+            configured_eos = [configured_eos]
+        elif configured_eos is not None:
+            if not isinstance(configured_eos, (list, tuple)) or not all(
+                isinstance(token_id, int) for token_id in configured_eos
+            ):
+                raise ValueError("Kimi K3 eos_token_id must contain integer IDs")
+            configured_eos = list(configured_eos)
+        if configured_eos is not None and any(
+            token_id < 0 or token_id >= len(tokenizer)
+            for token_id in configured_eos
+        ):
+            raise ValueError("Kimi K3 eos_token_id is outside the vocabulary")
+        eos_token_ids = configured_eos
+
     tokenizer_config = tokenizer.init_kwargs
 
     if chat_template_type := tokenizer_config.get("chat_template_type", False):
@@ -1160,6 +1174,11 @@ def load(
         tool_parser=tool_parser,
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
+        thinking_markers=(
+            ("<|open|>think<|sep|>", "<|close|>think<|sep|>")
+            if is_local_kimi_k3
+            else None
+        ),
     )
 
 

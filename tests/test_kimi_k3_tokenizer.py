@@ -116,7 +116,7 @@ class TestKimiK3Tokenizer(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_safe_loader_bypasses_auto_tokenizer(self):
+    def test_safe_loader_bypasses_auto_tokenizer_when_remote_code_is_disabled(self):
         self.assertTrue(_is_local_kimi_k3_tokenizer(self.model_path))
         with mock.patch(
             "mlx_lm.tokenizer_utils.AutoTokenizer.from_pretrained",
@@ -128,7 +128,7 @@ class TestKimiK3Tokenizer(unittest.TestCase):
                     self.model_path,
                     {
                         "padding_side": "left",
-                        "trust_remote_code": True,
+                        "trust_remote_code": False,
                     },
                 )
 
@@ -155,6 +155,87 @@ class TestKimiK3Tokenizer(unittest.TestCase):
             tokenizer.detokenizer,
             BPEStreamingDetokenizer,
         )
+
+    def test_trusted_remote_code_bypasses_safe_fallback(self):
+        fallback_tokenizer = _build_local_kimi_k3_tokenizer(self.model_path)
+
+        class TikTokenTokenizer:
+            """Match the official remote tokenizer type and public contract."""
+
+            def __len__(self):
+                return len(fallback_tokenizer)
+
+            def __getattr__(self, name):
+                return getattr(fallback_tokenizer, name)
+
+            def get_vocab(self):
+                return fallback_tokenizer.get_vocab()
+
+            def encode(self, text, **kwargs):
+                return fallback_tokenizer.encode(text, **kwargs)
+
+        trusted_tokenizer = TikTokenTokenizer()
+        with mock.patch(
+            "mlx_lm.tokenizer_utils.AutoTokenizer.from_pretrained",
+            return_value=trusted_tokenizer,
+        ) as from_pretrained:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                tokenizer = load(
+                    self.model_path,
+                    {
+                        "padding_side": "left",
+                        "trust_remote_code": True,
+                    },
+                )
+
+        self.assertFalse(
+            any("without executing" in str(item.message) for item in caught)
+        )
+        self.assertEqual(
+            tokenizer.eos_token_ids,
+            {self.first_reserved_id + 2},
+        )
+        self.assertTrue(tokenizer.has_thinking)
+        self.assertEqual(tokenizer.think_start, "<|open|>think<|sep|>")
+        self.assertEqual(tokenizer.think_end, "<|close|>think<|sep|>")
+        self.assertEqual(
+            tokenizer.think_start_tokens,
+            tuple(
+                trusted_tokenizer.encode(
+                    tokenizer.think_start,
+                    add_special_tokens=False,
+                )
+            ),
+        )
+        self.assertEqual(
+            tokenizer.think_end_tokens,
+            tuple(
+                trusted_tokenizer.encode(
+                    tokenizer.think_end,
+                    add_special_tokens=False,
+                )
+            ),
+        )
+        from_pretrained.assert_called_once_with(
+            self.model_path,
+            padding_side="left",
+            trust_remote_code=True,
+        )
+
+    def test_only_literal_true_enables_remote_code(self):
+        with mock.patch(
+            "mlx_lm.tokenizer_utils.AutoTokenizer.from_pretrained",
+            side_effect=AssertionError("AutoTokenizer must not run"),
+        ):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                load(
+                    self.model_path,
+                    {
+                        "trust_remote_code": "true",
+                    },
+                )
 
     def test_explicit_eos_override_wins_over_model_config(self):
         with warnings.catch_warnings():

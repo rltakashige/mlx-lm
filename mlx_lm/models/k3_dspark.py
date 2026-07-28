@@ -56,6 +56,8 @@ class ModelArgs(BaseModelArgs):
     target_layer_ids: Optional[List[int]] = None
     mask_token_id: int = 163837
     markov_rank: int = 256
+    enable_confidence_head: bool = False
+    confidence_head_with_markov: bool = False
     sample_from_anchor: bool = True
     dspark_bonus_anchor: bool = False
     mla_use_nope: bool = False
@@ -249,6 +251,17 @@ class DSparkMarkovHead(nn.Module):
         return self.markov_w2(markov_embed)
 
 
+class AcceptRatePredictor(nn.Module):
+    """Predict the conditional acceptance probability for one draft slot."""
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, 1, bias=True)
+
+    def __call__(self, features: mx.array) -> mx.array:
+        return self.proj(features).squeeze(-1)
+
+
 class Model(nn.Module):
     """The independently loadable DSpark companion.
 
@@ -294,6 +307,15 @@ class Model(nn.Module):
         ]
         self.final_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(args)
+        if args.enable_confidence_head and args.confidence_head_with_markov:
+            confidence_input_dim = args.hidden_size + args.markov_rank
+        else:
+            confidence_input_dim = args.hidden_size
+        self.confidence_head = (
+            AcceptRatePredictor(confidence_input_dim)
+            if args.enable_confidence_head
+            else None
+        )
         self.embed_tokens: Optional[nn.Module] = None
 
     def make_cache(self) -> list[KVCache]:
@@ -343,15 +365,37 @@ class Model(nn.Module):
             mx.async_eval(hidden)
         return self.final_norm(hidden)
 
+    def predict_confidence_step(
+        self,
+        hidden_states: mx.array,
+        prev_token_ids: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
+        """Return raw conditional-acceptance logits for each proposal slot."""
+        if self.confidence_head is None:
+            return None
+        features = hidden_states
+        if self.args.confidence_head_with_markov:
+            if prev_token_ids is None:
+                raise ValueError(
+                    "K3 DSpark confidence head requires previous token ids"
+                )
+            previous_embeddings = self.markov_head.embed(prev_token_ids).astype(
+                hidden_states.dtype
+            )
+            features = mx.concatenate([hidden_states, previous_embeddings], axis=-1)
+        return self.confidence_head(features).astype(mx.float32)
+
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        # The checkpoint's confidence head is reserved for confidence-based
-        # scheduling, which the pinned vLLM DSpark runtime does not wire into
-        # inference yet. The checkpoint embedding is an exact frozen target
-        # copy and is shared instead of loaded a second time.
+        # The checkpoint embedding is an exact frozen target copy and is shared
+        # instead of loaded a second time.
         weights = {
             key: value
             for key, value in weights.items()
-            if not key.startswith(("confidence_head.", "embed_tokens."))
+            if not key.startswith("embed_tokens.")
+            and (
+                self.args.enable_confidence_head
+                or not key.startswith("confidence_head.")
+            )
         }
         # The checkpoint stores MLA's latent K/V expansion as one
         # [heads * (qk_nope + v), kv_rank] matrix. MLX absorbs its K half into
