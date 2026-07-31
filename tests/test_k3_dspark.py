@@ -59,11 +59,25 @@ class TestK3DSparkConfidenceHead(unittest.TestCase):
             hidden,
             prev_token_ids=mx.array([[3]]),
         )
+        markov_embeddings = model.markov_head.embed(mx.array([[3]]))
+        reused_logits = model.predict_confidence_from_markov(
+            hidden,
+            previous_embeddings=markov_embeddings,
+        )
         self.assertIsNotNone(logits)
-        mx.eval(logits)
+        self.assertIsNotNone(reused_logits)
+        mx.eval(logits, reused_logits)
         expected = 1.0 + 4.0 + 9.0 + 16.0 + 35.0 + 48.0 + 0.5
         self.assertAlmostEqual(float(logits.item()), expected, places=5)
         self.assertEqual(logits.dtype, mx.float32)
+        self.assertTrue(mx.array_equal(logits, reused_logits))
+
+    def test_precomputed_markov_embedding_is_required_when_configured(self):
+        model = k3_dspark.Model(tiny_args(confidence=True))
+        with self.assertRaisesRegex(ValueError, "previous-token embeddings"):
+            model.predict_confidence_from_markov(
+                mx.zeros((1, 1, model.args.hidden_size)),
+            )
 
     def test_disabled_model_drops_unused_confidence_weights(self):
         model = k3_dspark.Model(tiny_args(confidence=False))
@@ -75,6 +89,16 @@ class TestK3DSparkConfidenceHead(unittest.TestCase):
             }
         )
         self.assertEqual(sanitized, {})
+
+    def test_disabled_head_returns_none_before_markov_validation(self):
+        args = tiny_args(confidence=False)
+        args.confidence_head_with_markov = True
+        model = k3_dspark.Model(args)
+        self.assertIsNone(
+            model.predict_confidence_step(
+                mx.zeros((1, 1, args.hidden_size)),
+            )
+        )
 
 
 if __name__ == "__main__":

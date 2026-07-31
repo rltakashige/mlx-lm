@@ -373,15 +373,39 @@ class Model(nn.Module):
         """Return raw conditional-acceptance logits for each proposal slot."""
         if self.confidence_head is None:
             return None
-        features = hidden_states
+        previous_embeddings = None
         if self.args.confidence_head_with_markov:
             if prev_token_ids is None:
                 raise ValueError(
                     "K3 DSpark confidence head requires previous token ids"
                 )
-            previous_embeddings = self.markov_head.embed(prev_token_ids).astype(
-                hidden_states.dtype
-            )
+            previous_embeddings = self.markov_head.embed(prev_token_ids)
+        return self.predict_confidence_from_markov(
+            hidden_states,
+            previous_embeddings=previous_embeddings,
+        )
+
+    def predict_confidence_from_markov(
+        self,
+        hidden_states: mx.array,
+        previous_embeddings: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
+        """Predict confidence while reusing an already-looked-up Markov embedding.
+
+        DSpark's causal sampler needs the same previous-token embedding for both
+        its confidence and vocabulary heads. Accepting that embedding directly
+        avoids a duplicate gather at every selected proposal position while the
+        token-id API above remains available to ordinary callers.
+        """
+        if self.confidence_head is None:
+            return None
+        features = hidden_states
+        if self.args.confidence_head_with_markov:
+            if previous_embeddings is None:
+                raise ValueError(
+                    "K3 DSpark confidence head requires previous-token embeddings"
+                )
+            previous_embeddings = previous_embeddings.astype(hidden_states.dtype)
             features = mx.concatenate([hidden_states, previous_embeddings], axis=-1)
         return self.confidence_head(features).astype(mx.float32)
 

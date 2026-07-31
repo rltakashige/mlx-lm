@@ -280,6 +280,17 @@ class TestKimiK3(unittest.TestCase):
         ).astype(mx.float16)
         np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
 
+        unbounded_actual = situ(gate, up, beta=4.0)
+        unbounded_expected = (
+            4.0 * mx.tanh(gate32 / 4.0) * mx.sigmoid(gate32) * up32
+        ).astype(mx.float16)
+        np.testing.assert_allclose(
+            unbounded_actual,
+            unbounded_expected,
+            rtol=0,
+            atol=0,
+        )
+
     def test_kda_lower_bound_decay(self):
         a_log = mx.array([[math.log(2.0)]], dtype=mx.float32)
         raw_gate = mx.array([[[[-0.5], [0.75]]]], dtype=mx.float32)

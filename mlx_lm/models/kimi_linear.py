@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -75,20 +76,40 @@ class ModelArgs(BaseModelArgs):
         return super().from_dict(params)
 
 
+@partial(mx.compile, shapeless=True)
+def _situ(gate: mx.array, up: mx.array, beta: float) -> mx.array:
+    dtype = gate.dtype
+    gate = gate.astype(mx.float32)
+    up = up.astype(mx.float32)
+    gate = beta * mx.tanh(gate / beta) * mx.sigmoid(gate)
+    return (gate * up).astype(dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _situ_linear(
+    gate: mx.array,
+    up: mx.array,
+    beta: float,
+    linear_beta: float,
+) -> mx.array:
+    dtype = gate.dtype
+    gate = gate.astype(mx.float32)
+    up = up.astype(mx.float32)
+    gate = beta * mx.tanh(gate / beta) * mx.sigmoid(gate)
+    up = linear_beta * mx.tanh(up / linear_beta)
+    return (gate * up).astype(dtype)
+
+
 def situ(
     gate: mx.array,
     up: mx.array,
     beta: float = 1.0,
     linear_beta: Optional[float] = None,
 ) -> mx.array:
-    """SiTU-and-multiply with float32 activation intermediates."""
-    dtype = gate.dtype
-    gate = gate.astype(mx.float32)
-    up = up.astype(mx.float32)
-    gate = beta * mx.tanh(gate / beta) * mx.sigmoid(gate)
-    if linear_beta is not None:
-        up = linear_beta * mx.tanh(up / linear_beta)
-    return (gate * up).astype(dtype)
+    """Fused SiTU-and-multiply with float32 activation intermediates."""
+    if linear_beta is None:
+        return _situ(gate, up, beta)
+    return _situ_linear(gate, up, beta, linear_beta)
 
 
 class SituGLU(nn.Module):
