@@ -18,7 +18,6 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
-from .qmv import qlinear
 from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
@@ -111,7 +110,7 @@ class Attention(Qwen3NextAttention):
         kv_dim = self.num_key_value_heads * self.head_dim
 
         q_proj_output, keys, values = mx.split(
-            qlinear(self.qkv_proj, x), [q_dim, q_dim + kv_dim], axis=-1
+            self.qkv_proj(x), [q_dim, q_dim + kv_dim], axis=-1
         )
         queries, gate = mx.split(
             q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
@@ -139,7 +138,7 @@ class Attention(Qwen3NextAttention):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return qlinear(self.o_proj, output * mx.sigmoid(gate))
+        return self.o_proj(output * mx.sigmoid(gate))
 
 
 class MLP(Qwen3NextMLP):
@@ -152,8 +151,8 @@ class MLP(Qwen3NextMLP):
             self.pop(name)
 
     def __call__(self, x) -> mx.array:
-        gate, up = mx.split(qlinear(self.gate_up_proj, x), 2, axis=-1)
-        return qlinear(self.down_proj, swiglu(gate, up))
+        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(swiglu(gate, up))
 
 
 class GatedDeltaNet(nn.Module):
@@ -214,7 +213,7 @@ class GatedDeltaNet(nn.Module):
             inputs = sum_gradients(self.sharding_group)(inputs)
 
         qkv, z, b, a = mx.split(
-            qlinear(self.in_proj, inputs),
+            self.in_proj(inputs),
             [
                 self.conv_dim,
                 self.conv_dim + self.value_dim,
@@ -282,7 +281,7 @@ class GatedDeltaNet(nn.Module):
                 cache.states, cache.conv_input = states[0], conv_input
 
         out = self.norm(out, z)
-        out = qlinear(self.out_proj, out.reshape(B, S, -1))
+        out = self.out_proj(out.reshape(B, S, -1))
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -325,8 +324,6 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
-    async_layers = False
-
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -380,8 +377,6 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
-            if self.async_layers and hidden_states.shape[1] == 1:
-                mx.async_eval(hidden_states)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -448,7 +443,7 @@ class TextModel(nn.Module):
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(hidden)
         else:
-            out = qlinear(self.lm_head, hidden)
+            out = self.lm_head(hidden)
         return (out, hidden) if return_hidden else out
 
     @property
