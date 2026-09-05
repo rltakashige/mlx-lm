@@ -8,16 +8,18 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_map
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
+    scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
-from .qwen3_next import Qwen3NextAttention as Attention
-from .qwen3_next import Qwen3NextMLP as MLP
+from .qmv import qlinear
+from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 
@@ -84,6 +86,76 @@ class TextModelArgs(BaseModelArgs):
             self.rope_scaling = self.rope_parameters
 
 
+class Attention(Qwen3NextAttention):
+    """Qwen3Next attention with q (and its output gate), k and v in one projection."""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__(args)
+        self.qkv_proj = nn.Linear(
+            args.hidden_size,
+            2 * (self.num_attention_heads + self.num_key_value_heads) * self.head_dim,
+            bias=args.attention_bias,
+        )
+        # A module is a dict of its children; drop the separate projections
+        for name in ("q_proj", "k_proj", "v_proj"):
+            self.pop(name)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, L, D = x.shape
+        q_dim = 2 * self.num_attention_heads * self.head_dim
+        kv_dim = self.num_key_value_heads * self.head_dim
+
+        q_proj_output, keys, values = mx.split(
+            qlinear(self.qkv_proj, x), [q_dim, q_dim + kv_dim], axis=-1
+        )
+        queries, gate = mx.split(
+            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(B, L, -1)
+
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+        return qlinear(self.o_proj, output * mx.sigmoid(gate))
+
+
+class MLP(Qwen3NextMLP):
+    """Qwen3Next MLP with the gate and up projections fused."""
+
+    def __init__(self, dim, hidden_dim):
+        super().__init__(dim, hidden_dim)
+        self.gate_up_proj = nn.Linear(dim, 2 * hidden_dim, bias=False)
+        for name in ("gate_proj", "up_proj"):
+            self.pop(name)
+
+    def __call__(self, x) -> mx.array:
+        gate, up = mx.split(qlinear(self.gate_up_proj, x), 2, axis=-1)
+        return qlinear(self.down_proj, swiglu(gate, up))
+
+
 class GatedDeltaNet(nn.Module):
     def __init__(self, config: TextModelArgs):
         super().__init__()
@@ -112,12 +184,12 @@ class GatedDeltaNet(nn.Module):
             padding=0,
         )
 
-        self.in_proj_qkv = nn.Linear(
-            self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
+        # One projection for qkv | z | b | a
+        self.in_proj = nn.Linear(
+            self.hidden_size,
+            2 * self.key_dim + 2 * self.value_dim + 2 * self.num_v_heads,
+            bias=False,
         )
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
         self.dt_bias = mx.ones(self.num_v_heads)
 
@@ -141,10 +213,16 @@ class GatedDeltaNet(nn.Module):
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        qkv, z, b, a = mx.split(
+            qlinear(self.in_proj, inputs),
+            [
+                self.conv_dim,
+                self.conv_dim + self.value_dim,
+                self.conv_dim + self.value_dim + self.num_v_heads,
+            ],
+            axis=-1,
+        )
+        z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -177,9 +255,11 @@ class GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
+        # rms_norm adds eps to mean(x^2); FLA's l2norm adds 1e-6 to sum(x^2)
+        eps = 1e-6 / self.head_k_dim
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, eps)
 
         out, state, *states = gated_delta_update(
             q,
@@ -202,7 +282,7 @@ class GatedDeltaNet(nn.Module):
                 cache.states, cache.conv_input = states[0], conv_input
 
         out = self.norm(out, z)
-        out = self.out_proj(out.reshape(B, S, -1))
+        out = qlinear(self.out_proj, out.reshape(B, S, -1))
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -245,6 +325,8 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
+    async_layers = False
+
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -298,6 +380,8 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+            if self.async_layers and hidden_states.shape[1] == 1:
+                mx.async_eval(hidden_states)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -317,6 +401,31 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
             ]
 
         return self.norm(hidden_states)
+
+
+# Same-input projections fused along the output rows: (module, fused, parts)
+_FUSED_PROJECTIONS = (
+    ("linear_attn", "in_proj", ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")),
+    ("self_attn", "qkv_proj", ("q_proj", "k_proj", "v_proj")),
+    ("mlp", "gate_up_proj", ("gate_proj", "up_proj")),
+)
+
+
+def fuse_projections(weights):
+    """Concatenate separate projections into the fused ones, in any key prefix.
+
+    Exact for quantized weights: ``weight``, ``scales`` and ``biases`` are all
+    indexed by output row on axis 0.
+    """
+    for module, fused, parts in _FUSED_PROJECTIONS:
+        marker = f".{module}.{parts[0]}."
+        for key in [k for k in weights if marker in k]:
+            prefix, param = key.split(marker)
+            weights[f"{prefix}.{module}.{fused}.{param}"] = mx.concatenate(
+                [weights.pop(f"{prefix}.{module}.{part}.{param}") for part in parts],
+                axis=0,
+            )
+    return weights
 
 
 class TextModel(nn.Module):
@@ -339,7 +448,7 @@ class TextModel(nn.Module):
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(hidden)
         else:
-            out = self.lm_head(hidden)
+            out = qlinear(self.lm_head, hidden)
         return (out, hidden) if return_hidden else out
 
     @property
@@ -357,6 +466,8 @@ class TextModel(nn.Module):
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+
+        weights = fuse_projections(weights)
 
         norm_keys = (
             ".input_layernorm.weight",
@@ -457,42 +568,46 @@ class Model(nn.Module):
         def conv_sharding(key_dim):
             return lambda p, w: (0, [key_dim, 2 * key_dim])
 
-        def repeat_kv_layer_inplace(layer, h):
+        def repeat_kv_inplace(attn):
             # No repeat needed cause we have more heads than nodes
+            h = attn.num_key_value_heads
             if N <= h:
                 return
+            q_dim = 2 * attn.num_attention_heads * attn.head_dim
 
-            # Repeat function to apply to the layer weights
+            # Repeat the k and v rows of the fused projection
             def _repeat(p):
-                s = p.shape
-                p = p.reshape(h, s[0] // h, *s[1:])
-                p = mx.repeat(p, N // h, axis=0)
-                p = p.reshape(-1, *s[1:])
-                return p
+                q, k, v = mx.split(p, [q_dim, q_dim + h * attn.head_dim], axis=0)
+                k, v = (
+                    mx.repeat(t.reshape(h, -1, *t.shape[1:]), N // h, axis=0).reshape(
+                        -1, *t.shape[1:]
+                    )
+                    for t in (k, v)
+                )
+                return mx.concatenate([q, k, v], axis=0)
 
-            layer.update(tree_map(_repeat, layer.parameters()))
+            attn.qkv_proj.update(tree_map(_repeat, attn.qkv_proj.parameters()))
 
         for layer in self.layers:
             # Linear attention
             if layer.is_linear:
                 kd = layer.linear_attn.key_dim
+                vd = layer.linear_attn.value_dim
+                nv = layer.linear_attn.num_v_heads
                 layer.linear_attn.sharding_group = group
                 shard_inplace(layer.linear_attn.conv1d, conv_sharding(kd), group=group)
                 layer.linear_attn.conv1d.groups //= N
                 shard_inplace(
-                    layer.linear_attn.in_proj_qkv,
+                    layer.linear_attn.in_proj,
                     "all-to-sharded",
-                    segments=[kd, 2 * kd],
+                    segments=[
+                        kd,
+                        2 * kd,
+                        2 * kd + vd,
+                        2 * kd + 2 * vd,
+                        2 * kd + 2 * vd + nv,
+                    ],
                     group=group,
-                )
-                shard_inplace(
-                    layer.linear_attn.in_proj_z, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.linear_attn.in_proj_b, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.linear_attn.in_proj_a, "all-to-sharded", group=group
                 )
                 layer.linear_attn.dt_bias = mx.contiguous(
                     mx.split(layer.linear_attn.dt_bias, N)[rank]
@@ -509,39 +624,27 @@ class Model(nn.Module):
 
             # Softmax attention
             else:
-                layer.self_attn.o_proj = shard_linear(
-                    layer.self_attn.o_proj, "sharded-to-all", group=group
+                attn = layer.self_attn
+                attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+                repeat_kv_inplace(attn)
+                q_dim = 2 * attn.num_attention_heads * attn.head_dim
+                kv_dim = max(attn.num_key_value_heads, N) * attn.head_dim
+                shard_inplace(
+                    attn.qkv_proj,
+                    "all-to-sharded",
+                    segments=[q_dim, q_dim + kv_dim],
+                    group=group,
                 )
-                layer.self_attn.q_proj = shard_linear(
-                    layer.self_attn.q_proj, "all-to-sharded", group=group
-                )
-                repeat_kv_layer_inplace(
-                    layer.self_attn.k_proj, layer.self_attn.num_key_value_heads
-                )
-                repeat_kv_layer_inplace(
-                    layer.self_attn.v_proj, layer.self_attn.num_key_value_heads
-                )
-                layer.self_attn.k_proj = shard_linear(
-                    layer.self_attn.k_proj, "all-to-sharded", group=group
-                )
-                layer.self_attn.v_proj = shard_linear(
-                    layer.self_attn.v_proj, "all-to-sharded", group=group
-                )
-                layer.self_attn.num_attention_heads //= N
-                layer.self_attn.num_key_value_heads = max(
-                    1, layer.self_attn.num_key_value_heads // N
-                )
+                attn.num_attention_heads //= N
+                attn.num_key_value_heads = max(1, attn.num_key_value_heads // N)
 
             # MLP
             if isinstance(layer.mlp, MLP):
-                layer.mlp.gate_proj = shard_linear(
-                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                shard_inplace(
+                    layer.mlp.gate_up_proj, "all-to-sharded", segments=2, group=group
                 )
                 layer.mlp.down_proj = shard_linear(
                     layer.mlp.down_proj, "sharded-to-all", group=group
-                )
-                layer.mlp.up_proj = shard_linear(
-                    layer.mlp.up_proj, "all-to-sharded", group=group
                 )
 
             # MoE

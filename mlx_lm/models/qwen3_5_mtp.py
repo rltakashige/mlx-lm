@@ -9,7 +9,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask
 from .cache import KVCache
-from .qwen3_5 import DecoderLayer, TextModelArgs
+from .qwen3_5 import DecoderLayer, TextModelArgs, fuse_projections
 
 
 @dataclass
@@ -70,12 +70,13 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # HF layout: "mtp." prefix and norm weights stored as (actual - 1)
-        if not any(k.startswith("mtp.") for k in weights):
-            return weights
-        weights = {k[4:]: v for k, v in weights.items() if k.startswith("mtp.")}
-        return {
-            k: v + 1.0 if v.ndim == 1 and "norm" in k else v for k, v in weights.items()
-        }
+        if any(k.startswith("mtp.") for k in weights):
+            weights = {k[4:]: v for k, v in weights.items() if k.startswith("mtp.")}
+            weights = {
+                k: v + 1.0 if v.ndim == 1 and "norm" in k else v
+                for k, v in weights.items()
+            }
+        return fuse_projections(weights)
 
 
 def load_bundled(model_path):
