@@ -18,6 +18,20 @@ class ModelArgs(BaseModelArgs):
         return super().from_dict(params)
 
 
+def split_experts(weights):
+    """Split the stacked HF ``experts`` tensors into the switch_mlp projections."""
+    for key in [k for k in weights if k.endswith(".experts.gate_up_proj")]:
+        prefix = key[: -len("experts.gate_up_proj")]
+        gate_up = weights.pop(key)
+        mid = gate_up.shape[-2] // 2
+        weights[f"{prefix}switch_mlp.gate_proj.weight"] = gate_up[..., :mid, :]
+        weights[f"{prefix}switch_mlp.up_proj.weight"] = gate_up[..., mid:, :]
+        weights[f"{prefix}switch_mlp.down_proj.weight"] = weights.pop(
+            f"{prefix}experts.down_proj"
+        )
+    return weights
+
+
 class Model(Qwen3_5Model):
 
     def sanitize(self, weights):
@@ -33,20 +47,4 @@ class Model(Qwen3_5Model):
                 key = "language_model." + key
             new_weights[key] = value
 
-        for l in range(self.language_model.args.num_hidden_layers):
-            prefix = f"language_model.model.layers.{l}.mlp"
-            gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in new_weights:
-                gate_up = new_weights.pop(gate_up_key)
-                mid = gate_up.shape[-2] // 2
-                new_weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
-                    ..., :mid, :
-                ]
-                new_weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
-                    ..., mid:, :
-                ]
-                new_weights[f"{prefix}.switch_mlp.down_proj.weight"] = new_weights.pop(
-                    f"{prefix}.experts.down_proj"
-                )
-
-        return self.language_model.sanitize(new_weights)
+        return self.language_model.sanitize(split_experts(new_weights))

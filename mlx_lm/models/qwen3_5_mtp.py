@@ -10,6 +10,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask
 from .cache import KVCache
 from .qwen3_5 import DecoderLayer, TextModelArgs, fuse_projections
+from .qwen3_5_moe import split_experts
 
 
 @dataclass
@@ -76,7 +77,7 @@ class Model(nn.Module):
                 k: v + 1.0 if v.ndim == 1 and "norm" in k else v
                 for k, v in weights.items()
             }
-        return fuse_projections(weights)
+        return fuse_projections(split_experts(weights))
 
 
 def load_bundled(model_path):
