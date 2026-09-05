@@ -17,6 +17,7 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .models.cache import (
+    ArraysCache,
     QuantizedKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
@@ -491,7 +492,9 @@ def speculative_generate_step(
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        draft_model (nn.Module): The draft model for speculative decoding.
+        draft_model (nn.Module): The draft model for speculative decoding. A
+          multi-token prediction head (``needs_hidden``) is bound to the model
+          and fed its hidden states.
         num_draft_tokens (int, optional): The number of draft tokens for
           speculative decoding. Default: ``2``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
@@ -517,6 +520,10 @@ def speculative_generate_step(
 
     y = prompt.astype(mx.uint32)
     prev_tokens = None
+    mtp = getattr(draft_model, "needs_hidden", False)
+    hidden = None
+    if mtp:
+        draft_model.bind(model)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -525,12 +532,6 @@ def speculative_generate_step(
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
-
-    if not can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
-        raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
-        )
 
     sampler = sampler or greedy_sampler
 
@@ -550,9 +551,16 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1):
+    def _step(model, cache, y, n_predict=1, hidden=None):
         with mx.stream(generation_stream):
-            logits = model(y[None], cache=cache)
+            # The MTP drafter is given the hidden states of the tokens
+            if hidden is not None:
+                logits, hidden = model(y[None], hidden, cache=cache)
+                hidden = hidden[:, -1:]
+            elif mtp:
+                logits, hidden = model(y[None], cache=cache, return_hidden=True)
+            else:
+                logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
             quantize_cache_fn(cache)
@@ -570,11 +578,11 @@ def speculative_generate_step(
                     y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
                     out_y.append(y)
                     out_logprobs.append(logprobs)
-                return mx.concatenate(out_y, axis=0), mx.concatenate(
-                    out_logprobs, axis=0
-                )
+                y = mx.concatenate(out_y, axis=0)
+                logprobs = mx.concatenate(out_logprobs, axis=0)
             else:
-                return _process_and_sample(None, logits.squeeze(0))
+                y, logprobs = _process_and_sample(None, logits.squeeze(0))
+            return y, logprobs, hidden
 
     def _prefill(model, cache, y):
         while y.size > 1:
@@ -586,6 +594,27 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
+    def _prefill_mtp(y):
+        nonlocal hidden
+        while y.size > 1:
+            n = min(prefill_step_size, y.size - 1)
+            _, h = model(y[:n][None], cache=model_cache, return_hidden=True)
+            if hidden is not None:
+                h = mx.concatenate([hidden, h], axis=1)
+            # Seed the drafter with each token and the hidden state before it
+            if h.shape[1] > 1:
+                draft_model(
+                    y[n + 1 - h.shape[1] : n][None], h[:, :-1], cache=draft_cache
+                )
+                quantize_cache_fn(draft_cache)
+                mx.eval([c.state for c in draft_cache])
+            hidden = h[:, -1:]
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache], hidden)
+            y = y[n:]
+            mx.clear_cache()
+        return y
+
     def _rewind_cache(num_draft, num_accept):
         trim_prompt_cache(model_cache, num_draft - num_accept)
         trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
@@ -594,30 +623,48 @@ def speculative_generate_step(
         if num_draft == 0:
             return mx.array([], mx.uint32)
         ys = []
+        h = hidden
         for _ in range(num_draft):
-            y, _ = _step(draft_model, draft_cache, y)
+            y, _, h = _step(draft_model, draft_cache, y, hidden=h)
             mx.async_eval(y)
             ys.append(y)
         return mx.concatenate(ys)
 
     with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
-        y = _prefill(model, model_cache, y)
+        if mtp:
+            y = _prefill_mtp(y)
+        else:
+            _prefill(draft_model, draft_cache, y)
+            y = _prefill(model, model_cache, y)
+        draft_y = y
 
         ntoks = 0
         # Set these so the finally block doesn't raise
         num_draft = 0
         n = 0
         try:
+            for c in model_cache:
+                if isinstance(c, ArraysCache):
+                    c.keep_states = True
+            if not can_trim_prompt_cache(model_cache):
+                types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+                raise ValueError(
+                    "Speculative decoding requires a trimmable prompt cache "
+                    f"(got {types})."
+                )
             while True:
                 num_draft = min(max_tokens - ntoks, num_draft_tokens)
+                if mtp and hidden is None:
+                    num_draft = 0
                 draft_tokens = _draft_generate(draft_y, num_draft)
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[
                         : prev_tokens.size - y.size - num_draft + 1
                     ]
                 y = mx.concatenate([y, draft_tokens])
-                tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+                tokens, logprobs, hidden_out = _step(
+                    model, model_cache, y, num_draft + 1
+                )
                 mx.eval(tokens, draft_tokens)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
@@ -648,12 +695,17 @@ def speculative_generate_step(
                     draft_y = mx.concatenate(
                         [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
                     )
+                if mtp:
+                    hidden = hidden_out[:, n + 1 - draft_y.size : n + 1]
 
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
                 _rewind_cache(num_draft, n)
         finally:
             _rewind_cache(num_draft, n)
+            for c in model_cache:
+                if isinstance(c, ArraysCache):
+                    c.keep_states = False
 
 
 def stream_generate(

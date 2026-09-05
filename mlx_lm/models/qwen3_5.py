@@ -181,7 +181,7 @@ class GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(
+        out, state, *states = gated_delta_update(
             q,
             k,
             v,
@@ -192,11 +192,14 @@ class GatedDeltaNet(nn.Module):
             state,
             mask,
             use_kernel=not self.training,
+            return_states=cache is not None and cache.keep_states and S > 1,
         )
 
         if cache is not None:
             cache[1] = state
             cache.advance(S)
+            if states:
+                cache.states, cache.conv_input = states[0], conv_input
 
         out = self.norm(out, z)
         out = self.out_proj(out.reshape(B, S, -1))
@@ -330,13 +333,14 @@ class TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        hidden = self.model(inputs, cache, input_embeddings=input_embeddings)
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            out = self.model.embed_tokens.as_linear(hidden)
         else:
-            out = self.lm_head(out)
-        return out
+            out = self.lm_head(hidden)
+        return (out, hidden) if return_hidden else out
 
     @property
     def layers(self):
@@ -415,9 +419,13 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            return_hidden=return_hidden,
         )
 
     @property

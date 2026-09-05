@@ -596,6 +596,10 @@ class ArraysCache(_BaseCache):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
+        # With keep_states set, layers record per-step snapshots for trim()
+        instance.keep_states = False
+        instance.states = None
+        instance.conv_input = None
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -692,6 +696,20 @@ class ArraysCache(_BaseCache):
             self.lengths -= N
         if self.left_padding is not None:
             self.left_padding -= N
+
+    def is_trimmable(self):
+        return self.keep_states
+
+    def trim(self, n):
+        if self.states is None:
+            return 0
+        T = self.states.shape[1]
+        n = min(n, T - 1)
+        self[1] = self.states[:, T - 1 - n]
+        self[0] = self.conv_input[:, T - n : self.conv_input.shape[1] - n]
+        self.advance(-n)
+        self.states = self.conv_input = None
+        return n
 
     def make_mask(self, N: int):
         if self.left_padding is not None:
