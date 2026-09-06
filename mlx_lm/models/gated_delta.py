@@ -90,7 +90,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_states=Fal
         {g_setup}
         auto beta_ = beta + b_idx * T * Hv;
 
-        for (int t = 0; t < T; ++t) {{
+        for (int t = 0; t < steps; ++t) {{
           if ({mask_source}) {{
             float kv_mem = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {{
@@ -129,7 +129,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_states=Fal
           o_state[s_idx] = static_cast<StT>(state[i]);
         }}
     """
-    inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
+    inputs = ["q", "k", "v", "g", "beta", "state_in", "T", "steps"]
     if has_mask:
         inputs.append("mask")
 
@@ -308,7 +308,7 @@ def _make_gated_delta_packed_kernel():
         auto g_ = g + b_idx * T * Hv;
         auto beta_ = beta + b_idx * T * Hv;
 
-        for (int t = 0; t < T; ++t) {
+        for (int t = 0; t < steps; ++t) {
           float gt = static_cast<float>(g_[hv_idx]);
 
           // Partials mirror the generic kernel: each 4-element chain is one
@@ -367,7 +367,7 @@ def _make_gated_delta_packed_kernel():
     """
     return mx.fast.metal_kernel(
         name="gated_delta_step_packed_btree",
-        input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
+        input_names=["q", "k", "v", "g", "beta", "state_in", "T", "steps"],
         output_names=["y", "state_out"],
         source=source,
     )
@@ -440,6 +440,7 @@ def _gated_delta_kernel_impl(
     *,
     allow_packed: bool,
     return_states: bool = False,
+    steps=None,
 ) -> Tuple[mx.array, ...]:
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
@@ -459,7 +460,7 @@ def _gated_delta_kernel_impl(
         and state.dtype == mx.float32
     )
 
-    inputs = [q, k, v, g, beta, state, T]
+    inputs = [q, k, v, g, beta, state, T, T if steps is None else steps]
     if mask is not None:
         inputs.append(mask)
     output_shapes = [(B, T, Hv, Dv), state.shape]
@@ -551,9 +552,19 @@ def gated_delta_kernel(
     state: mx.array,
     mask: Optional[mx.array] = None,
     return_states: bool = False,
+    steps=None,
 ) -> Tuple[mx.array, ...]:
     return _gated_delta_kernel_impl(
-        q, k, v, g, beta, state, mask, allow_packed=True, return_states=return_states
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        mask,
+        allow_packed=True,
+        return_states=return_states,
+        steps=steps,
     )
 
 
@@ -566,6 +577,7 @@ def gated_delta_ops(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     return_states: bool = False,
+    steps=None,
 ) -> Tuple[mx.array, ...]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
@@ -583,6 +595,8 @@ def gated_delta_ops(
     """
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
+    if steps is not None:
+        T = int(steps)
     if state is None:
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
@@ -622,6 +636,7 @@ def gated_delta_update(
     use_kernel: bool = True,
     lower_bound: float | None = None,
     return_states: bool = False,
+    steps=None,
 ) -> Tuple[mx.array, ...]:
     """Gated delta rule recurrence.
 
@@ -629,7 +644,8 @@ def gated_delta_update(
     (e.g. ``inv_scale = Dk**-0.5; q = inv_scale**2 * rms_norm(q, eps);
     k = inv_scale * rms_norm(k, eps)``). The helper applies no scale of its own.
     With ``return_states`` the state after every step ``[B, T, Hv, Dv, Dk]`` is
-    also returned.
+    also returned. ``steps`` (an int or a device scalar) runs only the first
+    steps of the sequence.
     """
     beta = mx.sigmoid(b)
     if lower_bound is None:
@@ -648,5 +664,5 @@ def gated_delta_update(
         or k.shape[-1] < 32
         or k.shape[-1] % 32 != 0
     ):
-        return gated_delta_ops(q, k, v, g, beta, state, mask, return_states)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask, return_states)
+        return gated_delta_ops(q, k, v, g, beta, state, mask, return_states, steps)
+    return gated_delta_kernel(q, k, v, g, beta, state, mask, return_states, steps)

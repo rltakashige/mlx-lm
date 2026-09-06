@@ -197,13 +197,16 @@ class TestQwen3_5MTP(unittest.TestCase):
                 if isinstance(c, ArraysCache):
                     c.keep_states = True
             target(tokens, cache=cache)
+            for c in cache:
+                if isinstance(c, ArraysCache):
+                    c.stage(mx.array(3))
             self.assertEqual(trim_prompt_cache(cache, 2), 2)
 
             expected = make_prompt_cache(target)
             target(tokens[:, :3], cache=expected)
             for c, e in zip(cache, expected):
                 if isinstance(c, ArraysCache):
-                    self.assertIsNone(c.states)
+                    self.assertIsNone(c.rollback)
                     self.assertTrue(mx.allclose(c[0], e[0], atol=1e-6))
                     self.assertTrue(mx.allclose(c[1], e[1], atol=1e-6))
                 else:
@@ -230,7 +233,12 @@ class TestQwen3_5MTP(unittest.TestCase):
                         self.assertEqual(tokens, expected)
                 for stop in (0.0, 0.9):
                     tokens, _ = _speculative(
-                        PROMPT, target, head, 32, num_draft_tokens=3, draft_stop_prob=stop
+                        PROMPT,
+                        target,
+                        head,
+                        32,
+                        num_draft_tokens=3,
+                        draft_stop_prob=stop,
                     )
                     self.assertEqual(tokens, expected)
             # A one token prompt has no hidden state before the first target step

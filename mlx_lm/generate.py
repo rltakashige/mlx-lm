@@ -671,9 +671,9 @@ def speculative_generate_step(
         num_draft = 0
         n = 0
         try:
-            for c in model_cache:
-                if isinstance(c, ArraysCache):
-                    c.keep_states = True
+            gdn_caches = [c for c in model_cache if isinstance(c, ArraysCache)]
+            for c in gdn_caches:
+                c.keep_states = True
             if not can_trim_prompt_cache(model_cache):
                 types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
                 raise ValueError(
@@ -694,17 +694,31 @@ def speculative_generate_step(
                 tokens, logprobs, hidden_out = _step(
                     model, model_cache, y, num_draft + 1
                 )
+                mx.async_eval(tokens, draft_tokens)
+                # Build the state rollback for the accepted count while the verify runs
+                accepted = mx.sum(
+                    mx.cumprod((tokens[:-1] == draft_tokens).astype(mx.int32))
+                )
+                for c in gdn_caches:
+                    c.stage(accepted + 1)
                 mx.eval(tokens, draft_tokens)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
+                n_accept = 0
+                while (
+                    n_accept < num_draft and tokens[n_accept] == draft_tokens[n_accept]
+                ):
+                    n_accept += 1
+                if n_accept < num_draft:
+                    # Run the rollback while the tokens are consumed
+                    mx.async_eval(
+                        [c.staged for c in gdn_caches if c.staged is not None]
+                    )
                 n = 0
-                while n < num_draft:
-                    tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
-                    if tn != dtn:
-                        break
+                while n < n_accept:
                     n += 1
                     ntoks += 1
-                    yield tn, lpn, True
+                    yield tokens[n - 1], logprobs[n - 1], True
                     if ntoks == max_tokens:
                         break
                 if ntoks < max_tokens:
@@ -731,10 +745,12 @@ def speculative_generate_step(
                     prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
                 _rewind_cache(num_draft, n)
         finally:
+            # Fewer tokens than accepted may have been yielded: do not use the staged state
+            for c in gdn_caches:
+                c.staged = None
             _rewind_cache(num_draft, n)
-            for c in model_cache:
-                if isinstance(c, ArraysCache):
-                    c.keep_states = False
+            for c in gdn_caches:
+                c.keep_states = False
 
 
 def stream_generate(

@@ -596,9 +596,11 @@ class ArraysCache(_BaseCache):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
-        # With keep_states set, layers record per-step snapshots for trim()
+        # With keep_states set, layers record what trim() needs to roll back
         instance.keep_states = False
-        instance.states = None
+        instance.rollback = None
+        instance.staged = None
+        instance.steps = 0
         instance.conv_input = None
         return instance
 
@@ -700,15 +702,22 @@ class ArraysCache(_BaseCache):
     def is_trimmable(self):
         return self.keep_states
 
+    def stage(self, steps):
+        """Build the state after ``steps`` steps before the trim count is known."""
+        if self.rollback is not None:
+            self.staged = self.rollback(steps)
+
     def trim(self, n):
-        if self.states is None:
+        if self.rollback is None:
             return 0
-        T = self.states.shape[1]
+        T = self.steps
         n = min(n, T - 1)
-        self[1] = self.states[:, T - 1 - n]
-        self[0] = self.conv_input[:, T - n : self.conv_input.shape[1] - n]
-        self.advance(-n)
-        self.states = self.conv_input = None
+        if n:
+            state = self.staged if self.staged is not None else self.rollback(T - n)
+            self[1] = state
+            self[0] = self.conv_input[:, T - n : self.conv_input.shape[1] - n]
+            self.advance(-n)
+        self.rollback = self.staged = self.conv_input = None
         return n
 
     def make_mask(self, N: int):

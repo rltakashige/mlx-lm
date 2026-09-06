@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -261,14 +262,15 @@ class GatedDeltaNet(nn.Module):
             )
         ]
 
-        state = cache[1] if cache else None
+        state_in = cache[1] if cache else None
         # rms_norm adds eps to mean(x^2); FLA's l2norm adds 1e-6 to sum(x^2)
         eps = 1e-6 / self.head_k_dim
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
         k = inv_scale * mx.fast.rms_norm(k, None, eps)
 
-        out, state, *states = gated_delta_update(
+        update = functools.partial(
+            gated_delta_update,
             q,
             k,
             v,
@@ -276,17 +278,19 @@ class GatedDeltaNet(nn.Module):
             b,
             self.A_log,
             self.dt_bias,
-            state,
+            state_in,
             mask,
             use_kernel=not self.training,
-            return_states=cache is not None and cache.keep_states and S > 1,
         )
+        out, state = update()
 
         if cache is not None:
             cache[1] = state
             cache.advance(S)
-            if states:
-                cache.states, cache.conv_input = states[0], conv_input
+            if cache.keep_states and S > 1:
+                # A rollback reruns the first accepted steps from these inputs
+                cache.rollback = lambda steps: update(steps=steps)[1]
+                cache.steps, cache.conv_input = S, conv_input
 
         prepped = prep_gated_norm(self.norm, out, z, self.out_proj)
         if prepped is not None:
