@@ -41,58 +41,125 @@ _ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 _SCALE = (1.0, 1.0, 1 / 16, 1 / 16, 1.0, 1.0, 1 / 16, 1 / 16)
 
 
+_HEADER = """
+template <typename T> struct Unpack;
+template <> struct Unpack<bfloat16_t> {
+  static inline float2 f(uint u) { return float2(as_type<float>(u << 16), as_type<float>(u & 0xffff0000u)); }
+};
+template <> struct Unpack<half> {
+  static inline float2 f(uint u) { return float2(as_type<half2>(u)); }
+};
+
+// 16 consecutive T values as floats through two 16-byte loads.
+template <typename T>
+inline void load16(const device T* p, thread float* v) {
+  const device uint4* q = (const device uint4*)p;
+  const uint4 a = q[0], b = q[1];
+  const uint u[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  #pragma clang loop unroll(full)
+  for (int i = 0; i < 8; i++) {
+    const float2 f = Unpack<T>::f(u[i]);
+    v[2 * i] = f.x;
+    v[2 * i + 1] = f.y;
+  }
+}
+
+inline float sigmoid_f(float g) { return 1.0f / (1.0f + metal::exp(-g)); }
+"""
+
+
+def _prep_threads(K):
+    """Chunks of 16 values per thread and threads per row."""
+    chunks = K // 16
+    cpt = 1 if chunks <= 1024 else 2
+    nt = (-(-chunks // cpt) + 31) // 32 * 32
+    return cpt, nt
+
+
 def _prep_source(K, M, kind, eps=0.0):
-    """One threadgroup per row: producer op in fp32, row max, then fp16 store.
+    """One threadgroup per row: the values stay in registers between the row max and the store.
 
     kind: "copy" (x), "rms_norm" (x * rsqrt(mean(x^2) + eps) * weight), "swiglu"
-    (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]).
+    (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(weight)).
     """
     Mp = _mp(M)
+    C = K // 16
+    CPT, NT = _prep_threads(K)
     stores = "\n".join(
-        f"      h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
+        f"        h[{c * 8 + j}] = half(v[jj][{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
         for c in range(2)
         for j in range(8)
     )
     if kind == "rms_norm":
-        head = f"""
-    const device T* xr = x + (size_t)m * K;
-    float ss = 0.0f;
-    for (int k = t; k < K; k += NT) {{
-      const float v = float(xr[k]);
-      ss += v * v;
-    }}
+        loads = """
+      load16(x + (size_t)m * K + c * 16, v[jj]);
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) ss += v[jj][i] * v[jj][i];"""
+        norm = """
     ss = simd_sum(ss);
     if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     ss = 0.0f;
     for (int i = 0; i < NT / 32; i++) ss += red[i];
     const float rs = rsqrt(ss / K + {eps}f);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    #define VAL(k) (float(xr[k]) * rs * float(weight[k]))
-"""
+    for (int jj = 0; jj < CPT; jj++) {{
+      const int c = t + jj * NT;
+      if (c < C) {{
+        float wv[16];
+        load16(weight + c * 16, wv);
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) v[jj][i] *= rs * wv[i];
+      }}
+    }}"""
     elif kind == "swiglu":
-        head = """
-    const device T* xr = x + (size_t)m * 2 * K;
-    #define VAL(k) (float(xr[k]) / (1.0f + metal::exp(-float(xr[k]))) * float(xr[K + (k)]))
-"""
+        loads = """
+      float g[16];
+      load16(x + (size_t)m * 2 * K + c * 16, g);
+      load16(x + (size_t)m * 2 * K + K + c * 16, v[jj]);
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) v[jj][i] *= g[i] * sigmoid_f(g[i]);"""
+        norm = ""
+    elif kind == "gate":
+        loads = """
+      float g[16];
+      load16(x + (size_t)m * K + c * 16, v[jj]);
+      load16(weight + (size_t)m * K + c * 16, g);
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) v[jj][i] *= sigmoid_f(g[i]);"""
+        norm = ""
     else:
-        head = """
-    const device T* xr = x + (size_t)m * K;
-    #define VAL(k) float(xr[k])
-"""
+        loads = """
+      load16(x + (size_t)m * K + c * 16, v[jj]);"""
+        norm = ""
+    loads = loads.replace("{_UNROLL}", _UNROLL)
+    norm = norm.replace("{_UNROLL}", _UNROLL).replace("{eps}", repr(float(eps)))
     return f"""
-    constexpr int K = {K}, Mp = {Mp}, NT = 256;
+    constexpr int K = {K}, C = {C}, CPT = {CPT}, NT = {NT}, Mp = {Mp};
     const int m = threadgroup_position_in_grid.x;
     const int t = thread_position_in_threadgroup.x;
-    threadgroup float red[NT / 32];
-{head}
+    threadgroup float red[32];
+    threadgroup float red2[32];
+    float v[CPT][16];
+    float ss = 0.0f;
+    for (int jj = 0; jj < CPT; jj++) {{
+      const int c = t + jj * NT;
+      if (c < C) {{{loads}
+      }} else {{
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) v[jj][i] = 0.0f;
+      }}
+    }}
+    (void)ss;{norm}
     float amax = 0.0f;
-    for (int k = t; k < K; k += NT) amax = max(amax, fabs(VAL(k)));
+    for (int jj = 0; jj < CPT; jj++) {{
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) amax = max(amax, fabs(v[jj][i]));
+    }}
     amax = simd_max(amax);
-    if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = amax;
+    if (thread_index_in_simdgroup == 0) red2[simdgroup_index_in_threadgroup] = amax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    amax = red[0];
-    for (int i = 1; i < NT / 32; i++) amax = max(amax, red[i]);
+    amax = red2[0];
+    for (int i = 1; i < NT / 32; i++) amax = max(amax, red2[i]);
     // Scale the row so max |x| is in [4, 8): fp16 partials stay far from overflow.
     int e = 0;
     float sc = 1.0f;
@@ -101,21 +168,75 @@ def _prep_source(K, M, kind, eps=0.0):
       sc = ldexp(1.0f, 3 - e);
     }}
     if (t == 0) rscale[m] = 1.0f / sc;
-    for (int c = t; c < K / 16; c += NT) {{
-      float v[16];
-      {_UNROLL}
-      for (int i = 0; i < 16; i++) v[i] = VAL(c * 16 + i);
-      float s = 0.0f;
-      {_UNROLL}
-      for (int i = 0; i < 16; i++) s += v[i];
-      xsum[c * Mp + m] = s * sc;
-      half h[16];
+    for (int jj = 0; jj < CPT; jj++) {{
+      const int c = t + jj * NT;
+      if (c < C) {{
+        float s = 0.0f;
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) s += v[jj][i];
+        xsum[c * Mp + m] = s * sc;
+        half h[16];
 {stores}
-      device half4* o = (device half4*)(x16 + (size_t)m * K + c * 16);
-      {_UNROLL}
-      for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
+        device half4* o = (device half4*)(x16 + (size_t)m * K + c * 16);
+        {_UNROLL}
+        for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
+      }}
     }}
-    #undef VAL
+"""
+
+
+def _prep_gated_norm_source(K, M, D, eps):
+    """Per-head RMSNorm (over D) times silu(gate), one thread per 16 values, K / 16 threads per row."""
+    Mp = _mp(M)
+    NT = K // 16
+    assert NT % 32 == 0 and NT <= 1024 and D % 16 == 0 and D <= 16 * 32
+    stores = "\n".join(
+        f"    h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));" for c in range(2) for j in range(8)
+    )
+    return f"""
+    constexpr int K = {K}, D = {D}, Mp = {Mp}, NT = {NT}, TPH = D / 16;
+    const int m = threadgroup_position_in_grid.x;
+    const int t = thread_position_in_threadgroup.x;
+    const int k0 = t * 16;
+    float v[16], g[16], wv[16];
+    load16(x + (size_t)m * K + k0, v);
+    load16(z + (size_t)m * K + k0, g);
+    load16(weight + (k0 % D), wv);
+    float ss = 0.0f;
+    {_UNROLL}
+    for (int i = 0; i < 16; i++) ss += v[i] * v[i];
+    // The TPH threads of one head are adjacent lanes of one simdgroup.
+    {_UNROLL}
+    for (int o = TPH / 2; o > 0; o >>= 1) ss += simd_shuffle_xor(ss, o);
+    const float rs = rsqrt(ss / D + {eps}f);
+    float amax = 0.0f;
+    {_UNROLL}
+    for (int i = 0; i < 16; i++) {{
+      v[i] = v[i] * rs * wv[i] * (g[i] * sigmoid_f(g[i]));
+      amax = max(amax, fabs(v[i]));
+    }}
+    amax = simd_max(amax);
+    threadgroup float red[NT / 32];
+    if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = red[0];
+    for (int i = 1; i < NT / 32; i++) amax = max(amax, red[i]);
+    int e = 0;
+    float sc = 1.0f;
+    if (amax > 0.0f) {{
+      frexp(amax, e);
+      sc = ldexp(1.0f, 3 - e);
+    }}
+    if (t == 0) rscale[m] = 1.0f / sc;
+    float s = 0.0f;
+    {_UNROLL}
+    for (int i = 0; i < 16; i++) s += v[i];
+    xsum[t * Mp + m] = s * sc;
+    half h[16];
+{stores}
+    device half4* o = (device half4*)(x16 + (size_t)m * K + k0);
+    {_UNROLL}
+    for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
 """
 
 
@@ -196,12 +317,14 @@ def _main_source(M, N, K, R, NSG, MC):
 """
 
 
-def _kernel(kind, key, source, inputs, outputs):
+def _kernel(kind, key, source, inputs, outputs, header=""):
     kern = _kernels.get((kind, key))
     if kern is None:
         name = kind + "_" + "_".join(str(v) for v in key)
         name = "".join(c if c.isalnum() else "_" for c in name)
-        kern = mx.fast.metal_kernel(name=name, input_names=inputs, output_names=outputs, source=source())
+        kern = mx.fast.metal_kernel(
+            name=name, input_names=inputs, output_names=outputs, source=source(), header=header
+        )
         _kernels[(kind, key)] = kern
     return kern
 
@@ -228,12 +351,14 @@ def prep(x, kind="copy", weight=None, eps=0.0, shape=None):
         lambda: _prep_source(K, M, kind, eps),
         ["x"] if weight is None else ["x", "weight"],
         ["x16", "xsum", "rscale"],
+        _HEADER,
     )
+    _, nt = _prep_threads(K)
     x16, xsum, rscale = kern(
         inputs=inputs,
         template=[("T", x.dtype)],
-        grid=(256 * M, 1, 1),
-        threadgroup=(256, 1, 1),
+        grid=(nt * M, 1, 1),
+        threadgroup=(nt, 1, 1),
         output_shapes=[(M, K), (K // 16, Mp), (Mp,)],
         output_dtypes=[mx.float16, mx.float32, mx.float32],
     )
@@ -322,6 +447,44 @@ def prep_swiglu(gate_up, module):
     if not routes(module, shape, gate_up.dtype):
         return None
     return prep(gate_up.reshape(-1, k2), "swiglu", shape=shape)
+
+
+def prep_gate(x, gate, module):
+    """``x * sigmoid(gate)`` prepped for ``module``, or None when it does not route."""
+    if not routes(module, x.shape, x.dtype):
+        return None
+    k = x.shape[-1]
+    return prep(x.reshape(-1, k), "gate", gate.reshape(-1, k), shape=tuple(x.shape))
+
+
+def prep_gated_norm(norm, x, gate, module):
+    """``norm(x, gate)`` (per-head RMSNorm times silu(gate)) prepped for ``module``, or None."""
+    *batch, heads, d = x.shape
+    shape = (*batch, heads * d)
+    k = heads * d
+    if not routes(module, shape, x.dtype) or k % 512 or k // 16 > 1024 or d % 16 or d > 512:
+        return None
+    M = 1
+    for b in batch:
+        M *= b
+    Mp = _mp(M)
+    kern = _kernel(
+        "qmv_small_prep_gated_norm",
+        (k, M, d, norm.eps, _tag(x.dtype)),
+        lambda: _prep_gated_norm_source(k, M, d, norm.eps),
+        ["x", "z", "weight"],
+        ["x16", "xsum", "rscale"],
+        _HEADER,
+    )
+    x16, xsum, rscale = kern(
+        inputs=[x.reshape(M, k), gate.reshape(M, k), norm.weight],
+        template=[("T", x.dtype)],
+        grid=(k // 16 * M, 1, 1),
+        threadgroup=(k // 16, 1, 1),
+        output_shapes=[(M, k), (k // 16, Mp), (Mp,)],
+        output_dtypes=[mx.float16, mx.float32, mx.float32],
+    )
+    return Prepped(x16, xsum, rscale, shape, x.dtype)
 
 
 def qlinear(module, x):

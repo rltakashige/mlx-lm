@@ -18,7 +18,7 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
-from .qmv_small import prep_rms_norm, prep_swiglu, qlinear
+from .qmv_small import prep_gate, prep_gated_norm, prep_rms_norm, prep_swiglu, qlinear
 from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
@@ -139,7 +139,10 @@ class Attention(Qwen3NextAttention):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return qlinear(self.o_proj, output * mx.sigmoid(gate))
+        prepped = prep_gate(output, gate, self.o_proj)
+        if prepped is not None:
+            return qlinear(self.o_proj, prepped)
+        return self.o_proj(output * mx.sigmoid(gate))
 
 
 class MLP(Qwen3NextMLP):
@@ -285,8 +288,11 @@ class GatedDeltaNet(nn.Module):
             if states:
                 cache.states, cache.conv_input = states[0], conv_input
 
-        out = self.norm(out, z)
-        out = qlinear(self.out_proj, out.reshape(B, S, -1))
+        prepped = prep_gated_norm(self.norm, out, z, self.out_proj)
+        if prepped is not None:
+            out = qlinear(self.out_proj, prepped)
+        else:
+            out = self.out_proj(self.norm(out, z).reshape(B, S, -1))
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
