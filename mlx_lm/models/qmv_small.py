@@ -26,6 +26,9 @@ _GROUP = 64
 _VPL = 16  # K values per lane per step
 # At M = 2 mx.quantized_matmul is already weight-bound and the prep launch costs more than it saves.
 _MIN_M, _MAX_M = 3, 8
+# From 6 rows the tensor-op kernel (qmv_nax) streams faster than the SIMD kernel.
+_NAX_MIN_M, _NAX_MAX_M = 6, 32
+_NAX_KSTEP = 1024  # K values per split-K slice at the largest split
 # Below 8 MB of weights the prep launch and the low threadgroup count cost more than the kernel saves.
 _MIN_BYTES = 8 << 20
 _KSTEP = 32 * _VPL  # K values per main-kernel step
@@ -182,7 +185,7 @@ def _prep_segments(K):
     return -(-(K // 16) // _scan_threads(K))
 
 
-def _prep_source(K, M, kind, eps=0.0, D=0):
+def _prep_source(K, M, kind, eps=0.0, D=0, natural=False):
     """NT threads per 16 * NT values of one row: producer op in fp32, row scale, fp16 store.
 
     Every threadgroup of a row first scans the whole row with all its threads for a bound
@@ -190,12 +193,16 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
     kind: "copy" (x), "rms_norm" (x * rsqrt(mean(x^2) + eps) * weight), "swiglu"
     (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(gate)),
     "gated_norm" (per-head RMSNorm over D values times silu(gate)).
+    ``natural`` stores the 16 values in k order (for the tensor-op kernel) instead of the
+    nibble-pair order of ``qmv_small``.
     """
     Mp = _mp(M)
     NT = _scan_threads(K)
     NIT = _prep_segments(K)
+    order = range(8) if natural else _ORDER
+    scale = (1.0,) * 8 if natural else _SCALE
     stores = "\n".join(
-        f"      h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
+        f"      h[{c * 8 + j}] = half(v[{c * 8 + order[j]}] * (sc * {scale[j]}f));"
         for c in range(2)
         for j in range(8)
     )
@@ -226,6 +233,14 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
     else:
         post = "\n    const float rs = 1.0f;"
     scan = _scan(kind).replace("{_UNROLL}", _UNROLL)
+    if natural:
+        # Per-group (64 values) sums, (M, K / 64): the 4 chunks of a group are 4 adjacent lanes.
+        xsum_store = """s *= sc;
+      s += simd_shuffle_xor(s, 1);
+      s += simd_shuffle_xor(s, 2);
+      if ((c & 3) == 0) xsum[m * (K / 64) + c / 4] = s;"""
+    else:
+        xsum_store = "xsum[c * Mp + m] = s * sc;"
     return f"""
     constexpr int K = {K}, Mp = {Mp}, NT = {NT}, NIT = {NIT}, NSEG = NIT, D = {D}, TPH = D / 16;
     constexpr float EPS = {float(eps)!r}f;
@@ -265,7 +280,7 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
       float s = 0.0f;
       {_UNROLL}
       for (int i = 0; i < 16; i++) s += v[i];
-      xsum[c * Mp + m] = s * sc;
+      {xsum_store}
       half h[16];
 {stores}
       device half4* o = (device half4*)(x16 + (size_t)m * K + c * 16);
@@ -390,16 +405,16 @@ class Prepped:
         self.ndim = len(shape)
 
 
-def prep(x, kind="copy", *extra, eps=0.0, d=0, shape=None):
+def prep(x, kind="copy", *extra, eps=0.0, d=0, shape=None, natural=False):
     """Convert ``x`` (M, K) [(M, 2K) for swiglu] plus the ``extra`` inputs of ``kind`` into a ``Prepped``."""
     M, K = x.shape
     if kind == "swiglu":
         K //= 2
     Mp = _mp(M)
     kern = _kernel(
-        "qmv_small_prep_" + kind,
-        (K, M, eps, d, _tag(x.dtype)),
-        lambda: _prep_source(K, M, kind, eps, d),
+        "qmv_small_prep_" + kind + ("_nat" if natural else ""),
+        (K, M, eps, d, _tag(x.dtype), natural),
+        lambda: _prep_source(K, M, kind, eps, d, natural),
         _PREP_INPUTS[kind],
         ["x16", "xsum", "rscale"],
         _HEADER,
@@ -409,10 +424,12 @@ def prep(x, kind="copy", *extra, eps=0.0, d=0, shape=None):
         template=[("T", x.dtype)],
         grid=(_scan_threads(K) * _prep_segments(K) * M, 1, 1),
         threadgroup=(_scan_threads(K), 1, 1),
-        output_shapes=[(M, K), (K // 16, Mp), (Mp,)],
+        output_shapes=[(M, K), (M, K // 64) if natural else (K // 16, Mp), (Mp,)],
         output_dtypes=[mx.float16, mx.float32, mx.float32],
     )
-    return Prepped(x16, xsum, rscale, shape or (M, K), x.dtype)
+    p = Prepped(x16, xsum, rscale, shape or (M, K), x.dtype)
+    p.natural = natural
+    return p
 
 
 def _config(m):
@@ -426,6 +443,17 @@ def _m5():
         info = mx.device_info() if mx.metal.is_available() else {}
         _kernels["m5"] = str(info.get("architecture", "")).startswith("applegpu_g17")
     return _kernels["m5"]
+
+
+def _nax_m(m):
+    """True when rows ``m`` go to the tensor-op kernel instead of the SIMD kernel."""
+    return _NAX_MIN_M <= m <= _NAX_MAX_M
+
+
+def _shape_ok(m, n, k):
+    if _nax_m(m):
+        return k % _NAX_KSTEP == 0 and n % 32 == 0
+    return _MIN_M <= m <= _MAX_M and k % _KSTEP == 0 and n % 8 == 0
 
 
 def supported(x, w, scales, biases, group_size, bits):
@@ -445,13 +473,7 @@ def supported(x, w, scales, biases, group_size, bits):
         return False
     m, k = x.shape
     n = w.shape[0]
-    return (
-        _MIN_M <= m <= _MAX_M
-        and k % _KSTEP == 0
-        and n % 8 == 0
-        and w.shape[1] * 8 == k
-        and w.nbytes >= _MIN_BYTES
-    )
+    return _shape_ok(m, n, k) and w.shape[1] * 8 == k and w.nbytes >= _MIN_BYTES
 
 
 def qmv_main(p, w, scales, biases):
@@ -478,13 +500,22 @@ def qmv_main(p, w, scales, biases):
     return y
 
 
+def _main(p, w, scales, biases):
+    """The kernel matching the prep order of ``p``."""
+    if p.natural:
+        from .qmv_nax import nax_main
+
+        return nax_main(p, w, scales, biases)
+    return qmv_main(p, w, scales, biases)
+
+
 def qmv_small(x, w, scales, biases, group_size=_GROUP, bits=_BITS):
-    """``x @ dequant(w).T`` for ``x`` of shape (M, K); mx.quantized_matmul outside 3 <= M <= 8."""
+    """``x @ dequant(w).T`` for ``x`` of shape (M, K); mx.quantized_matmul outside 3 <= M <= 32."""
     if not supported(x, w, scales, biases, group_size, bits):
         return mx.quantized_matmul(
             x, w, scales, biases, transpose=True, group_size=group_size, bits=bits
         )
-    return qmv_main(prep(x), w, scales, biases)
+    return _main(prep(x, natural=_nax_m(x.shape[0])), w, scales, biases)
 
 
 def routes(module, shape, dtype):
@@ -503,12 +534,17 @@ def routes(module, shape, dtype):
         and dtype in (mx.bfloat16, mx.float16)
         and module.scales.dtype == dtype
         and module.biases.dtype == dtype
-        and _MIN_M <= m <= _MAX_M
-        and k % _KSTEP == 0
-        and module.weight.shape[0] % 8 == 0
+        and _shape_ok(m, module.weight.shape[0], k)
         and module.weight.shape[1] * 8 == k
         and module.weight.nbytes >= _MIN_BYTES
     )
+
+
+def _rows(shape):
+    m = 1
+    for d in shape[:-1]:
+        m *= d
+    return m
 
 
 def prep_rms_norm(norm, x, module) -> "Prepped | mx.array":
@@ -517,7 +553,12 @@ def prep_rms_norm(norm, x, module) -> "Prepped | mx.array":
         return norm(x)
     k = x.shape[-1]
     return prep(
-        x.reshape(-1, k), "rms_norm", norm.weight, eps=norm.eps, shape=tuple(x.shape)
+        x.reshape(-1, k),
+        "rms_norm",
+        norm.weight,
+        eps=norm.eps,
+        shape=tuple(x.shape),
+        natural=_nax_m(_rows(x.shape)),
     )
 
 
@@ -527,7 +568,7 @@ def prep_swiglu(gate_up, module) -> "Prepped | None":
     shape = (*batch, k2 // 2)
     if not routes(module, shape, gate_up.dtype):
         return None
-    return prep(gate_up.reshape(-1, k2), "swiglu", shape=shape)
+    return prep(gate_up.reshape(-1, k2), "swiglu", shape=shape, natural=_nax_m(_rows(shape)))
 
 
 def prep_gate(x, gate, module) -> "Prepped | None":
@@ -535,7 +576,13 @@ def prep_gate(x, gate, module) -> "Prepped | None":
     if not routes(module, x.shape, x.dtype):
         return None
     k = x.shape[-1]
-    return prep(x.reshape(-1, k), "gate", gate.reshape(-1, k), shape=tuple(x.shape))
+    return prep(
+        x.reshape(-1, k),
+        "gate",
+        gate.reshape(-1, k),
+        shape=tuple(x.shape),
+        natural=_nax_m(_rows(x.shape)),
+    )
 
 
 def prep_gated_norm(norm, x, gate, module) -> "Prepped | None":
@@ -555,21 +602,18 @@ def prep_gated_norm(norm, x, gate, module) -> "Prepped | None":
         eps=norm.eps,
         d=d,
         shape=shape,
+        natural=_nax_m(_rows(shape)),
     )
 
 
 def qlinear(module, x):
-    """Apply a bias-free 4-bit g64 ``QuantizedLinear`` through ``qmv_small`` when 3 <= M <= 8."""
+    """Apply a bias-free 4-bit g64 ``QuantizedLinear`` through the small-M kernels when 3 <= M <= 32."""
     if isinstance(x, Prepped):
-        return qmv_main(x, module.weight, module.scales, module.biases).reshape(
+        return _main(x, module.weight, module.scales, module.biases).reshape(
             *x.shape[:-1], -1
         )
     if routes(module, x.shape, x.dtype):
-        y = qmv_main(
-            prep(x.reshape(-1, x.shape[-1])),
-            module.weight,
-            module.scales,
-            module.biases,
-        )
+        p = prep(x.reshape(-1, x.shape[-1]), natural=_nax_m(_rows(x.shape)))
+        y = _main(p, module.weight, module.scales, module.biases)
         return y.reshape(*x.shape[:-1], -1)
     return module(x)
