@@ -18,7 +18,7 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
-from .qmv_small import qlinear
+from .qmv_small import prep_rms_norm, prep_swiglu, qlinear
 from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
@@ -152,8 +152,12 @@ class MLP(Qwen3NextMLP):
             self.pop(name)
 
     def __call__(self, x) -> mx.array:
-        gate, up = mx.split(qlinear(self.gate_up_proj, x), 2, axis=-1)
-        return qlinear(self.down_proj, swiglu(gate, up))
+        gate_up = qlinear(self.gate_up_proj, x)
+        prepped = prep_swiglu(gate_up, self.down_proj)
+        if prepped is not None:
+            return qlinear(self.down_proj, prepped)
+        gate, up = mx.split(gate_up, 2, axis=-1)
+        return self.down_proj(swiglu(gate, up))
 
 
 class GatedDeltaNet(nn.Module):
@@ -316,12 +320,16 @@ class DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            xn = prep_rms_norm(self.input_layernorm, x, self.linear_attn.in_proj)
+            r = self.linear_attn(xn, mask, cache)
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            xn = prep_rms_norm(self.input_layernorm, x, self.self_attn.qkv_proj)
+            r = self.self_attn(xn, mask, cache)
         h = x + r
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
+        hn = prep_rms_norm(
+            self.post_attention_layernorm, h, getattr(self.mlp, "gate_up_proj", None)
+        )
+        return h + self.mlp(hn)
 
 
 class Qwen3_5TextModel(PipelineMixin, nn.Module):

@@ -22,7 +22,8 @@ import mlx.nn as nn
 _BITS = 4
 _GROUP = 64
 _VPL = 16  # K values per lane per step
-_MIN_M, _MAX_M = 2, 8
+# mx.quantized_matmul is already weight-bandwidth bound at M = 2.
+_MIN_M, _MAX_M = 3, 8
 _UNROLL = "#pragma clang loop unroll(full)"
 _kernels = {}
 
@@ -40,22 +41,54 @@ _ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 _SCALE = (1.0, 1.0, 1 / 16, 1 / 16, 1.0, 1.0, 1 / 16, 1 / 16)
 
 
-def _prep_source(K, M):
+def _prep_source(K, M, kind, eps=0.0):
+    """One threadgroup per row: producer op in fp32, row max, then fp16 store.
+
+    kind: "copy" (x), "rms_norm" (x * rsqrt(mean(x^2) + eps) * weight), "swiglu"
+    (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]).
+    """
     Mp = _mp(M)
     stores = "\n".join(
         f"      h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
         for c in range(2)
         for j in range(8)
     )
+    if kind == "rms_norm":
+        head = f"""
+    const device T* xr = x + (size_t)m * K;
+    float ss = 0.0f;
+    for (int k = t; k < K; k += NT) {{
+      const float v = float(xr[k]);
+      ss += v * v;
+    }}
+    ss = simd_sum(ss);
+    if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ss = 0.0f;
+    for (int i = 0; i < NT / 32; i++) ss += red[i];
+    const float rs = rsqrt(ss / K + {eps}f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #define VAL(k) (float(xr[k]) * rs * float(weight[k]))
+"""
+    elif kind == "swiglu":
+        head = """
+    const device T* xr = x + (size_t)m * 2 * K;
+    #define VAL(k) (float(xr[k]) / (1.0f + metal::exp(-float(xr[k]))) * float(xr[K + (k)]))
+"""
+    else:
+        head = """
+    const device T* xr = x + (size_t)m * K;
+    #define VAL(k) float(xr[k])
+"""
     return f"""
     constexpr int K = {K}, Mp = {Mp}, NT = 256;
     const int m = threadgroup_position_in_grid.x;
     const int t = thread_position_in_threadgroup.x;
-    const device T* xr = x + (size_t)m * K;
-    float amax = 0.0f;
-    for (int k = t; k < K; k += NT) amax = max(amax, fabs(float(xr[k])));
-    amax = simd_max(amax);
     threadgroup float red[NT / 32];
+{head}
+    float amax = 0.0f;
+    for (int k = t; k < K; k += NT) amax = max(amax, fabs(VAL(k)));
+    amax = simd_max(amax);
     if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = amax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     amax = red[0];
@@ -71,7 +104,7 @@ def _prep_source(K, M):
     for (int c = t; c < K / 16; c += NT) {{
       float v[16];
       {_UNROLL}
-      for (int i = 0; i < 16; i++) v[i] = float(xr[c * 16 + i]);
+      for (int i = 0; i < 16; i++) v[i] = VAL(c * 16 + i);
       float s = 0.0f;
       {_UNROLL}
       for (int i = 0; i < 16; i++) s += v[i];
@@ -82,6 +115,7 @@ def _prep_source(K, M):
       {_UNROLL}
       for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
     }}
+    #undef VAL
 """
 
 
@@ -166,24 +200,44 @@ def _kernel(kind, key, source, inputs, outputs):
     kern = _kernels.get((kind, key))
     if kern is None:
         name = kind + "_" + "_".join(str(v) for v in key)
+        name = "".join(c if c.isalnum() else "_" for c in name)
         kern = mx.fast.metal_kernel(name=name, input_names=inputs, output_names=outputs, source=source())
         _kernels[(kind, key)] = kern
     return kern
 
 
-def prep(x):
-    """``x`` (M, K) -> fp16 x (permuted, scaled), per-16-chunk sums (K/16, Mp), row scales (Mp,)."""
+class Prepped:
+    """An (M, K) activation already converted for ``qmv_small``; mimics the array's shape and dtype."""
+
+    def __init__(self, x16, xsum, rscale, shape, dtype):
+        self.x16, self.xsum, self.rscale = x16, xsum, rscale
+        self.shape, self.dtype = shape, dtype
+        self.ndim = len(shape)
+
+
+def prep(x, kind="copy", weight=None, eps=0.0, shape=None):
+    """Convert ``x`` (M, K) [or (M, 2K) for swiglu] into a ``Prepped``."""
     M, K = x.shape
+    if kind == "swiglu":
+        K //= 2
     Mp = _mp(M)
-    kern = _kernel("qmv_small_prep", (K, M, _tag(x.dtype)), lambda: _prep_source(K, M), ["x"], ["x16", "xsum", "rscale"])
-    return kern(
-        inputs=[x],
+    inputs = [x] if weight is None else [x, weight]
+    kern = _kernel(
+        "qmv_small_prep_" + kind,
+        (K, M, eps, _tag(x.dtype)),
+        lambda: _prep_source(K, M, kind, eps),
+        ["x"] if weight is None else ["x", "weight"],
+        ["x16", "xsum", "rscale"],
+    )
+    x16, xsum, rscale = kern(
+        inputs=inputs,
         template=[("T", x.dtype)],
         grid=(256 * M, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(M, K), (K // 16, Mp), (Mp,)],
         output_dtypes=[mx.float16, mx.float32, mx.float32],
     )
+    return Prepped(x16, xsum, rscale, shape or (M, K), x.dtype)
 
 
 def _config(m):
@@ -201,48 +255,80 @@ def supported(x, w, scales, biases, group_size, bits):
     return _MIN_M <= m <= _MAX_M and k % (32 * _VPL) == 0 and n % 8 == 0 and w.shape[1] * 8 == k
 
 
-def qmv_small(x, w, scales, biases, group_size=_GROUP, bits=_BITS):
-    """``x @ dequant(w).T`` for ``x`` of shape (M, K) with 2 <= M <= 8."""
-    if not supported(x, w, scales, biases, group_size, bits):
-        return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group_size, bits=bits)
-    M, K = x.shape
+def qmv_main(p, w, scales, biases):
+    """``x @ dequant(w).T`` from a ``Prepped`` x."""
+    M, K = p.x16.shape
     N = w.shape[0]
     R, NSG, MC = _config(M)
-    x16, xsum, rscale = prep(x)
     kern = _kernel(
         "qmv_small",
-        (M, N, K, R, NSG, MC, _tag(x.dtype)),
+        (M, N, K, R, NSG, MC, _tag(p.dtype)),
         lambda: _main_source(M, N, K, R, NSG, MC),
         ["x16", "xsum", "rscale", "w", "scales", "biases"],
         ["y"],
     )
     ntg = N // (R * NSG)
     (y,) = kern(
-        inputs=[x16, xsum, rscale, w, scales, biases],
-        template=[("T", x.dtype)],
+        inputs=[p.x16, p.xsum, p.rscale, w, scales, biases],
+        template=[("T", p.dtype)],
         grid=(32 * NSG * ntg, 1, 1),
         threadgroup=(32 * NSG, 1, 1),
         output_shapes=[(M, N)],
-        output_dtypes=[x.dtype],
+        output_dtypes=[p.dtype],
     )
     return y
 
 
-def qlinear(module, x):
-    """Apply a bias-free 4-bit g64 ``QuantizedLinear`` through ``qmv_small`` when 2 <= M <= 8."""
-    *batch, k = x.shape
+def qmv_small(x, w, scales, biases, group_size=_GROUP, bits=_BITS):
+    """``x @ dequant(w).T`` for ``x`` of shape (M, K) with 2 <= M <= 8."""
+    if not supported(x, w, scales, biases, group_size, bits):
+        return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group_size, bits=bits)
+    return qmv_main(prep(x), w, scales, biases)
+
+
+def routes(module, shape, dtype):
+    """True when ``qlinear`` uses the small-M kernel for ``module`` on an input of ``shape``."""
+    *batch, k = shape
     m = 1
     for d in batch:
         m *= d
-    if (
+    return (
         isinstance(module, nn.QuantizedLinear)
         and module.bits == _BITS
         and module.group_size == _GROUP
         and getattr(module, "mode", "affine") == "affine"
         and "bias" not in module
+        and dtype in (mx.bfloat16, mx.float16)
+        and module.scales.dtype == dtype
+        and module.biases.dtype == dtype
         and _MIN_M <= m <= _MAX_M
-    ):
-        x2 = x.reshape(m, k)
-        if supported(x2, module.weight, module.scales, module.biases, _GROUP, _BITS):
-            return qmv_small(x2, module.weight, module.scales, module.biases).reshape(*batch, -1)
+        and k % (32 * _VPL) == 0
+        and module.weight.shape[0] % 8 == 0
+        and module.weight.shape[1] * 8 == k
+    )
+
+
+def prep_rms_norm(norm, x, module):
+    """``norm(x)`` fused with the prep when the projection ``module`` routes; else ``norm(x)``."""
+    if not routes(module, x.shape, x.dtype):
+        return norm(x)
+    return prep(x.reshape(-1, x.shape[-1]), "rms_norm", norm.weight, norm.eps, shape=tuple(x.shape))
+
+
+def prep_swiglu(gate_up, module):
+    """``swiglu(gate, up)`` of the fused (.., 2K) projection output, prepped for ``module``."""
+    *batch, k2 = gate_up.shape
+    shape = (*batch, k2 // 2)
+    if not routes(module, shape, gate_up.dtype):
+        return None
+    return prep(gate_up.reshape(-1, k2), "swiglu", shape=shape)
+
+
+def qlinear(module, x):
+    """Apply a bias-free 4-bit g64 ``QuantizedLinear`` through ``qmv_small`` when 3 <= M <= 8."""
+    if isinstance(x, Prepped):
+        return qmv_main(x, module.weight, module.scales, module.biases).reshape(*x.shape[:-1], -1)
+    if routes(module, x.shape, x.dtype):
+        y = qmv_main(prep(x.reshape(-1, x.shape[-1])), module.weight, module.scales, module.biases)
+        return y.reshape(*x.shape[:-1], -1)
     return module(x)

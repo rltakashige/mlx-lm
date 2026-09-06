@@ -73,3 +73,41 @@ mx.fast.metal_kernel compiles `#include <metal_tensor>` + `<MetalPerformancePrim
 and runs mpp::tensor_ops::matmul2d (half x half -> float, 32x32x32) correctly on troy (M5) and
 locally (M4). Inputs must be cast to non-const `device half*`. troy's runtime header (macOS 26.6)
 lists half x uint4b_format -> float among supported combos (int4 weights consumed directly).
+
+## tensor-op qmv (scratch k/tensor_qmv.py)
+
+matmul2d(half x uint4b_format -> float, 16 x 32 x 64 per group) compiles through mx.fast.metal_kernel
+and reads MLX's packed 4-bit weight rows directly (tensor<device metal::uint4b_format> over the
+uint32 buffer, transpose_right=true). Per-group scale/bias applied on the cooperative tensor
+elements (is_valid_element / get_multidimensional_index). Local M4 check: err == mlx err.
+API notes: get_mask does not exist (use is_valid_element); `#pragma unroll full` is not accepted
+(use `#pragma clang loop unroll(full)`); get_capacity() is not constexpr.
+
+## integration (commit d848f02)
+
+mlx_lm/models/qmv_small.py (prep + main kernels, qlinear wrapper); qwen3_5.py routes qkv/o/in/out/
+gate_up/down/lm_head through qlinear when 2 <= M <= 8. Local tests: 10 passed, 1 skipped.
+
+## verify S-curve (NO_CAPTURE=1 verify_capture.py, 27B, 512-token prompt), median ms
+
+| S | before (leo/qwen-mtp-opt) | after d848f02 (standalone prep, M>=2) |
+|---|---|---|
+| 1 | 31.01 | 31.13 |
+| 2 | 31.64 | 33.40 |
+| 3 | 33.95 | 34.55 |
+| 4 | 36.47 | 35.33 |
+| 6 | 53.14 | 41.76 |
+| 8 | 62.70 | 46.24 |
+
+S=2 regresses (mlx qmv_wide is already bandwidth bound at M=2; the extra prep launch costs
+~5 us x 257 matmuls): route only M >= 3. Next: fuse the prep into rms_norm / swiglu.
+
+## tensor-op path timing on troy (M padded to 16, per-group epilogue), GB/s
+
+| shape | NT=32 | NT=64 | NT=128 | mlx M=1 | mlx M=4 | mlx M=8 |
+|---|---|---|---|---|---|---|
+| out_proj | 161 | 162 | 308 | 477 | 409 | 195 |
+| in_proj | 152 | - | - | 548 | 487 | 180 |
+| lm_head | 106 | 116 | 404-411 | 585 | 259 | 105 |
+
+lm_head M=16-padded at NT=128: 1.75 ms vs qmv_fast M=1 1.22 ms, mlx M=4 2.77 ms, M=8 6.84 ms.
