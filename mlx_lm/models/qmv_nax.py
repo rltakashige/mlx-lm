@@ -27,25 +27,29 @@ using namespace mpp::tensor_ops;
 _UNROLL = "#pragma clang loop unroll(full)"
 
 
-def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
-    """NSG simdgroups split K; NT tiles of 32 columns per simdgroup at once; NTS tiles in sequence;
-    GU groups (64 k) per load step (GU = 2: 16-byte weight loads); PF steps requested ahead."""
+def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL):
+    """Kernel for up to MB (8, 16 or 32) rows; the row count M is read from the x16 shape at run time.
+    NSG simdgroups split K; NT tiles of NCOL (16 or 32) columns per simdgroup at once; NTS tiles in
+    sequence; GU groups (64 k) per load step (GU = 2: 16-byte weight loads); PF steps requested ahead."""
     i8 = mode != "f16"
     BT = "int8_t" if i8 else "half"
-    MT = 16 if M <= 16 else 32
-    NH = 1 if M <= 8 else (2 if M <= 16 else 4)  # x row sets fm + 8h read per lane
+    MT = 16 if MB <= 16 else 32
+    NH = MB // 8  # x row sets fm + 8h read per lane
     G = K // 64
     GS = G // NSG
     NU = GS // GU  # load steps per simdgroup
     WT = "uint4" if GU == 2 else "uint2"
     if i8:
-        assert GU == 1, "the int8 modes need one group per step"
-    CA, CC = MT * KOP // 32, MT  # cooperative tensor elements per lane
+        assert GU == 1 and NCOL == 32, "the int8 modes need one group per step and 32-column tiles"
+    assert NCOL == 32 or KOP == 32 or MT == 32, "16-column tiles need a 32-deep op"
+    NR = NCOL // 8  # weight rows fm + 8r per lane
+    CA, CC = MT * KOP // 32, MT * NCOL // 32  # cooperative tensor elements per lane
     NOP = 64 // KOP  # ops per group and tile
     L = []
     add = L.append
     add(f"""
-    constexpr int M = {M}, N = {N}, K = {K}, NSG = {NSG}, NT = {NT}, NTS = {NTS}, MT = {MT}, NH = {NH};
+    constexpr int N = {N}, K = {K}, NSG = {NSG}, NT = {NT}, NTS = {NTS}, MT = {MT}, NH = {NH}, NCOL = {NCOL};
+    const int M = x16_shape[0];
     constexpr int G = {G}, GS = {GS}, NU = {NU}, GU = {GU}, KW = K / 8, CC = {CC};
     const int lane = thread_index_in_simdgroup;
     const int sg = simdgroup_index_in_threadgroup;
@@ -53,7 +57,7 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
     const int fm = ((lane >> 2) & 4) | ((lane >> 1) & 3);
     const int cls = ((lane >> 2) & 2) | (lane & 1);
     const int g0 = sg * GS;
-    constexpr auto desc = matmul2d_descriptor(MT, 32, {KOP}, false, true, false,
+    constexpr auto desc = matmul2d_descriptor(MT, NCOL, {KOP}, false, true, false,
                                               matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, metal::execution_simdgroup> op;
     auto ta = op.get_left_input_cooperative_tensor<half, {BT}, float>();
@@ -64,7 +68,7 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
         if i8:
             add(f"    float acc{t}[CC];")
     if i8:
-        add(f"""    constexpr auto descb = matmul2d_descriptor(MT, 32, 16, false, true, false,
+        add(f"""    constexpr auto descb = matmul2d_descriptor(MT, NCOL, 16, false, true, false,
                                                matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<descb, metal::execution_simdgroup> opb;
     auto tab = opb.get_left_input_cooperative_tensor<half, half, float>();
@@ -78,12 +82,12 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
         add(f"    const float rs{h} = rscale[min(fm + 8 * {h}, M - 1)];")
     if NSG > 1:
         add("    threadgroup float red[(NSG - 1) * NT * CC * 32];")
-    add(f"    {WT} wq[{PF}][NT][4], wn[NT][4];")
+    add(f"    {WT} wq[{PF}][NT][{NR}], wn[NT][{NR}];")
     add(f"    uint4 xv[NH][{2 * GU}];")
     add("""    for (int tt = 0; tt < NTS; tt++) {
       // The last threadgroup may own fewer tiles; the break is uniform over the threadgroup.
-      if (tile0 + tt * NT >= N / 32) break;
-      const int n0 = (tile0 + tt * NT) * 32;
+      if (tile0 + tt * NT >= N / NCOL) break;
+      const int n0 = (tile0 + tt * NT) * NCOL;
       const device uint32_t* wp = w + (size_t)(n0 + fm) * KW + g0 * 8 + cls * 2 * GU;
       const device T* sp = scales + (size_t)(n0 + fm) * G + g0 + (GU == 2 ? cls >> 1 : 0);
       const device T* bp = biases + (size_t)(n0 + fm) * G + g0 + (GU == 2 ? cls >> 1 : 0);
@@ -106,9 +110,9 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
             add(f"          const float4 v{h} = *(const device float4*)(xq{h} + j * 16);")
             add(f"          const half4 hi{h} = half4(v{h}); const half4 lo{h} = half4(v{h} - float4(hi{h}));")
         for t in range(NT):
-            for r in range(4):
+            for r in range(NR):
                 add("          " + " ".join(
-                    f"tbb[{4 * r + e}] = half(bq[({t} * 32 + {r} * 8) * G + j * 16 + {e}]);" for e in range(4)
+                    f"tbb[{4 * r + e}] = half(bq[({t} * NCOL + {r} * 8) * G + j * 16 + {e}]);" for e in range(4)
                 ))
             for part in ("hi", "lo"):
                 for i in range(MT // 2):
@@ -122,20 +126,20 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
         add("      }")
     for u in range(PF):
         for t in range(NT):
-            for r in range(4):
-                add(f"      wq[{u}][{t}][{r}] = *(const device {WT}*)(wp + ({t} * 32 + {r} * 8) * KW + {u * 8 * GU});")
+            for r in range(NR):
+                add(f"      wq[{u}][{t}][{r}] = *(const device {WT}*)(wp + ({t} * NCOL + {r} * 8) * KW + {u * 8 * GU});")
     add("      for (int u = 0; u < NU; u++) {")
     add(f"        // Request the weights {PF} step(s) ahead before this step's math.")
     add(f"        if (u + {PF} < NU) {{")
     for t in range(NT):
-        for r in range(4):
-            add(f"          wn[{t}][{r}] = *(const device {WT}*)(wp + ({t} * 32 + {r} * 8) * KW + {PF * 8 * GU});")
+        for r in range(NR):
+            add(f"          wn[{t}][{r}] = *(const device {WT}*)(wp + ({t} * NCOL + {r} * 8) * KW + {PF * 8 * GU});")
     add("        }")
     if not i8:
         add("        half sv[NT][4], bv[NT][4];")
         for t in range(NT):
-            for r in range(4):
-                add(f"        sv[{t}][{r}] = half(sp[({t} * 32 + {r} * 8) * G]); bv[{t}][{r}] = half(bp[({t} * 32 + {r} * 8) * G]);")
+            for r in range(NR):
+                add(f"        sv[{t}][{r}] = half(sp[({t} * NCOL + {r} * 8) * G]); bv[{t}][{r}] = half(bp[({t} * NCOL + {r} * 8) * G]);")
     for h in range(NH):
         for c in range(2 * GU):
             add(f"        xv[{h}][{c}] = *(const device uint4*)(xp{h} + u * {64 * GU} + {8 * c});")
@@ -154,12 +158,12 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
             # Right input element 16*kf + 4*r + e: weight row fm + 8r, k fragment j = o*(KOP/16) + kf,
             # value e. f16: nibble 4j + e of the lane's 16*GU nibbles. i8: nibbles 0,2,4,6 of word (j>>1)
             # are kf = 0 and nibbles 1,3,5,7 are kf = 1 (one mask per 4 values).
-            for r in range(4):
+            for r in range(NR):
                 word = f"wq[0][{t}][{r}].{'xyzw'[o if KOP == 32 else o // 2]}"
                 if i8:
                     for kf in ((0, 1) if KOP == 32 else (o % 2,)):
                         src = f"(({word} >> {4 * kf}) & 0x0F0F0F0Fu)" if kf else f"({word} & 0x0F0F0F0Fu)"
-                        base = (16 * kf if KOP == 32 else 0) + 4 * r
+                        base = (NCOL // 2 * kf if KOP == 32 else 0) + 4 * r
                         if mode == "i8p":
                             add(f"        *(thread uint32_t*)&tb[{base}] = {src};")
                         else:
@@ -171,27 +175,27 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
                     add(f"        {{ half2 q = as_type<half2>(({sh} & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);")
                     add(f"          q = fma(q, half2(sv[{t}][{r}]), half2(bv[{t}][{r}]));")
                     if KOP == 32:
-                        add(f"          tb[{4 * r + e}] = q.x; tb[{16 + 4 * r + e}] = q.y; }}")
+                        add(f"          tb[{4 * r + e}] = q.x; tb[{NCOL // 2 + 4 * r + e}] = q.y; }}")
                     else:
                         add(f"          tb[{4 * r + e}] = q.{'x' if o % 2 == 0 else 'y'}; }}")
             add(f"        op.run(ta, tb, tc{t});")
     if i8:
         # Scale of the lane's output columns 16*nf + 4*cls + e for this group.
         for t in range(NT):
-            for nf in range(2):
+            for nf in range(NCOL // 16):
                 for e in range(4):
-                    add(f"        const float s{t}_{nf}{e} = float(sq[({t} * 32 + {16 * nf} + {e}) * G]);")
+                    add(f"        const float s{t}_{nf}{e} = float(sq[({t} * NCOL + {16 * nf} + {e}) * G]);")
             for i in range(CC):
                 f, rem = divmod(i, 8)
-                nf = f % 2 if MT == 32 else f
+                nf = (f % 2 if MT == 32 else f) if NCOL == 32 else 0
                 add(f"        acc{t}[{i}] = fma(tc{t}[{i}], s{t}_{nf}{rem % 4}, acc{t}[{i}]); tc{t}[{i}] = 0.0f;")
     add(f"        wp += {8 * GU}; sp += {GU}; bp += {GU}; sq += 1;")
     for u in range(PF - 1):
         for t in range(NT):
-            for r in range(4):
+            for r in range(NR):
                 add(f"        wq[{u}][{t}][{r}] = wq[{u + 1}][{t}][{r}];")
     for t in range(NT):
-        for r in range(4):
+        for r in range(NR):
             add(f"        wq[{PF - 1}][{t}][{r}] = wn[{t}][{r}];")
     add("      }")
     # Cross-simdgroup reduction of the split-K partials, then the store by simdgroup 0.
@@ -209,7 +213,10 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
         for i in range(CC):
             f, rem = divmod(i, 8)
             h, e = divmod(rem, 4)
-            mf, nf = divmod(f, 2) if MT == 32 else (0, f)
+            if NCOL == 32:
+                mf, nf = divmod(f, 2) if MT == 32 else (0, f)
+            else:
+                mf, nf = f, 0
             hh = 2 * mf + h
             if hh >= NH:
                 continue
@@ -218,7 +225,7 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
                 val = f"({val}" + "".join(
                     f" + red[((({s} - 1) * NT + {t}) * CC + {i}) * 32 + lane]" for s in range(1, NSG)
                 ) + ")"
-            add(f"        if (fm + {8 * hh} < M) y[(size_t)(fm + {8 * hh}) * N + n0 + {32 * t + 16 * nf} + 4 * cls + {e}] = TO({val} * rs{hh});")
+            add(f"        if (fm + {8 * hh} < M) y[(size_t)(fm + {8 * hh}) * N + n0 + {NCOL * t + 16 * nf} + 4 * cls + {e}] = TO({val} * rs{hh});")
     add("      }")
     if NSG > 1 and NTS > 1:
         add("      threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -227,7 +234,7 @@ def _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF):
 
 
 def _config(M, N, K):
-    """(NSG, NT, KOP, mode, NTS, GU, PF) for a shape: split K over 8 simdgroups, 16 for the small-N
+    """(NSG, NT, KOP, mode, NTS, GU, PF, NCOL) for a shape: split K over 8 simdgroups, 16 for the small-N
     projections where the grid is short (their 32-row reduction does not fit threadgroup memory)."""
     G = K // 64
     if M > 16:
@@ -235,7 +242,7 @@ def _config(M, N, K):
         NSG = 4 if N >= 32768 else 8
     else:
         NSG = 16 if N <= 8192 and G % 16 == 0 else 8
-    return NSG, 1, 32, "f16", 1, 1, 1
+    return NSG, 1, 32, "f16", 1, 1, 1, 32
 
 
 def supported(x, w, scales, biases, group_size, bits):
@@ -253,16 +260,17 @@ def nax_main(p, w, scales, biases, cfg=None, out_dtype=None):
     M, K = p.x16.shape
     N = w.shape[0]
     out_dtype = out_dtype or p.dtype
-    NSG, NT, KOP, mode, NTS, GU, PF = (tuple(cfg) + ("f16", 1, 1, 1))[:7] if cfg else _config(M, N, K)
+    MB = 8 if M <= 8 else (16 if M <= 16 else 32)  # one kernel per row bucket
+    NSG, NT, KOP, mode, NTS, GU, PF, NCOL = (tuple(cfg) + ("f16", 1, 1, 1, 32))[:8] if cfg else _config(MB, N, K)
     kern = _kernel(
         "qmv_nax_" + mode,
-        (M, N, K, NSG, NT, KOP, mode, NTS, GU, PF, _tag(p.dtype), _tag(out_dtype)),
-        lambda: _source(M, N, K, NSG, NT, KOP, mode, NTS, GU, PF),
+        (MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL, _tag(p.dtype), _tag(out_dtype)),
+        lambda: _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL),
         ["x16", "xsum", "rscale", "w", "scales", "biases"],
         ["y"],
         _HEADER,
     )
-    ntg = -(-N // (32 * NT * NTS))
+    ntg = -(-N // (NCOL * NT * NTS))
     (y,) = kern(
         inputs=[p.x16, p.xsum, p.rscale, w, scales, biases],
         template=[("T", p.dtype), ("TO", out_dtype)],

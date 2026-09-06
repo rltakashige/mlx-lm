@@ -196,7 +196,7 @@ def _prep_source(K, M, kind, eps=0.0, D=0, natural=False):
     ``natural`` stores the 16 values in k order (for the tensor-op kernel) instead of the
     nibble-pair order of ``qmv_small``.
     """
-    Mp = _mp(M)
+    Mp = 0 if natural else _mp(M)  # the natural-order source is the same for every M
     NT = _scan_threads(K)
     NIT = _prep_segments(K)
     order = range(8) if natural else _ORDER
@@ -411,9 +411,10 @@ def prep(x, kind="copy", *extra, eps=0.0, d=0, shape=None, natural=False):
     if kind == "swiglu":
         K //= 2
     Mp = _mp(M)
+    # The natural-order prep does not depend on M: one kernel per shape and kind.
     kern = _kernel(
         "qmv_small_prep_" + kind + ("_nat" if natural else ""),
-        (K, M, eps, d, _tag(x.dtype), natural),
+        (K, 0 if natural else M, eps, d, _tag(x.dtype), natural),
         lambda: _prep_source(K, M, kind, eps, d, natural),
         _PREP_INPUTS[kind],
         ["x16", "xsum", "rscale"],
