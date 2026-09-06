@@ -420,6 +420,9 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
+    # Layers per mx.async_eval while generating (0 disables)
+    eval_every = 8
+
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -470,9 +473,15 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         if pipeline_rank < pipeline_size - 1:
             hidden_states = mx.distributed.recv_like(hidden_states, (pipeline_rank + 1))
 
-        for layer, c in zip(self.pipeline_layers, cache):
+        # Start the GPU on a chunk of layers while Python builds the rest
+        chunk = self.eval_every
+        if cache[0] is None or self.training or pipeline_size > 1:
+            chunk = 0
+        for i, (layer, c) in enumerate(zip(self.pipeline_layers, cache), 1):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+            if chunk and i % chunk == 0 and i < len(cache):
+                mx.async_eval(hidden_states)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
