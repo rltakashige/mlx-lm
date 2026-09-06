@@ -135,7 +135,9 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
     """
     Mp = _mp(M)
     stores = "\n".join(
-        f"    h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));" for c in range(2) for j in range(8)
+        f"    h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
+        for c in range(2)
+        for j in range(8)
     )
     if kind == "rms_norm":
         norm = f"""
@@ -196,16 +198,26 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
 def _main_source(M, N, K, R, NSG, MC):
     Mp = _mp(M)
     NB = K // (32 * _VPL)
-    wload = "\n".join(f"      {{dst}}[{r}] = *(const device uint2*)(wp + {r} * KW);" for r in range(R))
+    wload = "\n".join(
+        f"      {{dst}}[{r}] = *(const device uint2*)(wp + {r} * KW);" for r in range(R)
+    )
     deq = []
     for r in range(R):
         for wi in range(2):
             wd = f"wv[{r}][{wi}]"
             deq.append(f"      {{ const uint lo = {wd}, hi = {wd} >> 8;")
-            deq.append(f"        q2[{r}][{wi * 4}] = as_type<half2>((lo & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);")
-            deq.append(f"        q2[{r}][{wi * 4 + 1}] = as_type<half2>((lo & 0x00F000F0u) | 0x64006400u) - half2(1024.0h);")
-            deq.append(f"        q2[{r}][{wi * 4 + 2}] = as_type<half2>((hi & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);")
-            deq.append(f"        q2[{r}][{wi * 4 + 3}] = as_type<half2>((hi & 0x00F000F0u) | 0x64006400u) - half2(1024.0h); }}")
+            deq.append(
+                f"        q2[{r}][{wi * 4}] = as_type<half2>((lo & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);"
+            )
+            deq.append(
+                f"        q2[{r}][{wi * 4 + 1}] = as_type<half2>((lo & 0x00F000F0u) | 0x64006400u) - half2(1024.0h);"
+            )
+            deq.append(
+                f"        q2[{r}][{wi * 4 + 2}] = as_type<half2>((hi & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);"
+            )
+            deq.append(
+                f"        q2[{r}][{wi * 4 + 3}] = as_type<half2>((hi & 0x00F000F0u) | 0x64006400u) - half2(1024.0h); }}"
+            )
     chunks = []
     for m0 in range(0, M, MC):
         rows = range(m0, min(m0 + MC, M))
@@ -221,7 +233,10 @@ def _main_source(M, N, K, R, NSG, MC):
                 mm = m - m0
                 fm.append(
                     f"      {{ half2 p = q2[{r}][0] * x2({mm}, 0);\n"
-                    + "\n".join(f"        p = fma(q2[{r}][{j}], x2({mm}, {j}), p);" for j in range(1, 8))
+                    + "\n".join(
+                        f"        p = fma(q2[{r}][{j}], x2({mm}, {j}), p);"
+                        for j in range(1, 8)
+                    )
                     + f"\n        acc[{r}][{m}] = fma(s[{r}], float(p.x + p.y), fma(bb[{r}], xs[{mm}], acc[{r}][{m}])); }}"
                 )
         chunks.append(xl + "\n" + xs + "\n" + "\n".join(fm))
@@ -276,7 +291,11 @@ def _kernel(kind, key, source, inputs, outputs, header=""):
         name = kind + "_" + "_".join(str(v) for v in key)
         name = "".join(c if c.isalnum() else "_" for c in name)
         kern = mx.fast.metal_kernel(
-            name=name, input_names=inputs, output_names=outputs, source=source(), header=header
+            name=name,
+            input_names=inputs,
+            output_names=outputs,
+            source=source(),
+            header=header,
         )
         _kernels[(kind, key)] = kern
     return kern
@@ -324,11 +343,17 @@ def _config(m):
 def supported(x, w, scales, biases, group_size, bits):
     if x.ndim != 2 or bits != _BITS or group_size != _GROUP or biases is None:
         return False
-    if x.dtype not in (mx.bfloat16, mx.float16) or scales.dtype != x.dtype or biases.dtype != x.dtype:
+    if (
+        x.dtype not in (mx.bfloat16, mx.float16)
+        or scales.dtype != x.dtype
+        or biases.dtype != x.dtype
+    ):
         return False
     m, k = x.shape
     n = w.shape[0]
-    return _MIN_M <= m <= _MAX_M and k % _SEG == 0 and n % 8 == 0 and w.shape[1] * 8 == k
+    return (
+        _MIN_M <= m <= _MAX_M and k % _SEG == 0 and n % 8 == 0 and w.shape[1] * 8 == k
+    )
 
 
 def qmv_main(p, w, scales, biases):
@@ -358,7 +383,9 @@ def qmv_main(p, w, scales, biases):
 def qmv_small(x, w, scales, biases, group_size=_GROUP, bits=_BITS):
     """``x @ dequant(w).T`` for ``x`` of shape (M, K); mx.quantized_matmul outside 3 <= M <= 8."""
     if not supported(x, w, scales, biases, group_size, bits):
-        return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group_size, bits=bits)
+        return mx.quantized_matmul(
+            x, w, scales, biases, transpose=True, group_size=group_size, bits=bits
+        )
     return qmv_main(prep(x), w, scales, biases)
 
 
@@ -389,7 +416,9 @@ def prep_rms_norm(norm, x, module):
     if not routes(module, x.shape, x.dtype):
         return norm(x)
     k = x.shape[-1]
-    return prep(x.reshape(-1, k), "rms_norm", norm.weight, eps=norm.eps, shape=tuple(x.shape))
+    return prep(
+        x.reshape(-1, k), "rms_norm", norm.weight, eps=norm.eps, shape=tuple(x.shape)
+    )
 
 
 def prep_swiglu(gate_up, module):
@@ -416,16 +445,37 @@ def prep_gated_norm(norm, x, gate, module):
     k = heads * d
     # The per-head reduction needs a power-of-two number of lanes per head (16 values each).
     tph = d // 16
-    if not routes(module, shape, x.dtype) or d % 16 or tph > 32 or tph & (tph - 1) or _SEG % d:
+    if (
+        not routes(module, shape, x.dtype)
+        or d % 16
+        or tph > 32
+        or tph & (tph - 1)
+        or _SEG % d
+    ):
         return None
-    return prep(x.reshape(-1, k), "gated_norm", gate.reshape(-1, k), norm.weight, eps=norm.eps, d=d, shape=shape)
+    return prep(
+        x.reshape(-1, k),
+        "gated_norm",
+        gate.reshape(-1, k),
+        norm.weight,
+        eps=norm.eps,
+        d=d,
+        shape=shape,
+    )
 
 
 def qlinear(module, x):
     """Apply a bias-free 4-bit g64 ``QuantizedLinear`` through ``qmv_small`` when 3 <= M <= 8."""
     if isinstance(x, Prepped):
-        return qmv_main(x, module.weight, module.scales, module.biases).reshape(*x.shape[:-1], -1)
+        return qmv_main(x, module.weight, module.scales, module.biases).reshape(
+            *x.shape[:-1], -1
+        )
     if routes(module, x.shape, x.dtype):
-        y = qmv_main(prep(x.reshape(-1, x.shape[-1])), module.weight, module.scales, module.biases)
+        y = qmv_main(
+            prep(x.reshape(-1, x.shape[-1])),
+            module.weight,
+            module.scales,
+            module.biases,
+        )
         return y.reshape(*x.shape[:-1], -1)
     return module(x)
