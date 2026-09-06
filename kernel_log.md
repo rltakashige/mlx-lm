@@ -235,3 +235,12 @@ S=1 31.50, S=2 32.70, S=3 34.62, S=4 35.36, S=6 41.69, S=8 45.86 -> ~2 ms slower
 (33.1/33.3/40.0/44.5) although chain_bench3 shows the prep only +0.5-2 us per call. Queued A/B
 reruns (after5, after4 via PYTHONPATH to an alt checkout, after5 again) to separate noise.
 final_sweep4 (integrated, 80fe538): sum M=3 27.4, M=4 27.7, M=6 30.9, M=8 36.4 ms (same as before).
+
+## A/B S-curve reruns (median ms, sizes 1/3/4/8)
+
+after5b (row scan, 80fe538): 31.86 / 34.48 / 35.18 / 46.02
+after4b (fixed 1/256, f67e8fd): 31.29 / 33.06 / 33.74 / 44.42
+after5c (row scan again): 31.30 / 34.52 / 35.20 / 45.94
+=> the redundant row scan costs ~1.4 ms at S=3/4 in the model (dependent chain: the scan loop's
+serialized load latency, 5-17 iterations per thread). Fix: scan with 256/512 threads per
+threadgroup and an unrolled compile-time loop; only the first 64 threads convert.

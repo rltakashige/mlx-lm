@@ -124,18 +124,25 @@ def _values(kind, dst, cidx, rs):
       load16(x + (size_t)m * K + ({cidx}) * 16, {dst});"""
 
 
-def _prep_source(K, M, kind, eps=0.0, D=0):
-    """64 threads per 1024 values of one row: producer op in fp32, row max, fp16 store.
+def _scan_threads(K):
+    """Threads per prep threadgroup: all scan the row, the first 64 convert their segment."""
+    return 256 if K <= 8192 else 512
 
-    Every threadgroup of a row first scans the whole row for the max (and the RMS), so the
-    fp16 scale is per row without a separate pass. kind: "copy" (x), "rms_norm"
-    (x * rsqrt(mean(x^2) + eps) * weight), "swiglu" (silu(gate) * up with gate = x[:, :K]
-    and up = x[:, K:]), "gate" (x * sigmoid(gate)), "gated_norm" (per-head RMSNorm over D
-    values times silu(gate)).
+
+def _prep_source(K, M, kind, eps=0.0, D=0):
+    """One threadgroup per 1024 values of one row: producer op in fp32, row max, fp16 store.
+
+    Every threadgroup of a row first scans the whole row for the max (and the RMS) with all
+    its threads, so the fp16 scale is per row without a separate pass. kind: "copy" (x),
+    "rms_norm" (x * rsqrt(mean(x^2) + eps) * weight), "swiglu" (silu(gate) * up with
+    gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(gate)), "gated_norm" (per-head
+    RMSNorm over D values times silu(gate)).
     """
     Mp = _mp(M)
+    NT = _scan_threads(K)
+    NIT = -(-(K // 16) // NT)
     stores = "\n".join(
-        f"    h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
+        f"      h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
         for c in range(2)
         for j in range(8)
     )
@@ -152,18 +159,21 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
     else:
         norm = "\n    const float rs = 1.0f;\n    (void)rs;"
     return f"""
-    constexpr int K = {K}, Mp = {Mp}, NT = 64, NSEG = K / {_SEG}, D = {D}, TPH = D / 16;
+    constexpr int K = {K}, Mp = {Mp}, NT = {NT}, NIT = {NIT}, NSEG = K / {_SEG}, D = {D}, TPH = D / 16;
     constexpr float EPS = {float(eps)!r}f;
     const int m = threadgroup_position_in_grid.x / NSEG;
     const int seg = threadgroup_position_in_grid.x % NSEG;
     const int t = thread_position_in_threadgroup.x;
-    const int c = seg * NT + t;
     float ss = 0.0f;
     float amax = 0.0f;
-    for (int c2 = t; c2 < K / 16; c2 += NT) {{
-      float u[16];{_values(kind, "u", "c2", "1.0f")}
-      {_UNROLL}
-      for (int i = 0; i < 16; i++) amax = max(amax, fabs(u[i]));
+    {_UNROLL}
+    for (int j = 0; j < NIT; j++) {{
+      const int c2 = t + j * NT;
+      if (c2 < K / 16) {{
+        float u[16];{_values(kind, "u", "c2", "1.0f")}
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) amax = max(amax, fabs(u[i]));
+      }}
     }}
     (void)ss;{norm}
     amax = simd_max(amax);
@@ -180,18 +190,21 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
       sc = ldexp(1.0f, 3 - e);
     }}
     if (seg == 0 && t == 0) rscale[m] = 1.0f / sc;
-    float v[16];
-    {{{_values(kind, "v", "c", "rs")}
-    }}
-    float s = 0.0f;
-    {_UNROLL}
-    for (int i = 0; i < 16; i++) s += v[i];
-    xsum[c * Mp + m] = s * sc;
-    half h[16];
+    if (t < {_SEG} / 16) {{
+      const int c = seg * ({_SEG} / 16) + t;
+      float v[16];
+      {{{_values(kind, "v", "c", "rs")}
+      }}
+      float s = 0.0f;
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) s += v[i];
+      xsum[c * Mp + m] = s * sc;
+      half h[16];
 {stores}
-    device half4* o = (device half4*)(x16 + (size_t)m * K + c * 16);
-    {_UNROLL}
-    for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
+      device half4* o = (device half4*)(x16 + (size_t)m * K + c * 16);
+      {_UNROLL}
+      for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
+    }}
 """
 
 
@@ -327,8 +340,8 @@ def prep(x, kind="copy", *extra, eps=0.0, d=0, shape=None):
     x16, xsum, rscale = kern(
         inputs=[x, *extra],
         template=[("T", x.dtype)],
-        grid=(64 * (K // _SEG) * M, 1, 1),
-        threadgroup=(64, 1, 1),
+        grid=(_scan_threads(K) * (K // _SEG) * M, 1, 1),
+        threadgroup=(_scan_threads(K), 1, 1),
         output_shapes=[(M, K), (K // 16, Mp), (Mp,)],
         output_dtypes=[mx.float16, mx.float32, mx.float32],
     )
