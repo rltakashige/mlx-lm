@@ -26,7 +26,7 @@ _GROUP = 64
 _VPL = 16  # K values per lane per step
 # mx.quantized_matmul is already weight-bandwidth bound at M = 2.
 _MIN_M, _MAX_M = 3, 8
-_SEG = 1024  # x values per prep threadgroup (64 threads x 16)
+_KSTEP = 32 * _VPL  # K values per main-kernel step
 _UNROLL = "#pragma clang loop unroll(full)"
 _kernels = {}
 
@@ -170,12 +170,17 @@ def _scan(kind):
 
 
 def _scan_threads(K):
-    """Threads per prep threadgroup: all scan the row, the first 64 convert their segment."""
+    """Threads per prep threadgroup; each converts one 16-value chunk after the row scan."""
     return 256 if K <= 8192 else 512
 
 
+def _prep_segments(K):
+    """Threadgroups per row: also the scan iterations per thread."""
+    return -(-(K // 16) // _scan_threads(K))
+
+
 def _prep_source(K, M, kind, eps=0.0, D=0):
-    """One threadgroup per 1024 values of one row: producer op in fp32, row scale, fp16 store.
+    """NT threads per 16 * NT values of one row: producer op in fp32, row scale, fp16 store.
 
     Every threadgroup of a row first scans the whole row with all its threads for a bound
     of the row's max (and the RMS), so the fp16 scale is per row without a separate pass.
@@ -185,7 +190,7 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
     """
     Mp = _mp(M)
     NT = _scan_threads(K)
-    NIT = -(-(K // 16) // NT)
+    NIT = _prep_segments(K)
     stores = "\n".join(
         f"      h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
         for c in range(2)
@@ -219,7 +224,7 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
         post = "\n    const float rs = 1.0f;"
     scan = _scan(kind).replace("{_UNROLL}", _UNROLL)
     return f"""
-    constexpr int K = {K}, Mp = {Mp}, NT = {NT}, NIT = {NIT}, NSEG = K / {_SEG}, D = {D}, TPH = D / 16;
+    constexpr int K = {K}, Mp = {Mp}, NT = {NT}, NIT = {NIT}, NSEG = NIT, D = {D}, TPH = D / 16;
     constexpr float EPS = {float(eps)!r}f;
     const int m = threadgroup_position_in_grid.x / NSEG;
     const int seg = threadgroup_position_in_grid.x % NSEG;
@@ -249,8 +254,8 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
       sc = ldexp(1.0f, 3 - e);
     }}
     if (seg == 0 && t == 0) rscale[m] = 1.0f / sc;
-    if (t < {_SEG} / 16) {{
-      const int c = seg * ({_SEG} / 16) + t;
+    const int c = seg * NT + t;
+    if (c < K / 16) {{
       float v[16];
       {{{_values(kind, "v", "c", "rs")}
       }}
@@ -399,7 +404,7 @@ def prep(x, kind="copy", *extra, eps=0.0, d=0, shape=None):
     x16, xsum, rscale = kern(
         inputs=[x, *extra],
         template=[("T", x.dtype)],
-        grid=(_scan_threads(K) * (K // _SEG) * M, 1, 1),
+        grid=(_scan_threads(K) * _prep_segments(K) * M, 1, 1),
         threadgroup=(_scan_threads(K), 1, 1),
         output_shapes=[(M, K), (K // 16, Mp), (Mp,)],
         output_dtypes=[mx.float16, mx.float32, mx.float32],
@@ -424,7 +429,7 @@ def supported(x, w, scales, biases, group_size, bits):
     m, k = x.shape
     n = w.shape[0]
     return (
-        _MIN_M <= m <= _MAX_M and k % _SEG == 0 and n % 8 == 0 and w.shape[1] * 8 == k
+        _MIN_M <= m <= _MAX_M and k % _KSTEP == 0 and n % 8 == 0 and w.shape[1] * 8 == k
     )
 
 
@@ -477,7 +482,7 @@ def routes(module, shape, dtype):
         and module.scales.dtype == dtype
         and module.biases.dtype == dtype
         and _MIN_M <= m <= _MAX_M
-        and k % _SEG == 0
+        and k % _KSTEP == 0
         and module.weight.shape[0] % 8 == 0
         and module.weight.shape[1] * 8 == k
     )
@@ -517,13 +522,7 @@ def prep_gated_norm(norm, x, gate, module):
     k = heads * d
     # The per-head reduction needs a power-of-two number of lanes per head (16 values each).
     tph = d // 16
-    if (
-        not routes(module, shape, x.dtype)
-        or d % 16
-        or tph > 32
-        or tph & (tph - 1)
-        or _SEG % d
-    ):
+    if not routes(module, shape, x.dtype) or d % 16 or tph > 32 or tph & (tph - 1):
         return None
     return prep(
         x.reshape(-1, k),

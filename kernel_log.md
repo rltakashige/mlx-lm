@@ -258,3 +258,10 @@ already exists for the RMS).
 mlx M=1 26.2 M=2 26.5 M=3 28.2 M=4 32.5 M=6 63.2 M=8 86.9; integrated M=3 27.6 M=4 27.9 M=6 31.3 M=8 36.8.
 Commit 2c8b5a2 (bound scans): accuracy unchanged (rms_norm 0.0207 vs mlx 0.0248, tiny rows
 0.000197 vs 0.000172, huge 54.6 vs 48.5, all finite). Queued S-curve after7, final_sweep6.
+
+## S-curve after7 (2c8b5a2: bound scans), median ms
+
+S=1 31.70, S=2 32.02, S=3 33.59, S=4 34.26, S=6 40.66, S=8 45.21. chain_bench5: swiglu prep at
+M=8 still 20 us (17 segments x full-row scan = 17x redundant L2 reads of 70 KB per row).
+final_sweep6 (integrated 2c8b5a2): M=3 27.6, M=4 27.8, M=6 31.2, M=8 36.6 ms.
+Next: segments of NT chunks (256/512 threads each convert one chunk) -> 2-3 segments per row.
