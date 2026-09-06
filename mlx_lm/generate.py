@@ -214,6 +214,13 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--draft-stop-prob",
+        type=float,
+        help="Stop drafting once the product of the draft top-1 probabilities "
+        "is below this value (0 disables).",
+        default=0.5,
+    )
     return parser
 
 
@@ -479,6 +486,7 @@ def speculative_generate_step(
     draft_model: nn.Module,
     *,
     num_draft_tokens: int = 2,
+    draft_stop_prob: float = 0.5,
     max_tokens: int = 256,
     sampler: Optional[Sampler] = None,
     logits_processors: Optional[List[LogitsProcessor]] = None,
@@ -499,6 +507,10 @@ def speculative_generate_step(
           and fed its hidden states.
         num_draft_tokens (int, optional): The number of draft tokens for
           speculative decoding. Default: ``2``.
+        draft_stop_prob (float, optional): Stop drafting once the product of
+          the drafts' top-1 probabilities is below this value. The probabilities
+          are read one draft late, so the draft computed past the stop is
+          dropped. ``0`` disables the stop. Default: ``0.5``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
         sampler (Sampler, optional): A sampler for sampling a
@@ -623,15 +635,28 @@ def speculative_generate_step(
         trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
-        if num_draft == 0:
-            return mx.array([], mx.uint32)
-        ys = []
-        h = hidden
-        for _ in range(num_draft):
-            y, _, h = _step(draft_model, draft_cache, y, hidden=h)
-            mx.async_eval(y)
+        nonlocal prev_tokens
+        ys, h, ps, q = [], hidden, [], 1.0
+        for i in range(num_draft):
+            y, logprobs, h = _step(draft_model, draft_cache, y, hidden=h)
             ys.append(y)
-        return mx.concatenate(ys)
+            if not draft_stop_prob:
+                mx.async_eval(y)
+                continue
+            ps.append(mx.exp(logprobs.max()))
+            mx.async_eval(y, ps[-1])
+            # Read the previous draft's top-1 probability while this one runs.
+            # The last draft is not read, so the verify is built without a wait.
+            if 0 < i < num_draft - 1:
+                q *= ps[i - 1].item()
+                if q < draft_stop_prob:
+                    # The chain is likely broken: drop the draft computed past it.
+                    trim_prompt_cache(draft_cache, 1)
+                    if prev_tokens is not None:
+                        prev_tokens = prev_tokens[:-1]
+                    ys.pop()
+                    break
+        return mx.concatenate(ys) if ys else mx.array([], mx.uint32)
 
     with mx.stream(generation_stream):
         if mtp:
@@ -660,6 +685,7 @@ def speculative_generate_step(
                 if mtp and hidden is None:
                     num_draft = 0
                 draft_tokens = _draft_generate(draft_y, num_draft)
+                num_draft = draft_tokens.size
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[
                         : prev_tokens.size - y.size - num_draft + 1
@@ -762,6 +788,7 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("draft_stop_prob", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -2213,6 +2240,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        draft_stop_prob=args.draft_stop_prob,
     )
     if not args.verbose:
         print(response)

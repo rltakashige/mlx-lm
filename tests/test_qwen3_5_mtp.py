@@ -228,6 +228,11 @@ class TestQwen3_5MTP(unittest.TestCase):
                             prefill_step_size=step,
                         )
                         self.assertEqual(tokens, expected)
+                for stop in (0.0, 0.9):
+                    tokens, _ = _speculative(
+                        PROMPT, target, head, 32, num_draft_tokens=3, draft_stop_prob=stop
+                    )
+                    self.assertEqual(tokens, expected)
             # A one token prompt has no hidden state before the first target step
             tokens, _ = _speculative(PROMPT[:1], target, head, 16, num_draft_tokens=2)
             self.assertEqual(tokens, _greedy(PROMPT[:1], target, 16))
