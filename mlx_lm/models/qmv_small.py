@@ -1,0 +1,248 @@
+# Copyright © 2026 Apple Inc.
+
+"""Small-M (2..8 rows) 4-bit affine g64 quantized matvec for the MTP verify pass.
+
+``mx.quantized_matmul`` routes 2 <= M < 13 to ``qmv_wide``, which dequantizes
+each weight in fp32 per input row and is ALU bound on M5. This kernel keeps the
+``qmv_fast`` geometry (R rows per simdgroup, 16 K values per lane per step),
+dequantizes each nibble once into fp16 and applies it to all M rows with half2
+FMAs. Half partials are flushed into fp32 accumulators every step, so one group
+of 64 per lane per step.
+
+``x`` is first converted by a small prep kernel into fp16 (scaled per row by a
+power of two so the fp16 partials stay in range), plus per-16-chunk sums for
+the bias term. The kernel reads the nibble pairs (k, k+4) of each 8-value word
+through the fp16 "magic number" trick, so the prep permutes x the same way and
+pre-scales the odd pairs by 1/16.
+"""
+
+import mlx.core as mx
+import mlx.nn as nn
+
+_BITS = 4
+_GROUP = 64
+_VPL = 16  # K values per lane per step
+_MIN_M, _MAX_M = 2, 8
+_UNROLL = "#pragma clang loop unroll(full)"
+_kernels = {}
+
+
+def _tag(dtype):
+    return {mx.bfloat16: "bf16", mx.float16: "f16", mx.float32: "f32"}[dtype]
+
+
+def _mp(m):
+    return 2 if m <= 2 else 4 if m <= 4 else 8
+
+
+# x order inside each 8-value word, and the pre-scale of each stored position.
+_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+_SCALE = (1.0, 1.0, 1 / 16, 1 / 16, 1.0, 1.0, 1 / 16, 1 / 16)
+
+
+def _prep_source(K, M):
+    Mp = _mp(M)
+    stores = "\n".join(
+        f"      h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));"
+        for c in range(2)
+        for j in range(8)
+    )
+    return f"""
+    constexpr int K = {K}, Mp = {Mp}, NT = 256;
+    const int m = threadgroup_position_in_grid.x;
+    const int t = thread_position_in_threadgroup.x;
+    const device T* xr = x + (size_t)m * K;
+    float amax = 0.0f;
+    for (int k = t; k < K; k += NT) amax = max(amax, fabs(float(xr[k])));
+    amax = simd_max(amax);
+    threadgroup float red[NT / 32];
+    if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = red[0];
+    for (int i = 1; i < NT / 32; i++) amax = max(amax, red[i]);
+    // Scale the row so max |x| is in [4, 8): fp16 partials stay far from overflow.
+    int e = 0;
+    float sc = 1.0f;
+    if (amax > 0.0f) {{
+      frexp(amax, e);
+      sc = ldexp(1.0f, 3 - e);
+    }}
+    if (t == 0) rscale[m] = 1.0f / sc;
+    for (int c = t; c < K / 16; c += NT) {{
+      float v[16];
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) v[i] = float(xr[c * 16 + i]);
+      float s = 0.0f;
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) s += v[i];
+      xsum[c * Mp + m] = s * sc;
+      half h[16];
+{stores}
+      device half4* o = (device half4*)(x16 + (size_t)m * K + c * 16);
+      {_UNROLL}
+      for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
+    }}
+"""
+
+
+def _main_source(M, N, K, R, NSG, MC):
+    Mp = _mp(M)
+    NB = K // (32 * _VPL)
+    wload = "\n".join(f"      {{dst}}[{r}] = *(const device uint2*)(wp + {r} * KW);" for r in range(R))
+    deq = []
+    for r in range(R):
+        for wi in range(2):
+            wd = f"wv[{r}][{wi}]"
+            deq.append(f"      {{ const uint lo = {wd}, hi = {wd} >> 8;")
+            deq.append(f"        q2[{r}][{wi * 4}] = as_type<half2>((lo & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);")
+            deq.append(f"        q2[{r}][{wi * 4 + 1}] = as_type<half2>((lo & 0x00F000F0u) | 0x64006400u) - half2(1024.0h);")
+            deq.append(f"        q2[{r}][{wi * 4 + 2}] = as_type<half2>((hi & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);")
+            deq.append(f"        q2[{r}][{wi * 4 + 3}] = as_type<half2>((hi & 0x00F000F0u) | 0x64006400u) - half2(1024.0h); }}")
+    chunks = []
+    for m0 in range(0, M, MC):
+        rows = range(m0, min(m0 + MC, M))
+        xl = "\n".join(
+            f"      xv[{m - m0}][{c}] = *(const device uint4*)(xp + {m} * K + {c} * 8);"
+            for m in rows
+            for c in range(2)
+        )
+        xs = "\n".join(f"      xs[{m - m0}] = xsp[{m}];" for m in rows)
+        fm = []
+        for r in range(R):
+            for m in rows:
+                mm = m - m0
+                fm.append(
+                    f"      {{ half2 p = q2[{r}][0] * x2({mm}, 0);\n"
+                    + "\n".join(f"        p = fma(q2[{r}][{j}], x2({mm}, {j}), p);" for j in range(1, 8))
+                    + f"\n        acc[{r}][{m}] = fma(s[{r}], float(p.x + p.y), fma(bb[{r}], xs[{mm}], acc[{r}][{m}])); }}"
+                )
+        chunks.append(xl + "\n" + xs + "\n" + "\n".join(fm))
+    return f"""
+    constexpr int M = {M}, N = {N}, K = {K}, R = {R}, NSG = {NSG}, VPL = {_VPL}, Mp = {Mp}, MC = {MC};
+    constexpr int KW = K / 8, KG = K / 64, NB = {NB};
+    const int lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int row0 = (threadgroup_position_in_grid.x * NSG + sg) * R;
+    const device uint32_t* wp = w + (size_t)row0 * KW + lane * 2;
+    const device T* sp = scales + (size_t)row0 * KG + lane / 4;
+    const device T* bp = biases + (size_t)row0 * KG + lane / 4;
+    const device half* xp = x16 + lane * VPL;
+    const device float* xsp = xsum + (size_t)lane * Mp;
+    #define x2(m, j) as_type<half2>(xv[m][(j) / 4][(j) % 4])
+    float acc[R][M];
+    {_UNROLL}
+    for (int r = 0; r < R; r++)
+      {_UNROLL}
+      for (int m = 0; m < M; m++) acc[r][m] = 0.0f;
+    uint2 wv[R], wn[R];
+    uint4 xv[MC][2];
+    half2 q2[R][8];
+    float s[R], bb[R], xs[MC];
+{wload.format(dst="wv")}
+    for (int b = 0; b < NB; b++) {{
+      // Request the next step's weights before this step's math.
+      wp += 32 * VPL / 8;
+      if (b + 1 < NB) {{
+{wload.format(dst="wn")}
+      }}
+{chr(10).join(f"      s[{r}] = float(sp[{r} * KG]); bb[{r}] = float(bp[{r} * KG]);" for r in range(R))}
+{chr(10).join(deq)}
+{chr(10).join(chunks)}
+      sp += 32 * VPL / 64;
+      bp += 32 * VPL / 64;
+      xp += 32 * VPL;
+      xsp += 32 * Mp;
+{chr(10).join(f"      wv[{r}] = wn[{r}];" for r in range(R))}
+    }}
+{chr(10).join(f"    acc[{r}][{m}] = simd_sum(acc[{r}][{m}]);" for r in range(R) for m in range(M))}
+    if (lane == 0) {{
+{chr(10).join(f"      y[(size_t){m} * N + row0 + {r}] = T(acc[{r}][{m}] * rscale[{m}]);" for r in range(R) for m in range(M))}
+    }}
+    #undef x2
+"""
+
+
+def _kernel(kind, key, source, inputs, outputs):
+    kern = _kernels.get((kind, key))
+    if kern is None:
+        name = kind + "_" + "_".join(str(v) for v in key)
+        kern = mx.fast.metal_kernel(name=name, input_names=inputs, output_names=outputs, source=source())
+        _kernels[(kind, key)] = kern
+    return kern
+
+
+def prep(x):
+    """``x`` (M, K) -> fp16 x (permuted, scaled), per-16-chunk sums (K/16, Mp), row scales (Mp,)."""
+    M, K = x.shape
+    Mp = _mp(M)
+    kern = _kernel("qmv_small_prep", (K, M, _tag(x.dtype)), lambda: _prep_source(K, M), ["x"], ["x16", "xsum", "rscale"])
+    return kern(
+        inputs=[x],
+        template=[("T", x.dtype)],
+        grid=(256 * M, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(M, K), (K // 16, Mp), (Mp,)],
+        output_dtypes=[mx.float16, mx.float32, mx.float32],
+    )
+
+
+def _config(m):
+    # Two rows per simdgroup keeps registers low; at M > 4 four rows amortize the dequant.
+    return (2, 2, m) if m <= 4 else (4, 2, 4)
+
+
+def supported(x, w, scales, biases, group_size, bits):
+    if x.ndim != 2 or bits != _BITS or group_size != _GROUP or biases is None:
+        return False
+    if x.dtype not in (mx.bfloat16, mx.float16) or scales.dtype != x.dtype or biases.dtype != x.dtype:
+        return False
+    m, k = x.shape
+    n = w.shape[0]
+    return _MIN_M <= m <= _MAX_M and k % (32 * _VPL) == 0 and n % 8 == 0 and w.shape[1] * 8 == k
+
+
+def qmv_small(x, w, scales, biases, group_size=_GROUP, bits=_BITS):
+    """``x @ dequant(w).T`` for ``x`` of shape (M, K) with 2 <= M <= 8."""
+    if not supported(x, w, scales, biases, group_size, bits):
+        return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group_size, bits=bits)
+    M, K = x.shape
+    N = w.shape[0]
+    R, NSG, MC = _config(M)
+    x16, xsum, rscale = prep(x)
+    kern = _kernel(
+        "qmv_small",
+        (M, N, K, R, NSG, MC, _tag(x.dtype)),
+        lambda: _main_source(M, N, K, R, NSG, MC),
+        ["x16", "xsum", "rscale", "w", "scales", "biases"],
+        ["y"],
+    )
+    ntg = N // (R * NSG)
+    (y,) = kern(
+        inputs=[x16, xsum, rscale, w, scales, biases],
+        template=[("T", x.dtype)],
+        grid=(32 * NSG * ntg, 1, 1),
+        threadgroup=(32 * NSG, 1, 1),
+        output_shapes=[(M, N)],
+        output_dtypes=[x.dtype],
+    )
+    return y
+
+
+def qlinear(module, x):
+    """Apply a bias-free 4-bit g64 ``QuantizedLinear`` through ``qmv_small`` when 2 <= M <= 8."""
+    *batch, k = x.shape
+    m = 1
+    for d in batch:
+        m *= d
+    if (
+        isinstance(module, nn.QuantizedLinear)
+        and module.bits == _BITS
+        and module.group_size == _GROUP
+        and getattr(module, "mode", "affine") == "affine"
+        and "bias" not in module
+        and _MIN_M <= m <= _MAX_M
+    ):
+        x2 = x.reshape(m, k)
+        if supported(x2, module.weight, module.scales, module.biases, _GROUP, _BITS):
+            return qmv_small(x2, module.weight, module.scales, module.biases).reshape(*batch, -1)
+    return module(x)
