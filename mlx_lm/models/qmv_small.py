@@ -9,12 +9,13 @@ dequantizes each nibble once into fp16 and applies it to all M rows with half2
 FMAs. Half partials are flushed into fp32 accumulators every step, so one group
 of 64 per lane per step.
 
-``x`` is first converted by a prep kernel into fp16 scaled by 1/256 (so the
-fp16 partials stay in range), plus per-16-chunk sums for the bias term. The
-kernel reads the nibble pairs (k, k+4) of each 8-value word through the fp16
-"magic number" trick, so the prep permutes x the same way and pre-scales the
-odd pairs by 1/16. The prep can fuse the producer of x (RMSNorm, swiglu, the
-attention output gate, the GDN gated norm) so no extra kernel is launched.
+``x`` is first converted by a prep kernel into fp16 scaled per row by a power
+of two (so the fp16 partials stay in range), plus per-16-chunk sums for the
+bias term. The kernel reads the nibble pairs (k, k+4) of each 8-value word
+through the fp16 "magic number" trick, so the prep permutes x the same way and
+pre-scales the odd pairs by 1/16. The prep can fuse the producer of x (RMSNorm,
+swiglu, the attention output gate, the GDN gated norm) so no extra kernel is
+launched.
 """
 
 import mlx.core as mx
@@ -26,7 +27,6 @@ _VPL = 16  # K values per lane per step
 # mx.quantized_matmul is already weight-bandwidth bound at M = 2.
 _MIN_M, _MAX_M = 3, 8
 _SEG = 1024  # x values per prep threadgroup (64 threads x 16)
-_XSCALE = 1.0 / 256  # |x| may reach ~7e4 before an fp16 partial overflows
 _UNROLL = "#pragma clang loop unroll(full)"
 _kernels = {}
 
@@ -79,91 +79,117 @@ _PREP_INPUTS = {
 }
 
 
-def _prep_source(K, M, kind, eps=0.0, D=0):
-    """64 threads per 1024 values of one row: producer op in fp32, then the fp16 store.
+def _values(kind, dst, cidx, rs):
+    """Code that computes the 16 values of chunk ``cidx`` of row ``m`` into ``dst`` (floats)."""
+    if kind == "rms_norm":
+        return f"""
+      float xx[16], ww[16];
+      load16(x + (size_t)m * K + ({cidx}) * 16, xx);
+      load16(weight + ({cidx}) * 16, ww);
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) {{
+        ss += xx[i] * xx[i];
+        {dst}[i] = xx[i] * ww[i] * {rs};
+      }}"""
+    if kind == "swiglu":
+        return f"""
+      float gg[16];
+      load16(x + (size_t)m * 2 * K + ({cidx}) * 16, gg);
+      load16(x + (size_t)m * 2 * K + K + ({cidx}) * 16, {dst});
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) {dst}[i] *= gg[i] * sigmoid_f(gg[i]);"""
+    if kind == "gate":
+        return f"""
+      float gg[16];
+      load16(x + (size_t)m * K + ({cidx}) * 16, {dst});
+      load16(gate + (size_t)m * K + ({cidx}) * 16, gg);
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) {dst}[i] *= sigmoid_f(gg[i]);"""
+    if kind == "gated_norm":
+        return f"""
+      float xx[16], gg[16], ww[16];
+      load16(x + (size_t)m * K + ({cidx}) * 16, xx);
+      load16(gate + (size_t)m * K + ({cidx}) * 16, gg);
+      load16(weight + (({cidx}) * 16) % D, ww);
+      float ssh = 0.0f;
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) ssh += xx[i] * xx[i];
+      // The TPH threads of one head are adjacent lanes of one simdgroup.
+      {_UNROLL}
+      for (int o = TPH / 2; o > 0; o >>= 1) ssh += simd_shuffle_xor(ssh, o);
+      const float rsh = rsqrt(ssh / D + EPS);
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) {dst}[i] = xx[i] * rsh * ww[i] * (gg[i] * sigmoid_f(gg[i]));"""
+    return f"""
+      load16(x + (size_t)m * K + ({cidx}) * 16, {dst});"""
 
-    kind: "copy" (x), "rms_norm" (x * rsqrt(mean(x^2) + eps) * weight), "swiglu"
-    (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(gate)),
-    "gated_norm" (per-head RMSNorm over D values times silu(gate)).
+
+def _prep_source(K, M, kind, eps=0.0, D=0):
+    """64 threads per 1024 values of one row: producer op in fp32, row max, fp16 store.
+
+    Every threadgroup of a row first scans the whole row for the max (and the RMS), so the
+    fp16 scale is per row without a separate pass. kind: "copy" (x), "rms_norm"
+    (x * rsqrt(mean(x^2) + eps) * weight), "swiglu" (silu(gate) * up with gate = x[:, :K]
+    and up = x[:, K:]), "gate" (x * sigmoid(gate)), "gated_norm" (per-head RMSNorm over D
+    values times silu(gate)).
     """
     Mp = _mp(M)
     stores = "\n".join(
-        f"    h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (SC * {_SCALE[j]}f));" for c in range(2) for j in range(8)
+        f"    h[{c * 8 + j}] = half(v[{c * 8 + _ORDER[j]}] * (sc * {_SCALE[j]}f));" for c in range(2) for j in range(8)
     )
     if kind == "rms_norm":
-        values = f"""
-    // Every threadgroup of the row reduces the whole row (10 KB) for the RMS.
-    float ss = 0.0f;
-    for (int c2 = t; c2 < K / 16; c2 += NT) {{
-      float u[16];
-      load16(x + (size_t)m * K + c2 * 16, u);
-      {_UNROLL}
-      for (int i = 0; i < 16; i++) ss += u[i] * u[i];
-    }}
+        norm = f"""
     ss = simd_sum(ss);
     threadgroup float red[NT / 32];
     if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     ss = 0.0f;
     for (int i = 0; i < NT / 32; i++) ss += red[i];
-    const float rs = rsqrt(ss / K + {float(eps)!r}f);
-    float wv[16];
-    load16(x + (size_t)m * K + k0, v);
-    load16(weight + k0, wv);
-    {_UNROLL}
-    for (int i = 0; i < 16; i++) v[i] *= rs * wv[i];"""
-    elif kind == "swiglu":
-        values = f"""
-    float g[16];
-    load16(x + (size_t)m * 2 * K + k0, g);
-    load16(x + (size_t)m * 2 * K + K + k0, v);
-    {_UNROLL}
-    for (int i = 0; i < 16; i++) v[i] *= g[i] * sigmoid_f(g[i]);"""
-    elif kind == "gate":
-        values = f"""
-    float g[16];
-    load16(x + (size_t)m * K + k0, v);
-    load16(gate + (size_t)m * K + k0, g);
-    {_UNROLL}
-    for (int i = 0; i < 16; i++) v[i] *= sigmoid_f(g[i]);"""
-    elif kind == "gated_norm":
-        values = f"""
-    constexpr int D = {D}, TPH = D / 16;
-    float g[16], wv[16];
-    load16(x + (size_t)m * K + k0, v);
-    load16(gate + (size_t)m * K + k0, g);
-    load16(weight + (k0 % D), wv);
-    float ss = 0.0f;
-    {_UNROLL}
-    for (int i = 0; i < 16; i++) ss += v[i] * v[i];
-    // The TPH threads of one head are adjacent lanes of one simdgroup.
-    {_UNROLL}
-    for (int o = TPH / 2; o > 0; o >>= 1) ss += simd_shuffle_xor(ss, o);
-    const float rs = rsqrt(ss / D + {float(eps)!r}f);
-    {_UNROLL}
-    for (int i = 0; i < 16; i++) v[i] *= rs * wv[i] * (g[i] * sigmoid_f(g[i]));"""
+    const float rs = rsqrt(ss / K + EPS);
+    amax *= rs;"""
     else:
-        values = """
-    load16(x + (size_t)m * K + k0, v);"""
+        norm = "\n    const float rs = 1.0f;\n    (void)rs;"
     return f"""
-    constexpr int K = {K}, Mp = {Mp}, NT = 64, NSEG = K / {_SEG};
-    constexpr float SC = {_XSCALE!r}f;
+    constexpr int K = {K}, Mp = {Mp}, NT = 64, NSEG = K / {_SEG}, D = {D}, TPH = D / 16;
+    constexpr float EPS = {float(eps)!r}f;
     const int m = threadgroup_position_in_grid.x / NSEG;
     const int seg = threadgroup_position_in_grid.x % NSEG;
     const int t = thread_position_in_threadgroup.x;
     const int c = seg * NT + t;
-    const int k0 = c * 16;
-    float v[16];{values}
+    float ss = 0.0f;
+    float amax = 0.0f;
+    for (int c2 = t; c2 < K / 16; c2 += NT) {{
+      float u[16];{_values(kind, "u", "c2", "1.0f")}
+      {_UNROLL}
+      for (int i = 0; i < 16; i++) amax = max(amax, fabs(u[i]));
+    }}
+    (void)ss;{norm}
+    amax = simd_max(amax);
+    threadgroup float red2[NT / 32];
+    if (thread_index_in_simdgroup == 0) red2[simdgroup_index_in_threadgroup] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = red2[0];
+    for (int i = 1; i < NT / 32; i++) amax = max(amax, red2[i]);
+    // Scale the row so max |x| is in [4, 8): fp16 partials stay far from overflow.
+    int e = 0;
+    float sc = 1.0f;
+    if (amax > 0.0f) {{
+      frexp(amax, e);
+      sc = ldexp(1.0f, 3 - e);
+    }}
+    if (seg == 0 && t == 0) rscale[m] = 1.0f / sc;
+    float v[16];
+    {{{_values(kind, "v", "c", "rs")}
+    }}
     float s = 0.0f;
     {_UNROLL}
     for (int i = 0; i < 16; i++) s += v[i];
-    xsum[c * Mp + m] = s * SC;
+    xsum[c * Mp + m] = s * sc;
     half h[16];
 {stores}
-    device half4* o = (device half4*)(x16 + (size_t)m * K + k0);
+    device half4* o = (device half4*)(x16 + (size_t)m * K + c * 16);
     {_UNROLL}
     for (int i = 0; i < 4; i++) o[i] = half4(h[4 * i], h[4 * i + 1], h[4 * i + 2], h[4 * i + 3]);
-    if (seg == 0 && t == 0) rscale[m] = 1.0f / SC;
 """
 
 
