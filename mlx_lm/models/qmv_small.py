@@ -405,7 +405,7 @@ def qmv_main(p, w, scales, biases):
 
 
 def qmv_small(x, w, scales, biases, group_size=_GROUP, bits=_BITS):
-    """``x @ dequant(w).T`` for ``x`` of shape (M, K) with 2 <= M <= 8."""
+    """``x @ dequant(w).T`` for ``x`` of shape (M, K); mx.quantized_matmul outside 3 <= M <= 8."""
     if not supported(x, w, scales, biases, group_size, bits):
         return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group_size, bits=bits)
     return qmv_main(prep(x), w, scales, biases)
@@ -462,7 +462,9 @@ def prep_gated_norm(norm, x, gate, module):
     *batch, heads, d = x.shape
     shape = (*batch, heads * d)
     k = heads * d
-    if not routes(module, shape, x.dtype) or k % 512 or k // 16 > 1024 or d % 16 or d > 512:
+    # The per-head reduction needs a power-of-two number of lanes per head (16 values each).
+    tph = d // 16
+    if not routes(module, shape, x.dtype) or k // 16 > 1024 or d % 16 or tph > 32 or tph & (tph - 1):
         return None
     M = 1
     for b in batch:
