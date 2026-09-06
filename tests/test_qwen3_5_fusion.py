@@ -12,7 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
-from mlx_lm.models import qwen3_5, qwen3_next
+from mlx_lm.models import moe_small, qwen3_5, qwen3_next
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.utils import (
     dequantize_model,
@@ -40,6 +40,14 @@ TEXT_CONFIG = {
     "full_attention_interval": 2,
     "tie_word_embeddings": False,
     "max_position_embeddings": 512,
+}
+MOE_CONFIG = {
+    **TEXT_CONFIG,
+    "model_type": "qwen3_5_moe",
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 32,
 }
 PROMPT = mx.array([3, 17, 42, 7, 99, 5, 61, 8, 23, 44])
 
@@ -196,6 +204,38 @@ def _logits(model, prompt, steps=4):
         out.append(logits)
         y = logits[0, -1].argmax(keepdims=True)
     return mx.concatenate(out, axis=1).astype(mx.float32)
+
+
+def _moe_block(config=MOE_CONFIG, seed=0, scale=0.3):
+    mx.random.seed(seed)
+    block = qwen3_5.SparseMoeBlock(qwen3_5.TextModelArgs.from_dict(config))
+    block.update(
+        tree_map(lambda p: mx.random.normal(p.shape) * scale, block.parameters())
+    )
+    mx.eval(block.parameters())
+    return block
+
+
+def _unfuse_experts(weights, num_experts, hidden_dim, prefix=""):
+    """The checkpoint layout of a fused MoE block: separate gate, up and shared expert."""
+    E, I = num_experts, hidden_dim
+    out = {}
+    for key, v in weights.items():
+        name, param = key.rsplit(".", 1)
+        if name == "gate":
+            out[f"{prefix}gate.{param}"] = v[:E]
+            out[f"{prefix}shared_expert_gate.{param}"] = v[E:]
+        elif name == "switch_mlp.gate_up_proj":
+            out[f"{prefix}switch_mlp.gate_proj.{param}"] = v[:E, :I]
+            out[f"{prefix}switch_mlp.up_proj.{param}"] = v[:E, I:]
+            out[f"{prefix}shared_expert.gate_proj.{param}"] = v[E, :I]
+            out[f"{prefix}shared_expert.up_proj.{param}"] = v[E, I:]
+        elif name == "switch_mlp.down_proj":
+            out[f"{prefix}switch_mlp.down_proj.{param}"] = v[:E]
+            out[f"{prefix}shared_expert.down_proj.{param}"] = v[E]
+        else:
+            out[prefix + key] = v
+    return out
 
 
 class _Group:
@@ -359,3 +399,71 @@ class TestQwen3_5Fusion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQwen3_5MoeFusion(unittest.TestCase):
+    def test_block_matches_qwen3_next(self):
+        block = _moe_block()
+        args = qwen3_5.TextModelArgs.from_dict(MOE_CONFIG)
+        twin = qwen3_next.Qwen3NextSparseMoeBlock(args)
+        weights = _unfuse_experts(
+            dict(tree_flatten(block.parameters())),
+            args.num_experts,
+            args.moe_intermediate_size,
+        )
+        twin.load_weights(list(weights.items()))
+        mx.eval(twin.parameters())
+        # 70 tokens takes the sorted path of both blocks
+        for length in (1, 3, 70):
+            x = mx.random.normal((1, length, args.hidden_size))
+            self.assertTrue(mx.allclose(block(x), twin(x), atol=1e-5), length)
+
+    def test_fusion_is_exact(self):
+        prefix = "language_model.model.layers.0.mlp."
+        for quantize in (False, True):
+            block = _moe_block()
+            if quantize:
+                nn.quantize(block, 32, 4)
+            fused = {prefix + k: v for k, v in tree_flatten(block.parameters())}
+            unfused = _unfuse_experts(
+                dict(tree_flatten(block.parameters())),
+                block.num_experts,
+                MOE_CONFIG["moe_intermediate_size"],
+                prefix,
+            )
+            for weights in (unfused, dict(fused)):
+                got = qwen3_5.fuse_projections(weights)
+                self.assertEqual(set(got), set(fused))
+                for k, v in fused.items():
+                    self.assertTrue(mx.array_equal(got[k], v), k)
+
+    def test_kernel_matches_fallback(self):
+        if not moe_small._m5():
+            raise unittest.SkipTest("the MoE decode kernel runs on M5 GPUs")
+        config = {
+            **MOE_CONFIG,
+            "hidden_size": 2048,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "num_experts": 16,
+            "num_experts_per_tok": 8,
+        }
+        block = _moe_block(config, scale=0.05)
+        nn.quantize(block, 64, 4)
+        block.update(
+            tree_map(
+                lambda p: p.astype(mx.bfloat16) if p.dtype == mx.float32 else p,
+                block.parameters(),
+            )
+        )
+        for m in (1, 2, 3, 5, 8):
+            x = mx.random.normal((1, m, 2048)).astype(mx.bfloat16)
+            self.assertTrue(moe_small.routes(block, x))
+            y = block(x).astype(mx.float32)
+            with mock.patch.object(moe_small, "routes", return_value=False):
+                expected = block(x).astype(mx.float32)
+            tol = 0.03 * mx.abs(expected).max().item()
+            self.assertLess(mx.abs(y - expected).max().item(), tol, m)
+        self.assertFalse(
+            moe_small.routes(block, mx.random.normal((1, 9, 2048)).astype(mx.bfloat16))
+        )

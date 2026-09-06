@@ -9,6 +9,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_map
 
+from . import moe_small
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -22,7 +23,8 @@ from .pipeline import PipelineMixin
 from .qmv_small import prep_gate, prep_gated_norm, prep_rms_norm, prep_swiglu, qlinear
 from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
-from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+from .qwen3_next import Qwen3NextSparseMoeBlock
+from .switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 
 
 @dataclass
@@ -162,6 +164,77 @@ class MLP(Qwen3NextMLP):
             return qlinear(self.down_proj, prepped)
         gate, up = mx.split(gate_up, 2, axis=-1)
         return self.down_proj(swiglu(gate, up))
+
+
+class FusedSwitchGLU(nn.Module):
+    """SwitchGLU with the gate and up projections fused along the output rows."""
+
+    def __init__(self, input_dims, hidden_dims, num_experts):
+        super().__init__()
+        self.gate_up_proj = SwitchLinear(
+            input_dims, 2 * hidden_dims, num_experts, bias=False
+        )
+        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=False)
+
+    def __call__(self, x, indices):
+        x = mx.expand_dims(x, (-2, -3))
+        # With many tokens, sort them so the experts are accessed in order
+        do_sort = indices.size >= 64
+        idx, inv_order = indices, None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        gate, up = mx.split(
+            self.gate_up_proj(x, idx, sorted_indices=do_sort), 2, axis=-1
+        )
+        x = self.down_proj(swiglu(gate, up), idx, sorted_indices=do_sort)
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+
+class SparseMoeBlock(nn.Module):
+    """Qwen3Next MoE block with fused expert weights.
+
+    The shared expert's gate is the last row of ``gate`` and the shared expert is the
+    last expert of ``switch_mlp``, so one gather step computes every expert of a token.
+    """
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        dim = args.hidden_size
+        self.norm_topk_prob = args.norm_topk_prob
+        self.num_experts = args.num_experts
+        self.top_k = args.num_experts_per_tok
+        self.gate = nn.Linear(dim, args.num_experts + 1, bias=False)
+        self.switch_mlp = FusedSwitchGLU(
+            dim, args.moe_intermediate_size, args.num_experts + 1
+        )
+        self.sharding_group = None
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
+        E, k = self.num_experts, self.top_k
+        logits = self.gate(x)
+        inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
+        if moe_small.routes(self, x):
+            y = moe_small.experts(self, x, logits, inds)
+        else:
+            if self.norm_topk_prob:
+                top = mx.take_along_axis(logits, inds, axis=-1)
+                scores = mx.softmax(top, axis=-1, precise=True)
+            else:
+                probs = mx.softmax(logits[..., :E], axis=-1, precise=True)
+                scores = mx.take_along_axis(probs, inds, axis=-1)
+            scores = mx.concatenate([scores, mx.sigmoid(logits[..., E:])], axis=-1)
+            shared = mx.full(inds.shape[:-1] + (1,), E, inds.dtype)
+            y = self.switch_mlp(x, mx.concatenate([inds, shared], axis=-1))
+            y = (y * scores[..., None]).sum(axis=-2)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+        return y
 
 
 class GatedDeltaNet(nn.Module):
@@ -318,10 +391,12 @@ class DecoderLayer(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
 
-        if args.num_experts > 0:
+        if args.num_experts <= 0:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        elif args.shared_expert_intermediate_size == args.moe_intermediate_size:
             self.mlp = SparseMoeBlock(args)
         else:
-            self.mlp = MLP(args.hidden_size, args.intermediate_size)
+            self.mlp = Qwen3NextSparseMoeBlock(args)
 
     def __call__(
         self,
@@ -441,6 +516,43 @@ def fuse_projections(weights):
                 [weights.pop(f"{prefix}.{module}.{part}.{param}") for part in parts],
                 axis=0,
             )
+    return fuse_experts(weights)
+
+
+def fuse_experts(weights):
+    """Fuse the experts' gate and up and store the shared expert as the last expert.
+
+    Only when the shared expert has the experts' shapes; the expert tensors are
+    indexed by expert on axis 0 and by output row on axis 1.
+    """
+    marker = ".mlp.switch_mlp.gate_proj."
+    for key in [k for k in weights if marker in k]:
+        prefix, param = key.split(marker)
+        shared = [
+            f"{prefix}.mlp.shared_expert.{part}.{param}"
+            for part in ("gate_proj", "up_proj", "down_proj")
+        ]
+        up = f"{prefix}.mlp.switch_mlp.up_proj.{param}"
+        down = f"{prefix}.mlp.switch_mlp.down_proj.{param}"
+        if (
+            shared[0] not in weights
+            or weights[shared[0]].shape != weights[key].shape[1:]
+        ):
+            continue
+        gate_up = mx.concatenate([weights.pop(key), weights.pop(up)], axis=1)
+        shared_gate_up = mx.concatenate(
+            [weights.pop(shared[0]), weights.pop(shared[1])]
+        )
+        weights[f"{prefix}.mlp.switch_mlp.gate_up_proj.{param}"] = mx.concatenate(
+            [gate_up, shared_gate_up[None]]
+        )
+        weights[down] = mx.concatenate(
+            [weights.pop(down), weights.pop(shared[2])[None]]
+        )
+        gate = f"{prefix}.mlp.gate.{param}"
+        weights[gate] = mx.concatenate(
+            [weights[gate], weights.pop(f"{prefix}.mlp.shared_expert_gate.{param}")]
+        )
     return weights
 
 
@@ -664,6 +776,17 @@ class Model(nn.Module):
                 )
 
             # MoE
+            elif isinstance(layer.mlp, SparseMoeBlock):
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_up_proj,
+                    "all-to-sharded",
+                    segments=2,
+                    group=group,
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
             else:
                 layer.mlp.sharding_group = group
                 shard_inplace(

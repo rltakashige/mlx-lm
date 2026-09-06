@@ -54,7 +54,7 @@ PROMPT = mx.array([3, 17, 42, 7, 99, 5, 61, 8, 23, 44])
 def _reinit(model, scale=0.3):
     # With the default init greedy decoding collapses to a single token
     weights = tree_map(
-        lambda p: mx.random.normal(p.shape) * scale if p.ndim == 2 else p,
+        lambda p: mx.random.normal(p.shape) * scale if p.ndim >= 2 else p,
         model.parameters(),
     )
     model.update(weights)
@@ -304,7 +304,7 @@ class TestQwen3_5MTP(unittest.TestCase):
                 mx.array_equal(q_norm, head.layers[0].self_attn.q_norm.weight)
             )
             if moe:
-                for name in ("gate_proj", "up_proj", "down_proj"):
+                for name in ("gate_up_proj", "down_proj"):
                     got = getattr(model.layers[0].mlp.switch_mlp, name)
                     self.assertIsInstance(got, QuantizedSwitchLinear)
                     expected = getattr(head.layers[0].mlp.switch_mlp, name).weight

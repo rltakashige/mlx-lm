@@ -36,7 +36,8 @@ def _tag(dtype):
 
 
 def _mp(m):
-    return 4 if m <= 4 else 8
+    """Rows of the per-chunk sums: M rounded up to a multiple of 4."""
+    return -(-m // 4) * 4
 
 
 # x order inside each 8-value word, and the pre-scale of each stored position.
