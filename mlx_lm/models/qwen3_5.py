@@ -326,7 +326,9 @@ class DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         if self.is_linear:
-            xn = prep_rms_norm(self.input_layernorm, x, self.linear_attn.in_proj)
+            # A sharded GDN applies sum_gradients to its input, which needs an array.
+            proj = None if self.linear_attn.sharding_group else self.linear_attn.in_proj
+            xn = prep_rms_norm(self.input_layernorm, x, proj)
             r = self.linear_attn(xn, mask, cache)
         else:
             xn = prep_rms_norm(self.input_layernorm, x, self.self_attn.qkv_proj)

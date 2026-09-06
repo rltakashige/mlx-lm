@@ -252,3 +252,9 @@ scan cost, still ~1 ms behind the fixed scale at S=4. chain_bench4: swiglu prep 
 (exp-heavy scan). Next: scans without transcendentals, using bounds: swiglu max|g|*max|u|,
 gate max|x|, gated_norm sqrt(D)*max|w|*max|z|; rms_norm keeps the exact max|x*w| (its loop
 already exists for the RMS).
+
+## final_sweep5 (integrated, 2aaee95 wide-scan prep), sums (ms)
+
+mlx M=1 26.2 M=2 26.5 M=3 28.2 M=4 32.5 M=6 63.2 M=8 86.9; integrated M=3 27.6 M=4 27.9 M=6 31.3 M=8 36.8.
+Commit 2c8b5a2 (bound scans): accuracy unchanged (rms_norm 0.0207 vs mlx 0.0248, tiny rows
+0.000197 vs 0.000172, huge 54.6 vs 48.5, all finite). Queued S-curve after7, final_sweep6.
