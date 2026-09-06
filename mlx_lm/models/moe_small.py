@@ -31,6 +31,8 @@ from .switch_layers import QuantizedSwitchLinear
 
 _MAX_M = 8
 _KSTEP = 32 * _VPL
+_routes = {}
+_calls = {}
 
 
 def _config(K):
@@ -41,6 +43,14 @@ def _config(K):
 def routes(block, x):
     """True when ``experts`` runs this step: M5, 4-bit g64 affine experts, 1 <= M <= 8."""
     projs = (block.switch_mlp.gate_up_proj, block.switch_mlp.down_proj)
+    key = (id(block), type(projs[0]), x.shape, x.dtype)
+    use = _routes.get(key)
+    if use is None:
+        use = _routes[key] = _supported(block, projs, x)
+    return use
+
+
+def _supported(block, projs, x):
     *batch, k = x.shape
     m = math.prod(batch)
     if not (
@@ -118,24 +128,29 @@ def _prep(x, kind, inds=None, m=0, top_k=0, eshared=0):
         src = _prep_source(K, M, kind)
         return src + _plan_source(m, S, top_k, eshared) if plan else src
 
-    kern = _kernel(
-        "moe_small_prep_" + kind + ("_plan" if plan else ""),
-        (K, M, _tag(x.dtype), m, top_k, eshared),
-        source,
-        ["x"] + (["inds"] if plan else []),
-        ["x16", "xsum", "rscale"] + (["plan"] if plan else []),
-        _HEADER,
-    )
-    return kern(
-        inputs=[x] + ([inds] if plan else []),
-        template=[("T", x.dtype)],
-        grid=(_scan_threads(K) * _prep_segments(K) * M, 1, 1),
-        threadgroup=(_scan_threads(K), 1, 1),
-        output_shapes=[(M, K), (K // 16, Mp), (Mp,)]
-        + ([(m * S, m + 2)] if plan else []),
-        output_dtypes=[mx.float16, mx.float32, mx.float32]
-        + ([mx.int32] if plan else []),
-    )
+    key = ("prep", kind, plan, K, M, _tag(x.dtype), m, top_k, eshared)
+    call = _calls.get(key)
+    if call is None:
+        kern = _kernel(
+            "moe_small_prep_" + kind + ("_plan" if plan else ""),
+            key[3:],
+            source,
+            ["x"] + (["inds"] if plan else []),
+            ["x16", "xsum", "rscale"] + (["plan"] if plan else []),
+            _HEADER,
+        )
+        kwargs = dict(
+            template=[("T", x.dtype)],
+            grid=(_scan_threads(K) * _prep_segments(K) * M, 1, 1),
+            threadgroup=(_scan_threads(K), 1, 1),
+            output_shapes=[(M, K), (K // 16, Mp), (Mp,)]
+            + ([(m * S, m + 2)] if plan else []),
+            output_dtypes=[mx.float16, mx.float32, mx.float32]
+            + ([mx.int32] if plan else []),
+        )
+        call = _calls[key] = (kern, kwargs)
+    kern, kwargs = call
+    return kern(inputs=[x] + ([inds] if plan else []), **kwargs)
 
 
 def _body(c, R, MC):
@@ -292,22 +307,39 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     Mp = xsum.shape[1]
     RDIV = S if tokens else 1
     LW = logits.shape[-1] if logits is not None else 0
-    kern = _kernel(
-        "moe_small_gather",
-        (m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype)),
-        lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW),
-        ["x16", "xsum", "rscale", "plan", "w", "scales", "biases", "inds", "logits"],
-        ["y"],
-    )
+    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype))
+    call = _calls.get(key)
+    if call is None:
+        kern = _kernel(
+            "moe_small_gather",
+            key[1:],
+            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW),
+            [
+                "x16",
+                "xsum",
+                "rscale",
+                "plan",
+                "w",
+                "scales",
+                "biases",
+                "inds",
+                "logits",
+            ],
+            ["y"],
+        )
+        kwargs = dict(
+            template=[("T", scales.dtype)],
+            grid=(32 * NSG * m * S * (N // (R * NSG)), 1, 1),
+            threadgroup=(32 * NSG, 1, 1),
+            output_shapes=[(m * S, N)],
+            output_dtypes=[scales.dtype],
+        )
+        call = _calls[key] = (kern, kwargs)
+    kern, kwargs = call
     # An unused input (scores of 1) reuses an existing array so no op is added
     logits = scales if logits is None else logits
     (y,) = kern(
-        inputs=[x16, xsum, rscale, plan, w, scales, biases, inds, logits],
-        template=[("T", scales.dtype)],
-        grid=(32 * NSG * m * S * (N // (R * NSG)), 1, 1),
-        threadgroup=(32 * NSG, 1, 1),
-        output_shapes=[(m * S, N)],
-        output_dtypes=[scales.dtype],
+        inputs=[x16, xsum, rscale, plan, w, scales, biases, inds, logits], **kwargs
     )
     return y
 

@@ -26,6 +26,8 @@ _GROUP = 64
 _VPL = 16  # K values per lane per step
 # At M = 2 mx.quantized_matmul is already weight-bound and the prep launch costs more than it saves.
 _MIN_M, _MAX_M = 3, 8
+# Below 8 MB of weights the prep launch and the low threadgroup count cost more than the kernel saves.
+_MIN_BYTES = 8 << 20
 _KSTEP = 32 * _VPL  # K values per main-kernel step
 _UNROLL = "#pragma clang loop unroll(full)"
 _kernels = {}
@@ -444,7 +446,11 @@ def supported(x, w, scales, biases, group_size, bits):
     m, k = x.shape
     n = w.shape[0]
     return (
-        _MIN_M <= m <= _MAX_M and k % _KSTEP == 0 and n % 8 == 0 and w.shape[1] * 8 == k
+        _MIN_M <= m <= _MAX_M
+        and k % _KSTEP == 0
+        and n % 8 == 0
+        and w.shape[1] * 8 == k
+        and w.nbytes >= _MIN_BYTES
     )
 
 
@@ -501,6 +507,7 @@ def routes(module, shape, dtype):
         and k % _KSTEP == 0
         and module.weight.shape[0] % 8 == 0
         and module.weight.shape[1] * 8 == k
+        and module.weight.nbytes >= _MIN_BYTES
     )
 
 
