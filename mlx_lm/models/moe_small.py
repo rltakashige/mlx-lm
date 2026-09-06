@@ -66,29 +66,33 @@ def routes(block, x):
 
 
 def _plan_source(M, S, TOPK, ESHARED):
-    """Thread t of threadgroup 0 fills plan slot t: [expert, count, pair_0 .. pair_{M-1}]."""
+    """Appended to the prep kernel: threadgroup 0 builds the plan.
+
+    Pair t is a "first" when no earlier pair has its expert. Slot d of the plan holds
+    [expert, count, pair_0 .. pair_{M-1}] for the d-th first pair; later slots count 0.
+    """
     return f"""
     {{
       constexpr int PT = {M} * {S}, PW = {M} + 2;
       threadgroup uint ex[PT];
+      threadgroup int first[PT];
       if (threadgroup_position_in_grid.x == 0) {{
         if (t < PT) ex[t] = (t % {S} < {TOPK}) ? uint(inds[(t / {S}) * {TOPK} + t % {S}]) : uint({ESHARED});
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (t < PT) {{
-          const uint e = ex[t];
-          // Slot index of this pair's expert and whether this pair is its first
+          int f = 1;
+          for (int q = 0; q < t; q++) f &= (ex[q] != ex[t]);
+          first[t] = f;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t < PT) {{
           int d = 0, D = 0;
-          bool first = true;
           for (int q = 0; q < PT; q++) {{
-            bool seen = false;
-            for (int r = 0; r < q; r++) seen |= (ex[r] == ex[q]);
-            D += !seen;
-            if (q < t) {{
-              d += !seen;
-              first &= (ex[q] != e);
-            }}
+            D += first[q];
+            d += (q < t) ? first[q] : 0;
           }}
-          if (first) {{
+          if (first[t]) {{
+            const uint e = ex[t];
             int c = 0;
             for (int q = t; q < PT; q++) if (ex[q] == e) {{ if (c < {M}) plan[d * PW + 2 + c] = q; c++; }}
             plan[d * PW] = int(e);

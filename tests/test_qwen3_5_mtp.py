@@ -1,8 +1,12 @@
 # Copyright © 2026 Apple Inc.
 
 import json
+import os
 import tempfile
 import unittest
+
+# The tiny fp32 models need exact GEMMs: M5 uses tf32 for float32 matmuls by default
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
 from pathlib import Path
 
 import mlx.core as mx
