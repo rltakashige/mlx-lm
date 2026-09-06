@@ -24,7 +24,7 @@ import mlx.nn as nn
 _BITS = 4
 _GROUP = 64
 _VPL = 16  # K values per lane per step
-# mx.quantized_matmul is already weight-bandwidth bound at M = 2.
+# At M = 2 mx.quantized_matmul is already weight-bound and the prep launch costs more than it saves.
 _MIN_M, _MAX_M = 3, 8
 _KSTEP = 32 * _VPL  # K values per main-kernel step
 _UNROLL = "#pragma clang loop unroll(full)"
@@ -36,7 +36,7 @@ def _tag(dtype):
 
 
 def _mp(m):
-    return 2 if m <= 2 else 4 if m <= 4 else 8
+    return 4 if m <= 4 else 8
 
 
 # x order inside each 8-value word, and the pre-scale of each stored position.
@@ -417,8 +417,22 @@ def _config(m):
     return (2, 2, m) if m <= 4 else (4, 2, 4)
 
 
+def _m5():
+    """The kernel was tuned and measured on M5-class GPUs only (fp16 FMA rate, occupancy manager)."""
+    if "m5" not in _kernels:
+        info = mx.device_info() if mx.metal.is_available() else {}
+        _kernels["m5"] = str(info.get("architecture", "")).startswith("applegpu_g17")
+    return _kernels["m5"]
+
+
 def supported(x, w, scales, biases, group_size, bits):
-    if x.ndim != 2 or bits != _BITS or group_size != _GROUP or biases is None:
+    if (
+        not _m5()
+        or x.ndim != 2
+        or bits != _BITS
+        or group_size != _GROUP
+        or biases is None
+    ):
         return False
     if (
         x.dtype not in (mx.bfloat16, mx.float16)
@@ -473,7 +487,8 @@ def routes(module, shape, dtype):
     for d in batch:
         m *= d
     return (
-        isinstance(module, nn.QuantizedLinear)
+        _m5()
+        and isinstance(module, nn.QuantizedLinear)
         and module.bits == _BITS
         and module.group_size == _GROUP
         and getattr(module, "mode", "affine") == "affine"
@@ -488,7 +503,7 @@ def routes(module, shape, dtype):
     )
 
 
-def prep_rms_norm(norm, x, module):
+def prep_rms_norm(norm, x, module) -> "Prepped | mx.array":
     """``norm(x)`` fused with the prep when the projection ``module`` routes; else ``norm(x)``."""
     if not routes(module, x.shape, x.dtype):
         return norm(x)
@@ -498,7 +513,7 @@ def prep_rms_norm(norm, x, module):
     )
 
 
-def prep_swiglu(gate_up, module):
+def prep_swiglu(gate_up, module) -> "Prepped | None":
     """``swiglu(gate, up)`` of the fused (.., 2K) projection output, prepped for ``module``."""
     *batch, k2 = gate_up.shape
     shape = (*batch, k2 // 2)
@@ -507,7 +522,7 @@ def prep_swiglu(gate_up, module):
     return prep(gate_up.reshape(-1, k2), "swiglu", shape=shape)
 
 
-def prep_gate(x, gate, module):
+def prep_gate(x, gate, module) -> "Prepped | None":
     """``x * sigmoid(gate)`` prepped for ``module``, or None when it does not route."""
     if not routes(module, x.shape, x.dtype):
         return None
@@ -515,7 +530,7 @@ def prep_gate(x, gate, module):
     return prep(x.reshape(-1, k), "gate", gate.reshape(-1, k), shape=tuple(x.shape))
 
 
-def prep_gated_norm(norm, x, gate, module):
+def prep_gated_norm(norm, x, gate, module) -> "Prepped | None":
     """``norm(x, gate)`` (per-head RMSNorm times silu(gate)) prepped for ``module``, or None."""
     *batch, heads, d = x.shape
     shape = (*batch, heads * d)
