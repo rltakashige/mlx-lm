@@ -265,3 +265,26 @@ S=1 31.70, S=2 32.02, S=3 33.59, S=4 34.26, S=6 40.66, S=8 45.21. chain_bench5: 
 M=8 still 20 us (17 segments x full-row scan = 17x redundant L2 reads of 70 KB per row).
 final_sweep6 (integrated 2c8b5a2): M=3 27.6, M=4 27.8, M=6 31.2, M=8 36.6 ms.
 Next: segments of NT chunks (256/512 threads each convert one chunk) -> 2-3 segments per row.
+
+## S-curve after8 (90d8cab: 2-3 prep segments per row), median ms
+
+S=1 31.88 (min 31.00), S=2 32.60 (31.89), S=3 33.53, S=4 34.30, S=6 40.64, S=8 45.03.
+Same as after7 within noise. chain_bench6: prep in-stream 4-7 us (down M=8 17 us). The robust
+per-row scale costs ~0.6-1 ms at S=4 versus the fixed 1/256 scale (33.3-33.7); kept for range
+safety.
+
+## Final state (90d8cab)
+
+final_sweep7 (integrated module incl. standalone prep launch vs mlx, GB/s):
+in_proj  M=1 533 | M=3 529/508 | M=4 492/509 | M=6 260/466 | M=8 181/407   (mlx/ours)
+out_proj M=1 485 | M=3 462/414 | M=4 412/415 | M=6 224/365 | M=8 200/334
+qkv_proj M=1 542 | M=3 531/500 | M=4 484/497 | M=6 261/457 | M=8 189/401
+o_proj   M=1 486 | M=3 464/415 | M=4 416/416 | M=6 226/368 | M=8 199/335
+gate_up  M=1 570 | M=3 556/553 | M=4 491/552 | M=6 224/531 | M=8 145/426
+down     M=1 540 | M=3 465/513 | M=4 395/502 | M=6 246/393 | M=8 207/351
+lm_head  M=1 582 | M=3 433/575 | M=4 258/567 | M=6 145/555 | M=8 104/432
+Sum over model (ms): mlx M=1 26.2 M=2 28.0 M=3 28.1 M=4 32.7 M=6 63.0 M=8 88.3;
+ours M=2 26.7 (mlx path) M=3 27.6 M=4 27.8 M=6 31.0 M=8 36.5.
+
+Verify forward S-curve (median ms): before 31.0/31.6/34.0/36.5/53.1/62.7 (S=1/2/3/4/6/8),
+final 31.9/32.6/33.5/34.3/40.6/45.0 (S=1, S=2 unchanged paths; noise +/-0.5).
