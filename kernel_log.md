@@ -244,3 +244,11 @@ after5c (row scan again): 31.30 / 34.52 / 35.20 / 45.94
 => the redundant row scan costs ~1.4 ms at S=3/4 in the model (dependent chain: the scan loop's
 serialized load latency, 5-17 iterations per thread). Fix: scan with 256/512 threads per
 threadgroup and an unrolled compile-time loop; only the first 64 threads convert.
+
+## S-curve after6 (2aaee95: 256/512-thread row scan), median ms
+
+S=1 31.32, S=2 32.08, S=3 33.59, S=4 34.85, S=6 41.16, S=8 45.57 -> recovers 0.3-0.5 ms of the
+scan cost, still ~1 ms behind the fixed scale at S=4. chain_bench4: swiglu prep at M=8 25 us
+(exp-heavy scan). Next: scans without transcendentals, using bounds: swiglu max|g|*max|u|,
+gate max|x|, gated_norm sqrt(D)*max|w|*max|z|; rms_norm keeps the exact max|x*w| (its loop
+already exists for the RMS).

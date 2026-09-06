@@ -124,19 +124,64 @@ def _values(kind, dst, cidx, rs):
       load16(x + (size_t)m * K + ({cidx}) * 16, {dst});"""
 
 
+def _scan(kind):
+    """Scan-loop body over chunk ``c2``: a cheap upper bound of the row's max in ``amax``.
+
+    rms_norm scans the exact max of |x * weight| (and the sum of squares); swiglu bounds
+    |silu(g) * u| by max|g| * max|u| (into amax and amax2); gate bounds |x * sigmoid(g)|
+    by max|x|; gated_norm bounds |x * rs * w * silu(z)| by sqrt(D) * max|w| * max|z|.
+    """
+    if kind == "rms_norm":
+        return """
+        float xx[16], ww[16];
+        load16(x + (size_t)m * K + c2 * 16, xx);
+        load16(weight + c2 * 16, ww);
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) {
+          ss += xx[i] * xx[i];
+          amax = max(amax, fabs(xx[i] * ww[i]));
+        }"""
+    if kind == "swiglu":
+        return """
+        float gg[16], uu[16];
+        load16(x + (size_t)m * 2 * K + c2 * 16, gg);
+        load16(x + (size_t)m * 2 * K + K + c2 * 16, uu);
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) {
+          amax = max(amax, fabs(gg[i]));
+          amax2 = max(amax2, fabs(uu[i]));
+        }"""
+    if kind == "gated_norm":
+        return """
+        float gg[16], ww[16];
+        load16(gate + (size_t)m * K + c2 * 16, gg);
+        load16(weight + (c2 * 16) % D, ww);
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) {
+          amax = max(amax, fabs(gg[i]));
+          amax2 = max(amax2, fabs(ww[i]));
+        }"""
+    # copy and gate: max|x|
+    return """
+        float xx[16];
+        load16(x + (size_t)m * K + c2 * 16, xx);
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) amax = max(amax, fabs(xx[i]));"""
+
+
 def _scan_threads(K):
     """Threads per prep threadgroup: all scan the row, the first 64 convert their segment."""
     return 256 if K <= 8192 else 512
 
 
 def _prep_source(K, M, kind, eps=0.0, D=0):
-    """One threadgroup per 1024 values of one row: producer op in fp32, row max, fp16 store.
+    """One threadgroup per 1024 values of one row: producer op in fp32, row scale, fp16 store.
 
-    Every threadgroup of a row first scans the whole row for the max (and the RMS) with all
-    its threads, so the fp16 scale is per row without a separate pass. kind: "copy" (x),
-    "rms_norm" (x * rsqrt(mean(x^2) + eps) * weight), "swiglu" (silu(gate) * up with
-    gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(gate)), "gated_norm" (per-head
-    RMSNorm over D values times silu(gate)).
+    Every threadgroup of a row first scans the whole row with all its threads for a bound
+    of the row's max (and the RMS), so the fp16 scale is per row without a separate pass.
+    kind: "copy" (x), "rms_norm" (x * rsqrt(mean(x^2) + eps) * weight), "swiglu"
+    (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(gate)),
+    "gated_norm" (per-head RMSNorm over D values times silu(gate)).
     """
     Mp = _mp(M)
     NT = _scan_threads(K)
@@ -146,8 +191,15 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
         for c in range(2)
         for j in range(8)
     )
+    reduce2 = """
+    amax2 = simd_max(amax2);
+    threadgroup float red3[NT / 32];
+    if (thread_index_in_simdgroup == 0) red3[simdgroup_index_in_threadgroup] = amax2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax2 = red3[0];
+    for (int i = 1; i < NT / 32; i++) amax2 = max(amax2, red3[i]);"""
     if kind == "rms_norm":
-        norm = f"""
+        post = """
     ss = simd_sum(ss);
     threadgroup float red[NT / 32];
     if (thread_index_in_simdgroup == 0) red[simdgroup_index_in_threadgroup] = ss;
@@ -156,8 +208,16 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
     for (int i = 0; i < NT / 32; i++) ss += red[i];
     const float rs = rsqrt(ss / K + EPS);
     amax *= rs;"""
+    elif kind == "swiglu":
+        post = reduce2 + "\n    amax *= amax2;\n    const float rs = 1.0f;"
+    elif kind == "gated_norm":
+        post = (
+            reduce2
+            + "\n    amax *= amax2 * metal::sqrt(float(D));\n    const float rs = 1.0f;"
+        )
     else:
-        norm = "\n    const float rs = 1.0f;\n    (void)rs;"
+        post = "\n    const float rs = 1.0f;"
+    scan = _scan(kind).replace("{_UNROLL}", _UNROLL)
     return f"""
     constexpr int K = {K}, Mp = {Mp}, NT = {NT}, NIT = {NIT}, NSEG = K / {_SEG}, D = {D}, TPH = D / 16;
     constexpr float EPS = {float(eps)!r}f;
@@ -165,24 +225,23 @@ def _prep_source(K, M, kind, eps=0.0, D=0):
     const int seg = threadgroup_position_in_grid.x % NSEG;
     const int t = thread_position_in_threadgroup.x;
     float ss = 0.0f;
-    float amax = 0.0f;
+    float amax = 0.0f, amax2 = 0.0f;
     {_UNROLL}
     for (int j = 0; j < NIT; j++) {{
       const int c2 = t + j * NT;
-      if (c2 < K / 16) {{
-        float u[16];{_values(kind, "u", "c2", "1.0f")}
-        {_UNROLL}
-        for (int i = 0; i < 16; i++) amax = max(amax, fabs(u[i]));
+      if (c2 < K / 16) {{{scan}
       }}
     }}
-    (void)ss;{norm}
+    (void)ss;
+    (void)amax2;
     amax = simd_max(amax);
     threadgroup float red2[NT / 32];
     if (thread_index_in_simdgroup == 0) red2[simdgroup_index_in_threadgroup] = amax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     amax = red2[0];
-    for (int i = 1; i < NT / 32; i++) amax = max(amax, red2[i]);
-    // Scale the row so max |x| is in [4, 8): fp16 partials stay far from overflow.
+    for (int i = 1; i < NT / 32; i++) amax = max(amax, red2[i]);{post}
+    (void)rs;
+    // Scale the row so the bound of max |x| is in [4, 8): fp16 partials stay in range.
     int e = 0;
     float sc = 1.0f;
     if (amax > 0.0f) {{
