@@ -630,10 +630,6 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
-    def _rewind_cache(num_draft, num_accept):
-        trim_prompt_cache(model_cache, num_draft - num_accept)
-        trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
-
     def _draft_generate(y, num_draft):
         nonlocal prev_tokens
         ys, h, ps, q = [], hidden, [], 1.0
@@ -668,8 +664,8 @@ def speculative_generate_step(
 
         ntoks = 0
         # Set these so the finally block doesn't raise
-        num_draft = 0
-        n = 0
+        num_draft = n = drafted = draft_trim = 0
+        draft_tokens = None
         try:
             gdn_caches = [c for c in model_cache if isinstance(c, ArraysCache)]
             for c in gdn_caches:
@@ -681,11 +677,13 @@ def speculative_generate_step(
                     f"(got {types})."
                 )
             while True:
-                num_draft = min(max_tokens - ntoks, num_draft_tokens)
-                if mtp and hidden is None:
-                    num_draft = 0
-                draft_tokens = _draft_generate(draft_y, num_draft)
+                if draft_tokens is None:
+                    num_draft = min(max_tokens - ntoks, num_draft_tokens)
+                    if mtp and hidden is None:
+                        num_draft = 0
+                    draft_tokens = _draft_generate(draft_y, num_draft)
                 num_draft = draft_tokens.size
+                n = drafted = draft_trim = 0
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[
                         : prev_tokens.size - y.size - num_draft + 1
@@ -695,12 +693,14 @@ def speculative_generate_step(
                     model, model_cache, y, num_draft + 1
                 )
                 mx.async_eval(tokens, draft_tokens)
-                # Build the state rollback for the accepted count while the verify runs
+                # Build and run the state rollback for the accepted count while the
+                # verify runs, so the GPU has work queued during the readback
                 accepted = mx.sum(
                     mx.cumprod((tokens[:-1] == draft_tokens).astype(mx.int32))
                 )
                 for c in gdn_caches:
                     c.stage(accepted + 1)
+                mx.async_eval([c.staged for c in gdn_caches if c.staged is not None])
                 mx.eval(tokens, draft_tokens)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
@@ -709,12 +709,33 @@ def speculative_generate_step(
                     n_accept < num_draft and tokens[n_accept] == draft_tokens[n_accept]
                 ):
                     n_accept += 1
-                if n_accept < num_draft:
-                    # Run the rollback while the tokens are consumed
-                    mx.async_eval(
-                        [c.staged for c in gdn_caches if c.staged is not None]
+
+                # Draft the next cycle before the tokens are consumed: the GPU
+                # runs the drafts while the caller handles the tokens
+                y = mx.array([tokens[n_accept]], mx.uint32)
+                draft_y = y
+                # If we accepted all the draft tokens, include the last
+                # draft token in the next draft step since it hasn't been
+                # processed yet by the draft model
+                if n_accept == num_draft:
+                    draft_y = mx.concatenate(
+                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
                     )
-                n = 0
+                if mtp:
+                    hidden = hidden_out[:, n_accept + 1 - draft_y.size : n_accept + 1]
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[: -max(num_draft - n_accept, 1)]
+                draft_trim = trim_prompt_cache(
+                    draft_cache, max(num_draft - n_accept - 1, 0)
+                )
+                next_draft = None
+                remaining = max_tokens - ntoks - n_accept - 1
+                if remaining > 0:
+                    next_draft = _draft_generate(
+                        draft_y, min(remaining, num_draft_tokens)
+                    )
+                    drafted = draft_y.size + next_draft.size - 1
+
                 while n < n_accept:
                     n += 1
                     ntoks += 1
@@ -727,28 +748,17 @@ def speculative_generate_step(
 
                 if ntoks == max_tokens:
                     break
-
-                y = mx.array([tokens[n]], mx.uint32)
-                draft_y = y
-
-                # If we accepted all the draft tokens, include the last
-                # draft token in the next draft step since it hasn't been
-                # processed yet by the draft model
-                if n == num_draft:
-                    draft_y = mx.concatenate(
-                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                    )
-                if mtp:
-                    hidden = hidden_out[:, n + 1 - draft_y.size : n + 1]
-
-                if prev_tokens is not None:
-                    prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-                _rewind_cache(num_draft, n)
+                trim_prompt_cache(model_cache, num_draft - n)
+                draft_tokens = next_draft
         finally:
             # Fewer tokens than accepted may have been yielded: do not use the staged state
             for c in gdn_caches:
                 c.staged = None
-            _rewind_cache(num_draft, n)
+            trim_prompt_cache(model_cache, num_draft - n)
+            # Drop the drafts of the next cycle and the rest of this one
+            trim_prompt_cache(
+                draft_cache, drafted + max(num_draft - n - 1, 0) - draft_trim
+            )
             for c in gdn_caches:
                 c.keep_states = False
 
