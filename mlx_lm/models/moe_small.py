@@ -58,6 +58,7 @@ def _supported(block, projs, x):
         and block.norm_topk_prob
         and 1 <= m <= _MAX_M
         and x.dtype in (mx.bfloat16, mx.float16)
+        and block.num_experts <= _scan_threads(k)
     ):
         return False
     for p in projs:
@@ -75,19 +76,34 @@ def _supported(block, projs, x):
     return projs[0].input_dims == k
 
 
-def _plan_source(M, S, TOPK, ESHARED):
-    """Appended to the prep kernel: threadgroup 0 builds the plan.
+def _plan_source(M, S, TOPK, ESHARED, LW):
+    """Appended to the prep kernel: threadgroup 0 picks the experts and builds the plan.
 
-    Pair t is a "first" when no earlier pair has its expert. Slot d of the plan holds
-    [expert, count, pair_0 .. pair_{M-1}] for the d-th first pair; later slots count 0.
+    The top-k of a token's logits is mx.argpartition's: the k largest in ascending order,
+    ties in index order. Pair t is a "first" when no earlier pair has its expert. Slot d of
+    the plan holds [expert, count, pair_0 .. pair_{M-1}] for the d-th first pair; later
+    slots count 0.
     """
     return f"""
     {{
-      constexpr int PT = {M} * {S}, PW = {M} + 2;
+      constexpr int PT = {M} * {S}, PW = {M} + 2, E = {ESHARED}, LW = {LW}, TK = {TOPK};
       threadgroup uint ex[PT];
       threadgroup int first[PT];
+      threadgroup float lg[E];
+      threadgroup int tk[{M} * TK];
       if (threadgroup_position_in_grid.x == 0) {{
-        if (t < PT) ex[t] = (t % {S} < {TOPK}) ? uint(inds[(t / {S}) * {TOPK} + t % {S}]) : uint({ESHARED});
+        for (int mm = 0; mm < {M}; mm++) {{
+          for (int j = t; j < E; j += NT) lg[j] = float(logits[mm * LW + j]);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int j = t; j < E; j += NT) {{
+            const float v = lg[j];
+            int pos = 0;
+            for (int i = 0; i < E; i++) pos += (lg[i] < v) || (lg[i] == v && i < j);
+            if (pos >= E - TK) {{ tk[mm * TK + pos - (E - TK)] = j; inds[mm * TK + pos - (E - TK)] = j; }}
+          }}
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        if (t < PT) ex[t] = (t % {S} < TK) ? uint(tk[(t / {S}) * TK + t % {S}]) : uint(E);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (t < PT) {{
           int f = 1;
@@ -115,28 +131,30 @@ def _plan_source(M, S, TOPK, ESHARED):
 """
 
 
-def _prep(x, kind, inds=None, m=0, top_k=0, eshared=0):
-    """``qmv_small``'s prep of (rows, K) x; with ``inds`` also the plan of the m tokens' pairs."""
+def _prep(x, kind, logits=None, m=0, top_k=0, eshared=0):
+    """``qmv_small``'s prep of (rows, K) x; with ``logits`` (m, E + 1) also the top-k expert
+    indices (m * top_k,) and the plan of the m tokens' pairs."""
     M, K = x.shape
     if kind == "swiglu":
         K //= 2
     Mp = _mp(M)
     S = top_k + 1
-    plan = inds is not None
+    plan = logits is not None
+    LW = logits.shape[-1] if plan else 0
 
     def source():
         src = _prep_source(K, M, kind)
-        return src + _plan_source(m, S, top_k, eshared) if plan else src
+        return src + _plan_source(m, S, top_k, eshared, LW) if plan else src
 
-    key = ("prep", kind, plan, K, M, _tag(x.dtype), m, top_k, eshared)
+    key = ("prep", kind, plan, K, M, _tag(x.dtype), m, top_k, eshared, LW)
     call = _calls.get(key)
     if call is None:
         kern = _kernel(
             "moe_small_prep_" + kind + ("_plan" if plan else ""),
             key[3:],
             source,
-            ["x"] + (["inds"] if plan else []),
-            ["x16", "xsum", "rscale"] + (["plan"] if plan else []),
+            ["x"] + (["logits"] if plan else []),
+            ["x16", "xsum", "rscale"] + (["inds", "plan"] if plan else []),
             _HEADER,
         )
         kwargs = dict(
@@ -144,13 +162,13 @@ def _prep(x, kind, inds=None, m=0, top_k=0, eshared=0):
             grid=(_scan_threads(K) * _prep_segments(K) * M, 1, 1),
             threadgroup=(_scan_threads(K), 1, 1),
             output_shapes=[(M, K), (K // 16, Mp), (Mp,)]
-            + ([(m * S, m + 2)] if plan else []),
+            + ([(m * top_k,), (m * S, m + 2)] if plan else []),
             output_dtypes=[mx.float16, mx.float32, mx.float32]
-            + ([mx.int32] if plan else []),
+            + ([mx.int32, mx.int32] if plan else []),
         )
         call = _calls[key] = (kern, kwargs)
     kern, kwargs = call
-    return kern(inputs=[x] + ([inds] if plan else []), **kwargs)
+    return kern(inputs=[x] + ([logits] if plan else []), **kwargs)
 
 
 def _body(c, R, MC):
@@ -344,25 +362,20 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     return y
 
 
-def experts(block, x, logits, inds):
-    """The routed and the shared expert of x (.., K) -> (.., K); ``logits`` (.., E + 1)."""
+def experts(block, x, logits, slots=False):
+    """The routed and the shared expert of x (.., K) -> (.., K); ``logits`` (.., E + 1).
+
+    With ``slots`` the top_k + 1 expert outputs of a token are returned unsummed (.., S, K).
+    """
     *batch, K = x.shape
     m = math.prod(batch)
     E, top_k = block.num_experts, block.top_k
-    inds = inds.reshape(-1)
-    x16, xsum, rscale, plan = _prep(x.reshape(m, K), "copy", inds, m, top_k, E)
+    logits = logits.reshape(m, -1)
+    x16, xsum, rscale, inds, plan = _prep(x.reshape(m, K), "copy", logits, m, top_k, E)
     gu = _gather(
         (x16, xsum, rscale), plan, block.switch_mlp.gate_up_proj, inds, m, top_k, True
     )
     h = _prep(gu, "swiglu")
-    y = _gather(
-        h,
-        plan,
-        block.switch_mlp.down_proj,
-        inds,
-        m,
-        top_k,
-        False,
-        logits.reshape(m, -1),
-    )
-    return y.reshape(*batch, top_k + 1, K).sum(axis=-2)
+    y = _gather(h, plan, block.switch_mlp.down_proj, inds, m, top_k, False, logits)
+    y = y.reshape(*batch, top_k + 1, K)
+    return y if slots else y.sum(axis=-2)

@@ -1,0 +1,706 @@
+# Copyright © 2026 Apple Inc.
+
+"""Merged small kernels of the Qwen3.5 decode step.
+
+Each kernel replaces a chain of MLX ops by one dispatch and rounds where the ops
+round (bf16 intermediates at the same places), so its output is bitwise the
+output of the ops it replaces.
+"""
+
+import os
+
+import mlx.core as mx
+
+from .qmv_small import _HEADER as _SMALL_HEADER
+from .qmv_small import _kernel, _nax_m, _rows, prep, prep_rms_norm, routes
+
+_ENABLED = os.environ.get("MLX_QWEN_FUSED", "1") != "0"
+
+# The MLX ops as the model compiles them: Sigmoid and LogAddExp in the input type,
+# Exp in float. The eager (library) Sigmoid kernel uses the precise exp.
+_HEADER = """
+struct Sigmoid {
+  template <typename T> T operator()(T x) {
+    auto y = 1 / (1 + metal::exp(metal::abs(x)));
+    return (x < 0) ? y : 1 - y;
+  }
+};
+struct SigmoidLib {
+  template <typename T> T operator()(T x) {
+    auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    return (x < 0) ? y : 1 - y;
+  }
+};
+struct LogAddExp {
+  template <typename T> T operator()(T x, T y) {
+    if (metal::isnan(x) || metal::isnan(y)) return metal::numeric_limits<T>::quiet_NaN();
+    constexpr T inf = metal::numeric_limits<T>::infinity();
+    T maxval = metal::max(x, y);
+    T minval = metal::min(x, y);
+    return (minval == -inf || maxval == inf) ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+  }
+};
+
+// mx.fast.rms_norm's reduction: 4 values per thread, simd sums, then the simd sums summed.
+inline float rms_sum(float acc, threadgroup float* sums, uint lane, uint sg) {
+  acc = simd_sum(acc);
+  if (sg == 0) sums[lane] = 0.0f;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) sums[sg] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return simd_sum(sums[lane]);
+}
+"""
+
+
+def enabled():
+    return _ENABLED and mx.metal.is_available()
+
+
+def _rms_threads(k):
+    """Threads of mx.fast.rms_norm's threadgroup for a row of ``k`` values."""
+    if k > 4096:
+        return 1024
+    return -(-(-(-k // 4)) // 32) * 32
+
+
+def slot_sum(pending):
+    """Sum the expert slot rows (.., S, K) of a MoE output; other pendings pass through."""
+    if pending is not None and pending.ndim == 4:
+        return pending.sum(axis=-2)
+    return pending
+
+
+def prep_add_rms_norm(norm, x, residual, module, fused=True):
+    """``(x + residual, norm(x + residual))``, the add merged into the norm or its prep.
+
+    The second value is a ``Prepped`` when the projection ``module`` routes, else an array.
+    A residual of expert slot rows (.., S, K) is summed as ``mx.sum`` does before the add.
+    """
+    if residual is None:
+        return x, prep_rms_norm(norm, x, module)
+    k = x.shape[-1]
+    rows = residual.shape[-2] if residual.ndim == 4 else 1
+    if routes(module, x.shape, x.dtype):
+        p = prep(
+            x.reshape(-1, k),
+            "rms_norm",
+            norm.weight,
+            eps=norm.eps,
+            shape=tuple(x.shape),
+            natural=_nax_m(_rows(x.shape)),
+            residual=(residual.reshape(-1, k), rows),
+        )
+        return p.h.reshape(x.shape), p
+    if fused and enabled():
+        return add_rms_norm(norm, x, residual.reshape(-1, k), rows)
+    h = x + slot_sum(residual)
+    return h, norm(h)
+
+
+def _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale):
+    KD, VD = Hk * Dk, Hv * Dv
+    return f"""
+    constexpr int Hk = {Hk}, Hv = {Hv}, Dk = {Dk}, Dv = {Dv}, PW = {PW}, TG = {TG};
+    constexpr int KD = {KD}, VD = {VD}, CD = 2 * KD + VD, KW = 4;
+    constexpr float EPS = {eps!r}f;
+    const int slot = threadgroup_position_in_grid.x;
+    const int m = threadgroup_position_in_grid.y;
+    const int b = m / S, t = m % S;
+    const int lid = thread_position_in_threadgroup.x;
+    int type, h, D, base;
+    if (slot < Hk) {{ type = 0; h = slot; D = Dk; base = h * Dk; }}
+    else if (slot < 2 * Hk) {{ type = 1; h = slot - Hk; D = Dk; base = KD + h * Dk; }}
+    else {{ type = 2; h = slot - 2 * Hk; D = Dv; base = 2 * KD + h * Dv; }}
+    const int c0 = lid * 4;
+    const bool active = c0 < D;
+    // Depthwise conv over [state; qkv] then silu, rounded like conv1d and nn.silu.
+    T sv[4];
+    float acc2 = 0.0f;
+    if (active) {{
+      for (int i = 0; i < 4; i++) {{
+        const int c = base + c0 + i;
+        float acc = 0.0f;
+        for (int j = 0; j < KW; j++) {{
+          const int tt = t + j;
+          const T xv = tt < KW - 1 ? state_in[(size_t)(b * (KW - 1) + tt) * CD + c]
+                                   : proj[(size_t)(b * S + tt - (KW - 1)) * PW + c];
+          acc += static_cast<float>(xv) * w[c * KW + j];
+        }}
+        const T cb = static_cast<T>(acc);
+        sv[i] = cb * Sigmoid{{}}(cb);
+        const float f = static_cast<float>(sv[i]);
+        acc2 += f * f;
+      }}
+    }}
+    if (type < 2) {{
+      threadgroup float sums[32];
+      acc2 = rms_sum(acc2, sums, thread_index_in_simdgroup, simdgroup_index_in_threadgroup);
+      if (active) {{
+        const float inv = metal::precise::rsqrt(acc2 / D + EPS);
+        const T sc = type == 0 ? T({qscale!r}f) : T({kscale!r}f);
+        device T* o = (type == 0 ? q : k) + ((size_t)m * Hk + h) * Dk + c0;
+        for (int i = 0; i < 4; i++) o[i] = static_cast<T>(static_cast<float>(sv[i]) * inv) * sc;
+      }}
+    }} else if (active) {{
+      device T* o = v + ((size_t)m * Hv + h) * Dv + c0;
+      for (int i = 0; i < 4; i++) o[i] = sv[i];
+    }}
+    // The next conv state is the last KW - 1 rows of [state; qkv].
+    if (active && t == 0) {{
+      for (int j = 0; j < KW - 1; j++) {{
+        const int tt = S + j;
+        for (int i = 0; i < 4; i++) {{
+          const int c = base + c0 + i;
+          state_out[(size_t)(b * (KW - 1) + j) * CD + c] =
+              tt < KW - 1 ? state_in[(size_t)(b * (KW - 1) + tt) * CD + c]
+                          : proj[(size_t)(b * S + tt - (KW - 1)) * PW + c];
+        }}
+      }}
+    }}
+    if (type == 2) {{
+      // max |z| of head h, for the row scale of the gated-norm prep
+      float zm = 0.0f;
+      if (active) {{
+        const device T* zr = proj + (size_t)m * PW + CD + h * Dv + c0;
+        for (int i = 0; i < 4; i++) zm = max(zm, metal::fabs(static_cast<float>(zr[i])));
+      }}
+      zm = simd_max(zm);
+      if (TG > 32) {{
+        threadgroup float zred[32];
+        if (thread_index_in_simdgroup == 0) zred[simdgroup_index_in_threadgroup] = zm;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        zm = zred[0];
+        for (int i = 1; i < TG / 32; i++) zm = max(zm, zred[i]);
+      }}
+      if (lid == 0) zmax[(size_t)m * Hv + h] = zm;
+    }}
+    // Gate values of head h: g = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b).
+    if (type == 2 && lid == 0) {{
+      const device T* row = proj + (size_t)m * PW + CD + VD;
+      const T sp = LogAddExp{{}}(row[Hv + h] + dt_bias[h], T(0.0f));
+      const float e = metal::precise::exp(static_cast<float>(A_log[h]));
+      g[(size_t)m * Hv + h] = metal::precise::exp((-e) * static_cast<float>(sp));
+      beta[(size_t)m * Hv + h] = SigmoidLib{{}}(row[h]);
+    }}
+"""
+
+
+def gdn_in_ok(net, proj, mask, cache):
+    """True when ``gdn_in`` handles this call (a cache without padding, no mask)."""
+    return (
+        enabled()
+        and cache is not None
+        and mask is None
+        and cache.lengths is None
+        and proj.dtype in (mx.bfloat16, mx.float16)
+        and net.dt_bias.dtype == proj.dtype
+        and net.A_log.dtype in (mx.float32, proj.dtype)
+        and net.conv1d.weight.dtype == proj.dtype
+        and net.conv_kernel_size == 4
+        and net.head_k_dim % 4 == 0
+        and net.head_v_dim % 4 == 0
+    )
+
+
+def gdn_in(net, proj, conv_state):
+    """The GDN mixer inputs from the fused in_proj output ``proj`` (B, S, PW).
+
+    Returns q, k (B, S, Hk, Dk) normalized and scaled, v (B, S, Hv, Dv), g (B, S, Hv)
+    float32, beta (B, S, Hv), the next conv state (B, KW - 1, conv_dim) and the per-head
+    max |z| (B * S, Hv).
+    """
+    B, S, PW = proj.shape
+    Hk, Hv, Dk, Dv = net.num_k_heads, net.num_v_heads, net.head_k_dim, net.head_v_dim
+    TG = -(-max(Dk, Dv) // 128) * 32
+    eps = 1e-6 / Dk
+    inv_scale = Dk**-0.5
+    # The ops multiply by the scale rounded to the activation type.
+    qscale = mx.array(inv_scale**2, proj.dtype).item()
+    kscale = mx.array(inv_scale, proj.dtype).item()
+    kern = _kernel(
+        "gdn_in",
+        (Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale, str(proj.dtype), str(net.A_log.dtype)),
+        lambda: _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale),
+        ["proj", "state_in", "w", "A_log", "dt_bias", "S"],
+        ["q", "k", "v", "g", "beta", "state_out", "zmax"],
+        _HEADER,
+    )
+    return kern(
+        inputs=[proj, conv_state, net.conv1d.weight, net.A_log, net.dt_bias, S],
+        template=[("T", proj.dtype)],
+        grid=(TG * (2 * Hk + Hv), B * S, 1),
+        threadgroup=(TG, 1, 1),
+        output_shapes=[
+            (B, S, Hk, Dk),
+            (B, S, Hk, Dk),
+            (B, S, Hv, Dv),
+            (B, S, Hv),
+            (B, S, Hv),
+            conv_state.shape,
+            (B * S, Hv),
+        ],
+        output_dtypes=[proj.dtype] * 3 + [mx.float32, proj.dtype, proj.dtype, mx.float32],
+    )
+
+
+def _gated_norm_source(D, GS, GO, eps):
+    return f"""
+    constexpr int D = {D}, GS = {GS}, GO = {GO};
+    constexpr float EPS = {eps!r}f;
+    const int row = threadgroup_position_in_grid.x;
+    const int lid = thread_position_in_threadgroup.x;
+    const int c0 = lid * 4;
+    const bool active = c0 < D;
+    float xv[4];
+    float acc = 0.0f;
+    if (active) {{
+      const device T* xr = x + (size_t)row * D + c0;
+      for (int i = 0; i < 4; i++) {{ xv[i] = static_cast<float>(xr[i]); acc += xv[i] * xv[i]; }}
+    }}
+    threadgroup float sums[32];
+    acc = rms_sum(acc, sums, thread_index_in_simdgroup, simdgroup_index_in_threadgroup);
+    if (!active) return;
+    const float inv = metal::precise::rsqrt(acc / D + EPS);
+    const device T* zr = gate + (size_t)(row / HEADS) * GS + GO + (size_t)(row % HEADS) * D + c0;
+    device T* o = out + (size_t)row * D + c0;
+    for (int i = 0; i < 4; i++) {{
+      // mx.fast.rms_norm with weight, then silu(gate) * x in float (_precise_swiglu)
+      const T n = weight[c0 + i] * static_cast<T>(xv[i] * inv);
+      const float gf = static_cast<float>(zr[i]);
+      const float s = gf * Sigmoid{{}}(gf);
+      o[i] = static_cast<T>(s * static_cast<float>(n));
+    }}
+"""
+
+
+def gated_norm(norm, x, gate, gate_offset=0):
+    """``norm(x, z)`` (per-head RMSNorm times silu(z)) as one kernel; z is read in place.
+
+    ``x`` is (.., heads, D); ``gate`` (rows, GS) holds z of row r at column ``gate_offset``.
+    """
+    *batch, heads, D = x.shape
+    rows = x.size // D
+    TG = -(-D // 128) * 32
+    GS = gate.shape[-1]
+    kern = _kernel(
+        "gated_norm",
+        (D, GS, gate_offset, norm.eps, heads, str(x.dtype)),
+        lambda: _gated_norm_source(D, GS, gate_offset, norm.eps),
+        ["x", "gate", "weight"],
+        ["out"],
+        _HEADER,
+    )
+    (out,) = kern(
+        inputs=[x, gate, norm.weight],
+        template=[("T", x.dtype), ("HEADS", heads)],
+        grid=(TG * rows, 1, 1),
+        threadgroup=(TG, 1, 1),
+        output_shapes=[(rows, D)],
+        output_dtypes=[x.dtype],
+    )
+    return out.reshape(*batch, heads * D)
+
+
+def _add_rms_norm_source(K, NT, eps):
+    return f"""
+    constexpr int K = {K}, NT = {NT};
+    constexpr float EPS = {eps!r}f;
+    const int row = threadgroup_position_in_grid.x;
+    const int lid = thread_position_in_threadgroup.x;
+    const device T* xr = x + (size_t)row * K;
+    const device T* rr = res + (size_t)row * res_rows * K;
+    // The residual summed over its slot rows as mx.sum does, then the add of the ops;
+    // the norm reads the rounded sum
+    #define LOAD(j) (has_res ? static_cast<float>(static_cast<T>(static_cast<float>(xr[j]) + static_cast<float>(res_sum(rr, j, K, res_rows)))) : static_cast<float>(xr[j]))
+    float acc = 0.0f;
+    for (int r = 0; r < K; r += NT * 4) {{
+      for (int i = 0; i < 4; i++) {{
+        const int j = r + lid * 4 + i;
+        if (j < K) {{ const float xi = LOAD(j); acc += xi * xi; }}
+      }}
+    }}
+    threadgroup float sums[32];
+    acc = rms_sum(acc, sums, thread_index_in_simdgroup, simdgroup_index_in_threadgroup);
+    const float inv = metal::precise::rsqrt(acc / K + EPS);
+    for (int r = 0; r < K; r += NT * 4) {{
+      for (int i = 0; i < 4; i++) {{
+        const int j = r + lid * 4 + i;
+        if (j < K) {{
+          const float xi = LOAD(j);
+          if (has_res) h[(size_t)row * K + j] = static_cast<T>(xi);
+          out[(size_t)row * K + j] = weight[j] * static_cast<T>(xi * inv);
+        }}
+      }}
+    }}
+    #undef LOAD
+"""
+
+
+def add_rms_norm(norm, x, residual=None, res_rows=1):
+    """``norm(x + residual)`` as one kernel; returns (x + residual, normed).
+
+    ``residual`` holds ``res_rows`` slot rows per row of x, summed as ``mx.sum`` does.
+    """
+    k = x.shape[-1]
+    rows = x.size // k
+    NT = _rms_threads(k)
+    kern = _kernel(
+        "add_rms_norm",
+        (k, NT, norm.eps, str(x.dtype)),
+        lambda: _add_rms_norm_source(k, NT, norm.eps),
+        ["x", "res", "weight", "has_res", "res_rows"],
+        ["h", "out"],
+        _HEADER + _SMALL_HEADER,
+    )
+    with_res = residual is not None
+    h, out = kern(
+        inputs=[x, residual if with_res else x, norm.weight, int(with_res), res_rows],
+        template=[("T", x.dtype)],
+        grid=(NT * rows, 1, 1),
+        threadgroup=(NT, 1, 1),
+        output_shapes=[x.shape] * 2,
+        output_dtypes=[x.dtype] * 2,
+    )
+    return (h, out) if with_res else (x, out)
+
+
+def _attn_qkv_source(H, Hkv, Dh, RD, QW, TG, eps, log2base, scale):
+    return f"""
+    constexpr int H = {H}, Hkv = {Hkv}, Dh = {Dh}, RD = {RD}, QW = {QW}, TG = {TG};
+    constexpr float EPS = {eps!r}f, LOG2BASE = {log2base!r}f, SCALE = {scale!r}f;
+    const int slot = threadgroup_position_in_grid.x;
+    const int m = threadgroup_position_in_grid.y;
+    const int b = m / L, l = m % L;
+    const int lid = thread_position_in_threadgroup.x;
+    const int c0 = lid * 4;
+    const bool active = c0 < Dh;
+    int type, h;
+    const device T* in;
+    if (slot < H) {{ type = 0; h = slot; in = qkv + (size_t)m * QW + h * 2 * Dh; }}
+    else if (slot < H + Hkv) {{ type = 1; h = slot - H; in = qkv + (size_t)m * QW + 2 * H * Dh + h * Dh; }}
+    else {{ type = 2; h = slot - H - Hkv; in = qkv + (size_t)m * QW + (2 * H + Hkv) * Dh + h * Dh; }}
+    const int heads = type == 0 ? H : Hkv;
+    device T* o = (type == 0 ? q : type == 1 ? k : v) + (((size_t)b * heads + h) * L + l) * Dh + c0;
+    if (type == 2) {{
+      if (active) for (int i = 0; i < 4; i++) o[i] = in[c0 + i];
+      return;
+    }}
+    // mx.fast.rms_norm with weight, then mx.fast.rope on the first RD dims
+    const device T* w = type == 0 ? q_w : k_w;
+    float acc = 0.0f;
+    if (active) for (int i = 0; i < 4; i++) {{ const float f = static_cast<float>(in[c0 + i]); acc += f * f; }}
+    threadgroup float sums[32];
+    acc = rms_sum(acc, sums, thread_index_in_simdgroup, simdgroup_index_in_threadgroup);
+    if (!active) return;
+    const float inv = metal::precise::rsqrt(acc / Dh + EPS);
+    const float Lp = SCALE * static_cast<float>(l + offset);
+    for (int i = 0; i < 4; i++) {{
+      const int d = c0 + i;
+      const T n = w[d] * static_cast<T>(static_cast<float>(in[d]) * inv);
+      if (d >= RD) {{ o[i] = n; continue; }}
+      const int d1 = d < RD / 2 ? d : d - RD / 2;
+      const int d2 = d1 + RD / 2;
+      const float theta = Lp * metal::exp2(-(static_cast<float>(d1) / static_cast<float>(RD / 2)) * LOG2BASE);
+      const float c = metal::fast::cos(theta), s = metal::fast::sin(theta);
+      const int dp = d < RD / 2 ? d2 : d1;
+      const float np = static_cast<float>(w[dp] * static_cast<T>(static_cast<float>(in[dp]) * inv));
+      const float x1 = d < RD / 2 ? static_cast<float>(n) : np;
+      const float x2 = d < RD / 2 ? np : static_cast<float>(n);
+      o[i] = static_cast<T>(d < RD / 2 ? x1 * c - x2 * s : x1 * s + x2 * c);
+    }}
+"""
+
+
+def attn_ok(attn, qkv, cache):
+    """True when ``attn_qkv`` handles this call: a plain RoPE and an integer cache offset."""
+    rope = attn.rope
+    return (
+        enabled()
+        and cache is not None
+        and isinstance(getattr(cache, "offset", None), int)
+        and type(rope).__name__ == "RoPE"
+        and not rope.traditional
+        and 0 < rope.dims <= attn.head_dim
+        and rope.dims % 2 == 0
+        and qkv.dtype in (mx.bfloat16, mx.float16)
+        and attn.q_norm.weight.dtype == qkv.dtype
+        and attn.k_norm.weight.dtype == qkv.dtype
+        and attn.head_dim % 4 == 0
+    )
+
+
+def attn_qkv(attn, qkv, offset):
+    """q (B, H, L, Dh) and k (B, Hkv, L, Dh) normalized and rotated, v (B, Hkv, L, Dh) from ``qkv``."""
+    import math
+
+    B, L, QW = qkv.shape
+    H, Hkv, Dh = attn.num_attention_heads, attn.num_key_value_heads, attn.head_dim
+    TG = -(-Dh // 128) * 32
+    rope = attn.rope
+    log2base = float(mx.array(math.log2(rope.base), mx.float32).item())
+    kern = _kernel(
+        "attn_qkv",
+        (H, Hkv, Dh, rope.dims, QW, TG, attn.q_norm.eps, log2base, rope.scale, str(qkv.dtype)),
+        lambda: _attn_qkv_source(H, Hkv, Dh, rope.dims, QW, TG, attn.q_norm.eps, log2base, rope.scale),
+        ["qkv", "q_w", "k_w", "offset", "L"],
+        ["q", "k", "v"],
+        _HEADER,
+    )
+    return kern(
+        inputs=[qkv, attn.q_norm.weight, attn.k_norm.weight, offset, L],
+        template=[("T", qkv.dtype)],
+        grid=(TG * (H + 2 * Hkv), B * L, 1),
+        threadgroup=(TG, 1, 1),
+        output_shapes=[(B, H, L, Dh), (B, Hkv, L, Dh), (B, Hkv, L, Dh)],
+        output_dtypes=[qkv.dtype] * 3,
+    )
+
+
+def _attn_gate_source(H, Dh, QW):
+    return f"""
+    constexpr int H = {H}, Dh = {Dh}, QW = {QW};
+    const int m = thread_position_in_grid.y;
+    const int j = thread_position_in_grid.x;
+    if (j >= H * Dh) return;
+    const int h = j / Dh, d = j % Dh;
+    const int b = m / L, l = m % L;
+    const T xv = x[(((size_t)b * H + h) * L + l) * Dh + d];
+    const T g = qkv[(size_t)m * QW + h * 2 * Dh + Dh + d];
+    out[(size_t)m * H * Dh + j] = xv * SigmoidLib{{}}(g);
+"""
+
+
+def attn_gate(x, qkv):
+    """``x * sigmoid(gate)`` for the attention output x (B, H, L, Dh); the gate is read in ``qkv``."""
+    B, H, L, Dh = x.shape
+    QW = qkv.shape[-1]
+    kern = _kernel(
+        "attn_gate",
+        (H, Dh, QW, str(x.dtype)),
+        lambda: _attn_gate_source(H, Dh, QW),
+        ["x", "qkv", "L"],
+        ["out"],
+        _HEADER,
+    )
+    (out,) = kern(
+        inputs=[x, qkv, L],
+        template=[("T", x.dtype)],
+        grid=(H * Dh, B * L, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B * L, H * Dh)],
+        output_dtypes=[x.dtype],
+    )
+    return out.reshape(B, L, H * Dh)
+
+
+def _gdn_norm_source(Dv, Dk, Hk, Hv, TMAX, PW, ZO, eps, prep):
+    """The packed gated-delta recurrence (4 lanes per value row, 8 rows per simdgroup, all Dv
+    rows of a head in one threadgroup) with the gated norm of the outputs as its epilogue.
+
+    prep=1 writes the ``qmv_small`` prep of norm(y) * silu(z) (fp16 rows, chunk sums, row
+    scales); prep=0 writes it in the activation type. Both round like the ops they replace.
+    """
+    order, scale = (0, 4, 1, 5, 2, 6, 3, 7), (1.0, 1.0, 1 / 16, 1 / 16, 1.0, 1.0, 1 / 16, 1 / 16)
+    stores = "\n".join(
+        f"        x16[xrow + c * 16 + {c8 * 8 + j}] = half(vals[t][c * 16 + {c8 * 8 + order[j]}] * (sc * {scale[j]}f));"
+        for c8 in range(2)
+        for j in range(8)
+    )
+    if prep:
+        epilogue = f"""
+    // Row scale from the bound sqrt(D) * max|w| * max|z| (the prep's scan), as a power of two
+    float wmax = lid < Dv ? metal::fabs(static_cast<float>(weight[lid])) : 0.0f;
+    for (int e = lid + TGN; e < Dv; e += TGN) wmax = max(wmax, metal::fabs(static_cast<float>(weight[e])));
+    wmax = simd_max(wmax);
+    if (lane == 0) red[sg] = wmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    wmax = red[0];
+    for (int i = 1; i < NSG; i++) wmax = max(wmax, red[i]);
+    for (int t = 0; t < T; t++) {{
+      const int m = b_idx * T + t;
+      float amax = lid < Hv ? zmax[m * Hv + lid] : 0.0f;
+      for (int e = lid + TGN; e < Hv; e += TGN) amax = max(amax, zmax[m * Hv + e]);
+      amax = simd_max(amax);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (lane == 0) red[sg] = amax;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      amax = red[0];
+      for (int i = 1; i < NSG; i++) amax = max(amax, red[i]);
+      amax *= wmax * metal::sqrt(float(Dv));
+      int e = 0;
+      float sc = 1.0f;
+      if (amax > 0.0f) {{
+        frexp(amax, e);
+        sc = ldexp(1.0f, 3 - e);
+      }}
+      if (hv_idx == 0 && lid == 0) rscale[m] = 1.0f / sc;
+      // ssh: 8 partials of 16 values, then the prep's xor-4,2,1 butterfly
+      if (lid < Dv / 16) {{
+        float acc = 0.0f;
+        for (int i = 0; i < 16; i++) acc += ys[t][lid * 16 + i] * ys[t][lid * 16 + i];
+        part[lid] = acc;
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const float ssh = ((part[0] + part[4]) + (part[2] + part[6])) + ((part[1] + part[5]) + (part[3] + part[7]));
+      const float rsh = rsqrt(ssh / Dv + EPS);
+      for (int e2 = lid; e2 < Dv; e2 += TGN) {{
+        const float xx = ys[t][e2];
+        const float ww = static_cast<float>(weight[e2]);
+        const float gg = static_cast<float>(proj[(size_t)m * PW + ZO + hv_idx * Dv + e2]);
+        vals[t][e2] = xx * rsh * ww * (gg * sigmoid_f(gg));
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const size_t xrow = (size_t)m * (Hv * Dv) + hv_idx * Dv;
+      for (int c = lid; c < Dv / 16; c += TGN) {{
+        float ssum = 0.0f;
+        for (int i = 0; i < 16; i++) ssum += vals[t][c * 16 + i];
+        xsum[(hv_idx * (Dv / 16) + c) * Mp + m] = ssum * sc;
+{stores}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+"""
+    else:
+        epilogue = """
+    // mx.fast.rms_norm with weight (32 lanes x 4 values), then silu(z) * x in float
+    for (int t = 0; t < T; t++) {
+      const int m = b_idx * T + t;
+      if (sg == 0) {
+        float acc = 0.0f;
+        for (int i = 0; i < 4; i++) { const float f = ys[t][lane * 4 + i]; acc += f * f; }
+        acc = simd_sum(acc);
+        if (lane == 0) red[0] = metal::precise::rsqrt(acc / Dv + EPS);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const float inv = red[0];
+      for (int e = lid; e < Dv; e += TGN) {
+        const InT n = weight[e] * static_cast<InT>(ys[t][e] * inv);
+        const float gf = static_cast<float>(proj[(size_t)m * PW + ZO + hv_idx * Dv + e]);
+        const float sv = gf * Sigmoid{}(gf);
+        out[(size_t)m * (Hv * Dv) + hv_idx * Dv + e] = static_cast<InT>(sv * static_cast<float>(n));
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+    return f"""
+    constexpr int Dv = {Dv}, Dk = {Dk}, Hk = {Hk}, Hv = {Hv}, TMAX = {TMAX}, PW = {PW}, ZO = {ZO};
+    constexpr float EPS = {eps!r}f;
+    constexpr int lanes_per_row = 4;
+    constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+    constexpr int values_per_lane = Dk / lanes_per_row;
+    constexpr int partials_per_lane = values_per_lane / 4;
+    constexpr int NSG = Dv / rows_per_simdgroup, TGN = 32 * NSG;
+
+    const int n = thread_position_in_grid.z;
+    const int b_idx = n / Hv;
+    const int hv_idx = n % Hv;
+    const int hk_idx = hv_idx / (Hv / Hk);
+    const int lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int lid = sg * 32 + lane;
+    const int row_in_simdgroup = lane / lanes_per_row;
+    const int lane_in_row = lane & (lanes_per_row - 1);
+    const int dv_idx = sg * rows_per_simdgroup + row_in_simdgroup;
+
+    const device InT* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+    const device InT* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+    const device InT* v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
+    const device float* i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+    device float* o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+
+    float state[values_per_lane];
+    for (int i = 0; i < values_per_lane; ++i) state[i] = i_state[i];
+    auto g_ = g + b_idx * T * Hv;
+    auto beta_ = beta + b_idx * T * Hv;
+
+    threadgroup float ys[TMAX][Dv];
+    threadgroup float vals[TMAX][Dv];
+    threadgroup float part[Dv / 16];
+    threadgroup float red[NSG];
+
+    for (int t = 0; t < T; ++t) {{
+      float gt = static_cast<float>(g_[hv_idx]);
+      float pt[partials_per_lane];
+      for (int pb = 0; pb < partials_per_lane; ++pb) {{
+        float acc = 0.0f;
+        for (int i = 0; i < 4; ++i) {{
+          int e = pb * 4 + i;
+          state[e] = state[e] * gt;
+          acc += state[e] * static_cast<float>(k_[e]);
+        }}
+        pt[pb] = acc;
+      }}
+      float kv_mem = ((pt[0] + pt[1]) + (pt[2] + pt[3])) + ((pt[4] + pt[5]) + (pt[6] + pt[7]));
+      kv_mem += simd_shuffle_xor(kv_mem, 1);
+      kv_mem += simd_shuffle_xor(kv_mem, 2);
+      auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+      for (int pb = 0; pb < partials_per_lane; ++pb) {{
+        float acc = 0.0f;
+        for (int i = 0; i < 4; ++i) {{
+          int e = pb * 4 + i;
+          state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+          acc += state[e] * static_cast<float>(q_[e]);
+        }}
+        pt[pb] = acc;
+      }}
+      float o = ((pt[0] + pt[1]) + (pt[2] + pt[3])) + ((pt[4] + pt[5]) + (pt[6] + pt[7]));
+      o += simd_shuffle_xor(o, 1);
+      o += simd_shuffle_xor(o, 2);
+      // The norm reads the output rounded to the activation type, as the ops did
+      if (lane_in_row == 0) ys[t][dv_idx] = static_cast<float>(static_cast<InT>(o));
+      q_ += Hk * Dk;
+      k_ += Hk * Dk;
+      v_ += Hv * Dv;
+      g_ += Hv;
+      beta_ += Hv;
+    }}
+    for (int i = 0; i < values_per_lane; ++i) o_state[i] = state[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+{epilogue}
+"""
+
+
+def gdn_norm_ok(net, q, state, T, prep):
+    """The fused recurrence + gated norm handles Dk = 128, Dv a multiple of 8, T <= 8, fp32 state."""
+    Dk, Dv = net.head_k_dim, net.head_v_dim
+    return (
+        Dk == 128
+        and Dv % 16 == 0
+        and Dv <= 256
+        and T <= 8
+        and state.dtype == mx.float32
+    )
+
+
+def gdn_norm(net, q, k, v, g, beta, state, proj, zmax, prep):
+    """The recurrence over ``T`` steps and ``norm(y, z)``; returns (state_out, prepped or out)."""
+    from .qmv_small import Prepped, _mp
+
+    B, T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[2:]
+    M = B * T
+    K = Hv * Dv
+    Mp = _mp(M)
+    PW, ZO = proj.shape[-1], net.conv_dim
+    kern = _kernel(
+        "gdn_norm",
+        (Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps, prep, str(q.dtype)),
+        lambda: _gdn_norm_source(Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps, prep),
+        ["q", "k", "v", "g", "beta", "state_in", "T", "proj", "weight", "zmax", "Mp"],
+        ["state_out", "x16", "xsum", "rscale"] if prep else ["state_out", "out"],
+        _HEADER + _SMALL_HEADER,
+    )
+    outs = kern(
+        inputs=[q, k, v, g, beta, state, T, proj, net.norm.weight, zmax, Mp],
+        template=[("InT", q.dtype)],
+        grid=(32, Dv // 8, B * Hv),
+        threadgroup=(32, Dv // 8, 1),
+        output_shapes=[state.shape] + ([(M, K), (K // 16, Mp), (Mp,)] if prep else [(M, K)]),
+        output_dtypes=[mx.float32] + ([mx.float16, mx.float32, mx.float32] if prep else [q.dtype]),
+    )
+    if prep:
+        p = Prepped(outs[1], outs[2], outs[3], (B, T, K), q.dtype)
+        p.natural = False
+        return outs[0], p
+    return outs[0], outs[1].reshape(B, T, K)

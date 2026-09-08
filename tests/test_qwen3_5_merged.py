@@ -1,0 +1,287 @@
+# Copyright © 2026 Apple Inc.
+
+import os
+import unittest
+
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+from mlx_lm.models import fused_ops, qmv_small, qwen3_5
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.gated_delta import gated_delta_update
+from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated
+
+CONFIG = {
+    "model_type": "qwen3_5",
+    "hidden_size": 64,
+    "intermediate_size": 96,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "vocab_size": 128,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 2,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "rms_norm_eps": 1e-5,
+    "full_attention_interval": 4,
+    "tie_word_embeddings": False,
+    "max_position_embeddings": 512,
+}
+
+
+def _bf16_values():
+    """Every finite bf16 value below 1e30."""
+    bits = np.arange(0, 65536, dtype=np.uint16)
+    f = (bits.astype(np.uint32) << 16).view(np.float32)
+    return mx.array(f[np.isfinite(f) & (np.abs(f) < 1e30)]).astype(mx.bfloat16)
+
+
+def _model(seed=0, a_log_dtype=mx.bfloat16):
+    mx.random.seed(seed)
+    args = qwen3_5.ModelArgs.from_dict({"model_type": "qwen3_5", "text_config": CONFIG})
+    model = qwen3_5.Model(args)
+    model.eval()
+    model.set_dtype(mx.bfloat16)
+    # The Qwen3.8 checkpoints store A_log in bf16; a converted model may keep float32
+    for layer in model.layers:
+        if layer.is_linear:
+            layer.linear_attn.A_log = layer.linear_attn.A_log.astype(a_log_dtype)
+    mx.eval(model.parameters())
+    return model
+
+
+def _gdn_reference(net, proj, conv_state):
+    """The ops chain of the GDN mixer inputs from the fused projection."""
+    B, S, _ = proj.shape
+    qkv, z, b, a = mx.split(
+        proj,
+        [net.conv_dim, net.conv_dim + net.value_dim, net.conv_dim + net.value_dim + net.num_v_heads],
+        axis=-1,
+    )
+    conv_input = mx.concatenate([conv_state, qkv], axis=1)
+    state_out = mx.contiguous(conv_input[:, -(net.conv_kernel_size - 1) :, :])
+    conv_out = nn.silu(net.conv1d(conv_input))
+    q, k, v = [
+        t.reshape(B, S, h, d)
+        for t, h, d in zip(
+            mx.split(conv_out, [net.key_dim, 2 * net.key_dim], -1),
+            [net.num_k_heads, net.num_k_heads, net.num_v_heads],
+            [net.head_k_dim, net.head_k_dim, net.head_v_dim],
+        )
+    ]
+    eps = 1e-6 / net.head_k_dim
+    inv_scale = net.head_k_dim**-0.5
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+    k = inv_scale * mx.fast.rms_norm(k, None, eps)
+    from mlx_lm.models.gated_delta import compute_g
+
+    zmax = mx.abs(z.reshape(B * S, net.num_v_heads, net.head_v_dim).astype(mx.float32)).max(axis=-1)
+    return q, k, v, compute_g(net.A_log, a, net.dt_bias), mx.sigmoid(b), state_out, zmax
+
+
+@unittest.skipUnless(mx.metal.is_available(), "Metal only")
+class TestMergedKernels(unittest.TestCase):
+    def test_gdn_in_matches_ops(self):
+        for a_log_dtype in (mx.bfloat16, mx.float32):
+            net = _model(a_log_dtype=a_log_dtype).layers[0].linear_attn
+            self._check_gdn_in(net)
+
+    def _check_gdn_in(self, net):
+        for B, S in ((1, 1), (1, 4), (2, 3), (1, 8)):
+            mx.random.seed(B * 10 + S)
+            proj = (mx.random.normal((B, S, net.in_proj.weight.shape[0])) * 2).astype(mx.bfloat16)
+            state = (mx.random.normal((B, 3, net.conv_dim)) * 2).astype(mx.bfloat16)
+            outs = fused_ops.gdn_in(net, proj, state)
+            refs = _gdn_reference(net, proj, state)
+            for name, o, r in zip(("q", "k", "v", "g", "beta", "state", "zmax"), outs, refs):
+                self.assertEqual(o.dtype, r.dtype, name)
+                self.assertTrue(mx.array_equal(o, r).item(), f"{name} B={B} S={S}")
+
+    def test_gate_math_over_all_bf16_values(self):
+        net = _model().layers[0].linear_attn
+        x = _bf16_values()
+        Hv = net.num_v_heads
+        n = x.size // Hv * Hv
+        # b and a rows made of every bf16 value; the conv part is random
+        proj = (mx.random.normal((n // Hv, 1, net.in_proj.weight.shape[0])) * 2).astype(mx.bfloat16)
+        ab = x[:n].reshape(n // Hv, 1, Hv)
+        proj[..., net.conv_dim + net.value_dim :] = mx.concatenate([ab, ab], axis=-1)
+        state = mx.zeros((n // Hv, 3, net.conv_dim), mx.bfloat16)
+        _, _, _, g, beta, _, _ = fused_ops.gdn_in(net, proj, state)
+        _, _, _, rg, rbeta, _, _ = _gdn_reference(net, proj, state)
+        self.assertTrue(mx.array_equal(g, rg).item())
+        self.assertTrue(mx.array_equal(beta, rbeta).item())
+
+    def test_gdn_norm_matches_ops(self):
+        """The fused recurrence + gated norm equals the packed kernel followed by the norm / prep."""
+        from mlx_lm.models.gated_delta import gated_delta_kernel
+
+        net = _model().layers[0].linear_attn
+        norm = net.norm
+        norm.weight = (mx.random.normal((net.head_v_dim,)) * 0.2 + 1).astype(mx.bfloat16)
+        for B, S in ((1, 1), (1, 4), (2, 3), (1, 8)):
+            mx.random.seed(100 + B * 10 + S)
+            proj = (mx.random.normal((B, S, net.in_proj.weight.shape[0])) * 2).astype(mx.bfloat16)
+            cstate = (mx.random.normal((B, 3, net.conv_dim)) * 2).astype(mx.bfloat16)
+            q, k, v, g, beta, _, zmax = fused_ops.gdn_in(net, proj, cstate)
+            state = mx.random.normal((B, net.num_v_heads, net.head_v_dim, net.head_k_dim)) * 0.5
+            y, rstate = gated_delta_kernel(q, k, v, g, beta, state)
+            proj2 = proj.reshape(B * S, -1)
+            # activation-type output
+            st, out = fused_ops.gdn_norm(net, q, k, v, g, beta, state, proj2, zmax, False)
+            self.assertTrue(mx.array_equal(st, rstate).item())
+            ref = fused_ops.gated_norm(norm, y, proj2, net.conv_dim)
+            self.assertTrue(mx.array_equal(out, ref).item(), f"out B={B} S={S}")
+            # prep output
+            st, p = fused_ops.gdn_norm(net, q, k, v, g, beta, state, proj2, zmax, True)
+            pr = qmv_small.prep(
+                y.reshape(B * S, -1), "gated_norm", proj2, norm.weight, eps=norm.eps,
+                d=net.head_v_dim, gs=proj2.shape[-1], go=net.conv_dim,
+            )
+            M = B * S
+            self.assertTrue(mx.array_equal(st, rstate).item())
+            for name, a, b in (("x16", p.x16, pr.x16), ("xsum", p.xsum[:, :M], pr.xsum[:, :M]), ("rscale", p.rscale[:M], pr.rscale[:M])):
+                self.assertTrue(mx.array_equal(a, b).item(), f"{name} B={B} S={S}")
+
+    def test_gated_norm_matches_ops(self):
+        D, heads = 128, 4
+        norm = Qwen3NextRMSNormGated(D, eps=1e-6)
+        norm.weight = (mx.random.normal((D,)) * 0.2 + 1).astype(mx.bfloat16)
+        x = (mx.random.normal((2, 3, heads, D)) * 2).astype(mx.bfloat16)
+        wide = (mx.random.normal((6, 7 + heads * D)) * 2).astype(mx.bfloat16)
+        z = wide[:, 7:].reshape(2, 3, heads, D)
+        ref = norm(x, z).reshape(2, 3, heads * D)
+        out = fused_ops.gated_norm(norm, x, wide, 7)
+        self.assertTrue(mx.array_equal(out, ref).item())
+
+    def test_add_rms_norm_matches_ops(self):
+        for k in (5120, 2048, 64):
+            norm = nn.RMSNorm(k, eps=1e-6)
+            norm.weight = (mx.random.normal((k,)) * 0.2 + 1).astype(mx.bfloat16)
+            x = (mx.random.normal((1, 3, k)) * 2).astype(mx.bfloat16)
+            r = (mx.random.normal((1, 3, k)) * 2).astype(mx.bfloat16)
+            h, out = fused_ops.add_rms_norm(norm, x, r)
+            self.assertTrue(mx.array_equal(h, x + r).item(), k)
+            self.assertTrue(mx.array_equal(out, norm(x + r)).item(), k)
+            _, out = fused_ops.add_rms_norm(norm, x)
+            self.assertTrue(mx.array_equal(out, norm(x)).item(), k)
+
+    def test_prep_with_residual_and_gate_offset(self):
+        k, m = 2048, 4
+        w = (mx.random.normal((k,)) * 0.2 + 1).astype(mx.bfloat16)
+        x = (mx.random.normal((m, k)) * 2).astype(mx.bfloat16)
+        r = (mx.random.normal((m, k)) * 2).astype(mx.bfloat16)
+        p = qmv_small.prep(x, "rms_norm", w, eps=1e-6, residual=r)
+        ref = qmv_small.prep(x + r, "rms_norm", w, eps=1e-6)
+        self.assertTrue(mx.array_equal(p.h, x + r).item())
+        for a, b in ((p.x16, ref.x16), (p.xsum, ref.xsum), (p.rscale, ref.rscale)):
+            self.assertTrue(mx.array_equal(a, b).item())
+        # The gated norm prep reads the gate inside a wider row
+        D, heads = 128, 4
+        wn = (mx.random.normal((D,)) * 0.2 + 1).astype(mx.bfloat16)
+        y = (mx.random.normal((m, heads * D)) * 2).astype(mx.bfloat16)
+        wide = (mx.random.normal((m, 16 + heads * D + 8)) * 2).astype(mx.bfloat16)
+        z = mx.contiguous(wide[:, 16 : 16 + heads * D])
+        p = qmv_small.prep(y, "gated_norm", wide, wn, eps=1e-6, d=D, gs=wide.shape[1], go=16)
+        ref = qmv_small.prep(y, "gated_norm", z, wn, eps=1e-6, d=D)
+        for a, b in ((p.x16, ref.x16), (p.xsum, ref.xsum), (p.rscale, ref.rscale)):
+            self.assertTrue(mx.array_equal(a, b).item())
+
+    def test_attention_kernels_match_ops(self):
+        args = qwen3_5.TextModelArgs.from_dict(
+            {**CONFIG, "hidden_size": 128, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 256}
+        )
+        attn = qwen3_5.Attention(args)
+        attn.set_dtype(mx.bfloat16)
+        mx.eval(attn.parameters())
+        H, Hkv, Dh = 4, 2, 256
+        for B, L, offset in ((1, 1, 0), (1, 4, 513), (2, 3, 100), (1, 6, 131000)):
+            qkv = (mx.random.normal((B, L, 2 * (H + Hkv) * Dh)) * 2).astype(mx.bfloat16)
+            q, k, v = fused_ops.attn_qkv(attn, qkv, offset)
+            # the ops chain
+            q_dim, kv_dim = 2 * H * Dh, Hkv * Dh
+            qo, ko, vo = mx.split(qkv, [q_dim, q_dim + kv_dim], axis=-1)
+            queries, gate = mx.split(qo.reshape(B, L, H, -1), 2, axis=-1)
+            rq = attn.rope(attn.q_norm(queries).transpose(0, 2, 1, 3), offset=offset)
+            rk = attn.rope(attn.k_norm(ko.reshape(B, L, Hkv, -1)).transpose(0, 2, 1, 3), offset=offset)
+            rv = vo.reshape(B, L, Hkv, -1).transpose(0, 2, 1, 3)
+            for name, a, b in (("q", q, rq), ("k", k, rk), ("v", v, rv)):
+                self.assertTrue(mx.array_equal(a, b).item(), f"{name} B={B} L={L} offset={offset}")
+            # the output gate
+            x = (mx.random.normal((B, H, L, Dh)) * 2).astype(mx.bfloat16)
+            ref = x.transpose(0, 2, 1, 3).reshape(B, L, -1) * mx.sigmoid(gate.reshape(B, L, -1))
+            out = fused_ops.attn_gate(x, qkv.reshape(B * L, -1))
+            self.assertTrue(mx.array_equal(out, ref).item())
+            # the gate prep reading the attention layouts in place
+            layout = (L, H, Dh, qkv.shape[-1])
+            p = qmv_small.prep(x, "gate", qkv.reshape(B * L, -1), attn=layout)
+            xr = x.transpose(0, 2, 1, 3).reshape(B * L, -1)
+            pr = qmv_small.prep(xr, "gate", mx.contiguous(gate.reshape(B * L, -1)))
+            # The padded rows of xsum and rscale are not written
+            M = B * L
+            for a, b in ((p.x16, pr.x16), (p.xsum[:, :M], pr.xsum[:, :M]), (p.rscale[:M], pr.rscale[:M])):
+                self.assertTrue(mx.array_equal(a, b).item())
+
+    def test_moe_topk_plan_and_slot_sum(self):
+        """The fused top-k equals argpartition (ties included); the consumers sum slot rows as mx.sum."""
+        from mlx_lm.models import moe_small
+
+        E, k, m, K = 256, 8, 4, 2048
+        mx.random.seed(7)
+        logits = (mx.random.normal((m, E + 1)) * 2).astype(mx.bfloat16)
+        # ties at the top and inside the top-k
+        logits[:, 5] = logits[:, :E].max(axis=-1)
+        logits[:, 77] = logits[:, 5]
+        logits[:, 200] = logits[:, 9]
+        x = (mx.random.normal((m, K)) * 2).astype(mx.bfloat16)
+        x16, xsum, rscale, inds, plan = moe_small._prep(x, "copy", logits, m, k, E)
+        ref = mx.argpartition(logits[:, :E], kth=-k, axis=-1)[:, -k:].reshape(-1)
+        self.assertTrue(mx.array_equal(inds, ref.astype(mx.int32)).item(), (inds, ref))
+        # residual slot rows
+        for R, Kd in ((9, 2048), (3, 5120), (1, 2048)):
+            norm = nn.RMSNorm(Kd, eps=1e-6)
+            norm.weight = (mx.random.normal((Kd,)) * 0.2 + 1).astype(mx.bfloat16)
+            xx = (mx.random.normal((1, m, Kd)) * 2).astype(mx.bfloat16)
+            rr = (mx.random.normal((1, m, R, Kd)) * 2).astype(mx.bfloat16)
+            h, out = fused_ops.add_rms_norm(norm, xx, rr.reshape(-1, Kd), R)
+            ref_h = xx + rr.sum(axis=-2)
+            self.assertTrue(mx.array_equal(h, ref_h).item(), (R, Kd))
+            self.assertTrue(mx.array_equal(out, norm(ref_h)).item(), (R, Kd))
+            p = qmv_small.prep(xx.reshape(m, Kd), "rms_norm", norm.weight, eps=1e-6, residual=(rr.reshape(-1, Kd), R))
+            pr = qmv_small.prep(ref_h.reshape(m, Kd), "rms_norm", norm.weight, eps=1e-6)
+            self.assertTrue(mx.array_equal(p.h, ref_h.reshape(m, Kd)).item())
+            for a, b in ((p.x16, pr.x16), (p.xsum[:, :m], pr.xsum[:, :m]), (p.rscale[:m], pr.rscale[:m])):
+                self.assertTrue(mx.array_equal(a, b).item(), (R, Kd))
+
+    def test_model_matches_unfused(self):
+        """The decode and verify forwards of the merged path equal the ops path bitwise."""
+        model = _model()
+        mx.random.seed(3)
+        prompt = mx.random.randint(0, CONFIG["vocab_size"], (1, 12))
+        toks = mx.random.randint(0, CONFIG["vocab_size"], (1, 6))
+        outs = []
+        for enabled in (True, False):
+            fused_ops._ENABLED = enabled
+            cache = make_prompt_cache(model)
+            mx.eval(model(prompt, cache=cache))
+            res = []
+            for s in (1, 4, 6):
+                logits, hidden = model(toks[:, :s], cache=cache, return_hidden=True)
+                mx.eval(logits, hidden)
+                res += [logits, hidden]
+            res += [c[0] for c in cache if not hasattr(c, "keys")]
+            res += [c[1] for c in cache if not hasattr(c, "keys")]
+            outs.append(res)
+        fused_ops._ENABLED = True
+        for a, b in zip(*outs):
+            self.assertTrue(mx.array_equal(a, b).item())
+
+
+if __name__ == "__main__":
+    unittest.main()

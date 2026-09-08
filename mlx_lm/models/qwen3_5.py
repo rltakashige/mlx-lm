@@ -9,7 +9,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_map
 
-from . import moe_small
+from . import fused_ops, moe_small
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -18,9 +18,10 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .fused_ops import prep_add_rms_norm
+from .gated_delta import gated_delta_kernel, gated_delta_update
 from .pipeline import PipelineMixin
-from .qmv_small import prep_gate, prep_gated_norm, prep_rms_norm, prep_swiglu, qlinear
+from .qmv_small import _nax_m, prep_gate, prep_gated_norm, prep_swiglu, qlinear, routes
 from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock
@@ -113,33 +114,46 @@ class Attention(Qwen3NextAttention):
         q_dim = 2 * self.num_attention_heads * self.head_dim
         kv_dim = self.num_key_value_heads * self.head_dim
 
-        q_proj_output, keys, values = mx.split(
-            qlinear(self.qkv_proj, x), [q_dim, q_dim + kv_dim], axis=-1
-        )
-        queries, gate = mx.split(
-            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
-        )
-        gate = gate.reshape(B, L, -1)
-
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
-            0, 2, 1, 3
-        )
-
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+        qkv = qlinear(self.qkv_proj, x)
+        fused = not self.training and fused_ops.attn_ok(self, qkv, cache)
+        if fused:
+            # One kernel: the q/k norms, the rope and the head layouts
+            queries, keys, values = fused_ops.attn_qkv(self, qkv, cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            q_proj_output, keys, values = mx.split(qkv, [q_dim, q_dim + kv_dim], axis=-1)
+            queries, gate = mx.split(
+                q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+            )
+            gate = gate.reshape(B, L, -1)
+
+            queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+            keys = self.k_norm(
+                keys.reshape(B, L, self.num_key_value_heads, -1)
+            ).transpose(0, 2, 1, 3)
+            values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+                0, 2, 1, 3
+            )
+
+            if cache is not None:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+                keys, values = cache.update_and_fetch(keys, values)
+            else:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+        if fused:
+            # The gate is read in place from the projection rows
+            qkv2 = qkv.reshape(B * L, -1)
+            layout = (L, self.num_attention_heads, self.head_dim, qkv2.shape[-1])
+            prepped = prep_gate(output, qkv2, self.o_proj, layout)
+            if prepped is not None:
+                return qlinear(self.o_proj, prepped)
+            return self.o_proj(fused_ops.attn_gate(output, qkv2))
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         prepped = prep_gate(output, gate, self.o_proj)
@@ -211,16 +225,18 @@ class SparseMoeBlock(nn.Module):
         )
         self.sharding_group = None
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, slots: bool = False) -> mx.array:
+        """With ``slots`` the top_k + 1 expert outputs of a token may come back unsummed
+        (.., S, K); the consumer then sums them."""
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
         E, k = self.num_experts, self.top_k
         logits = self.gate(x)
-        inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
         if moe_small.routes(self, x):
-            y = moe_small.experts(self, x, logits, inds)
+            y = moe_small.experts(self, x, logits, slots and self.sharding_group is None)
         else:
+            inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
             if self.norm_topk_prob:
                 top = mx.take_along_axis(logits, inds, axis=-1)
                 scores = mx.softmax(top, axis=-1, precise=True)
@@ -294,8 +310,37 @@ class GatedDeltaNet(nn.Module):
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
+        proj = qlinear(self.in_proj, inputs)
+        fused = not self.training and fused_ops.gdn_in_ok(self, proj, mask, cache)
+        if fused:
+            out, z, z_off = self._mixer_fused(proj, cache)
+        else:
+            out, z = self._mixer(proj, mask, cache)
+            z_off = 0
+
+        if fused and out.ndim == 3:
+            # The fused mixer already applied the norm (and the prep)
+            out = qlinear(self.out_proj, out)
+        else:
+            gate = z if fused else z.reshape(B * S, -1)
+            prepped = prep_gated_norm(self.norm, out, gate, self.out_proj, z_off)
+            if prepped is not None:
+                out = qlinear(self.out_proj, prepped)
+            elif fused:
+                out = self.out_proj(fused_ops.gated_norm(self.norm, out, gate, z_off))
+            else:
+                out = self.out_proj(self.norm(out, z).reshape(B, S, -1))
+
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+
+        return out
+
+    def _mixer(self, proj, mask, cache):
+        """conv, norms and the recurrence with MLX ops; returns (out, z (B, S, Hv, Dv))."""
+        B, S, _ = proj.shape
         qkv, z, b, a = mx.split(
-            qlinear(self.in_proj, inputs),
+            proj,
             [
                 self.conv_dim,
                 self.conv_dim + self.value_dim,
@@ -310,7 +355,7 @@ class GatedDeltaNet(nn.Module):
         else:
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim),
-                dtype=inputs.dtype,
+                dtype=proj.dtype,
             )
 
         if mask is not None:
@@ -364,17 +409,42 @@ class GatedDeltaNet(nn.Module):
                 # A rollback reruns the first accepted steps from these inputs
                 cache.rollback = lambda steps: update(steps=steps)[1]
                 cache.steps, cache.conv_input = S, conv_input
+        return out, z
 
-        prepped = prep_gated_norm(self.norm, out, z, self.out_proj)
-        if prepped is not None:
-            out = qlinear(self.out_proj, prepped)
+    def _mixer_fused(self, proj, cache):
+        """The same with the small ops merged; returns (out, proj rows, column of z)."""
+        B, S, _ = proj.shape
+        conv_state = cache[0]
+        if conv_state is None:
+            conv_state = mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim), dtype=proj.dtype
+            )
+        q, k, v, g, beta, cache[0], zmax = fused_ops.gdn_in(self, proj, conv_state)
+        state = cache[1]
+        if state is None:
+            state = mx.zeros(
+                (B, self.num_v_heads, self.head_v_dim, self.head_k_dim), mx.float32
+            )
+        update = functools.partial(gated_delta_kernel, q, k, v, g, beta, state)
+        proj2 = proj.reshape(B * S, -1)
+        # The recurrence with the gated norm (and its prep) as its epilogue
+        prep = routes(self.out_proj, (B, S, self.value_dim), proj.dtype) and not _nax_m(B * S)
+        if fused_ops.gdn_norm_ok(self, q, state, S, prep):
+            cache[1], out = fused_ops.gdn_norm(
+                self, q, k, v, g, beta, state, proj2, zmax, prep
+            )
         else:
-            out = self.out_proj(self.norm(out, z).reshape(B, S, -1))
-
-        if self.sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=self.sharding_group)
-
-        return out
+            out, cache[1] = update()
+        cache.advance(S)
+        if cache.keep_states and S > 1:
+            cache.rollback = lambda steps: update(steps=steps)[1]
+            cache.steps = S
+            # Only evaluated when a partial acceptance trims the conv window
+            cache.conv_input = mx.concatenate(
+                [conv_state, proj[..., : self.conv_dim]], axis=1
+            )
+        # z is read in place from the projection rows
+        return out, proj2, self.conv_dim
 
 
 class DecoderLayer(nn.Module):
@@ -403,20 +473,34 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
+        pending: Optional[mx.array] = None,
+        split: bool = False,
+    ):
+        """``pending`` is an output not yet added to ``x`` (the add is merged into the
+        norm); with ``split`` the result is returned as such a pair (h, mlp output)."""
+        fused = not self.training
         if self.is_linear:
             # A sharded GDN applies sum_gradients to its input, which needs an array.
             proj = None if self.linear_attn.sharding_group else self.linear_attn.in_proj
-            xn = prep_rms_norm(self.input_layernorm, x, proj)
+            x, xn = prep_add_rms_norm(self.input_layernorm, x, pending, proj, fused)
             r = self.linear_attn(xn, mask, cache)
         else:
-            xn = prep_rms_norm(self.input_layernorm, x, self.self_attn.qkv_proj)
+            x, xn = prep_add_rms_norm(
+                self.input_layernorm, x, pending, self.self_attn.qkv_proj, fused
+            )
             r = self.self_attn(xn, mask, cache)
-        h = x + r
-        hn = prep_rms_norm(
-            self.post_attention_layernorm, h, getattr(self.mlp, "gate_up_proj", None)
+        h, hn = prep_add_rms_norm(
+            self.post_attention_layernorm,
+            x,
+            r,
+            getattr(self.mlp, "gate_up_proj", None),
+            fused,
         )
-        return h + self.mlp(hn)
+        if split and fused and isinstance(self.mlp, SparseMoeBlock):
+            m = self.mlp(hn, slots=True)
+        else:
+            m = self.mlp(hn)
+        return (h, m) if split else h + m
 
 
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
@@ -477,11 +561,16 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         chunk = self.eval_every
         if cache[0] is None or self.training or pipeline_size > 1:
             chunk = 0
+        pending = None
         for i, (layer, c) in enumerate(zip(self.pipeline_layers, cache), 1):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states, pending = layer(
+                hidden_states, mask=mask, cache=c, pending=pending, split=True
+            )
             if chunk and i % chunk == 0 and i < len(cache):
-                mx.async_eval(hidden_states)
+                mx.async_eval(hidden_states, pending)
+        if pipeline_size > 1:
+            hidden_states, pending = hidden_states + fused_ops.slot_sum(pending), None
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -500,7 +589,9 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return self.norm(hidden_states)
+        return prep_add_rms_norm(
+            self.norm, hidden_states, pending, None, not self.training
+        )[1]
 
 
 # Same-input projections fused along the output rows: (module, fused, parts)

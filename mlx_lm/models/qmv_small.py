@@ -74,23 +74,55 @@ inline void load16(const device T* p, thread float* v) {
 }
 
 inline float sigmoid_f(float g) { return 1.0f / (1.0f + metal::exp(-g)); }
+
+template <typename T>
+inline void store16(device T* p, const thread float* v) {
+  #pragma clang loop unroll(full)
+  for (int i = 0; i < 16; i++) p[i] = static_cast<T>(v[i]);
+}
+
+// mx.sum over the slot rows of a residual: col_reduce_small's order in the input type
+template <typename T>
+inline T res_sum(const device T* rr, int j, int K, int rows) {
+  const int L = min(8, rows);
+  T tot = T(0.0f);
+  for (int y = 0; y < L; y++) {
+    T t = T(0.0f);
+    for (int r = y; r < rows; r += L) t = rr[(size_t)r * K + j] + t;
+    tot = (y == 0) ? t : t + tot;
+  }
+  return tot;
+}
 """
 
 _PREP_INPUTS = {
     "copy": ["x"],
-    "rms_norm": ["x", "weight"],
+    "rms_norm": ["x", "res", "weight", "has_res", "res_rows"],
     "swiglu": ["x"],
     "gate": ["x", "gate"],
     "gated_norm": ["x", "gate", "weight"],
 }
 
 
+def _load_x(cidx, store=False):
+    """Load chunk ``cidx`` of row ``m`` of x into ``xx``; with ``has_res`` add the residual
+    (its ``res_rows`` slot rows summed as mx.sum does) as the ops do."""
+    return f"""
+      float xx[16];
+      load16(x + (size_t)m * K + ({cidx}) * 16, xx);
+      if (has_res) {{
+        const device T* rr = res + (size_t)m * res_rows * K + ({cidx}) * 16;
+        {_UNROLL}
+        for (int i = 0; i < 16; i++) xx[i] = float(T(xx[i] + float(res_sum(rr, i, K, res_rows))));
+        {"store16(h + (size_t)m * K + (" + cidx + ") * 16, xx);" if store else ""}
+      }}"""
+
+
 def _values(kind, dst, cidx, rs):
     """Code that computes the 16 values of chunk ``cidx`` of row ``m`` into ``dst`` (floats)."""
     if kind == "rms_norm":
-        return f"""
-      float xx[16], ww[16];
-      load16(x + (size_t)m * K + ({cidx}) * 16, xx);
+        return f"""{_load_x(cidx, store=True)}
+      float ww[16];
       load16(weight + ({cidx}) * 16, ww);
       {_UNROLL}
       for (int i = 0; i < 16; i++) {{
@@ -107,15 +139,15 @@ def _values(kind, dst, cidx, rs):
     if kind == "gate":
         return f"""
       float gg[16];
-      load16(x + (size_t)m * K + ({cidx}) * 16, {dst});
-      load16(gate + (size_t)m * K + ({cidx}) * 16, gg);
+      load16(x + xoff(m, {cidx}), {dst});
+      load16(gate + goff(m, {cidx}), gg);
       {_UNROLL}
       for (int i = 0; i < 16; i++) {dst}[i] *= sigmoid_f(gg[i]);"""
     if kind == "gated_norm":
         return f"""
       float xx[16], gg[16], ww[16];
       load16(x + (size_t)m * K + ({cidx}) * 16, xx);
-      load16(gate + (size_t)m * K + ({cidx}) * 16, gg);
+      load16(gate + (size_t)m * GS + GO + ({cidx}) * 16, gg);
       load16(weight + (({cidx}) * 16) % D, ww);
       float ssh = 0.0f;
       {_UNROLL}
@@ -138,9 +170,8 @@ def _scan(kind):
     by max|x|; gated_norm bounds |x * rs * w * silu(z)| by sqrt(D) * max|w| * max|z|.
     """
     if kind == "rms_norm":
-        return """
-        float xx[16], ww[16];
-        load16(x + (size_t)m * K + c2 * 16, xx);
+        return _load_x("c2") + """
+        float ww[16];
         load16(weight + c2 * 16, ww);
         {_UNROLL}
         for (int i = 0; i < 16; i++) {
@@ -160,7 +191,7 @@ def _scan(kind):
     if kind == "gated_norm":
         return """
         float gg[16], ww[16];
-        load16(gate + (size_t)m * K + c2 * 16, gg);
+        load16(gate + (size_t)m * GS + GO + c2 * 16, gg);
         load16(weight + (c2 * 16) % D, ww);
         {_UNROLL}
         for (int i = 0; i < 16; i++) {
@@ -170,7 +201,7 @@ def _scan(kind):
     # copy and gate: max|x|
     return """
         float xx[16];
-        load16(x + (size_t)m * K + c2 * 16, xx);
+        load16(x + xoff(m, c2), xx);
         {_UNROLL}
         for (int i = 0; i < 16; i++) amax = max(amax, fabs(xx[i]));"""
 
@@ -185,7 +216,7 @@ def _prep_segments(K):
     return -(-(K // 16) // _scan_threads(K))
 
 
-def _prep_source(K, M, kind, eps=0.0, D=0, natural=False):
+def _prep_source(K, M, kind, eps=0.0, D=0, natural=False, gs=0, go=0, attn=None):
     """NT threads per 16 * NT values of one row: producer op in fp32, row scale, fp16 store.
 
     Every threadgroup of a row first scans the whole row with all its threads for a bound
@@ -194,7 +225,10 @@ def _prep_source(K, M, kind, eps=0.0, D=0, natural=False):
     (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(gate)),
     "gated_norm" (per-head RMSNorm over D values times silu(gate)).
     ``natural`` stores the 16 values in k order (for the tensor-op kernel) instead of the
-    nibble-pair order of ``qmv_small``.
+    nibble-pair order of ``qmv_small``. rms_norm adds ``res`` to x first when ``has_res`` is
+    set (and stores the sum in ``h``); ``gs`` and ``go`` locate ``gate`` inside a wider row.
+    ``attn`` = (L, H, Dh, QW) reads x as the attention output (B, H, L, Dh) and the gate of
+    head h at column 2 * h * Dh + Dh of the (rows, QW) projection.
     """
     Mp = 0 if natural else _mp(M)  # the natural-order source is the same for every M
     NT = _scan_threads(K)
@@ -241,8 +275,19 @@ def _prep_source(K, M, kind, eps=0.0, D=0, natural=False):
       if ((c & 3) == 0) xsum[m * (K / 64) + c / 4] = s;"""
     else:
         xsum_store = "xsum[c * Mp + m] = s * sc;"
+    if attn:
+        L, H, Dh, QW = attn
+        offs = f"""
+    constexpr int AL = {L}, AH = {H}, ADH = {Dh}, AQW = {QW};
+    #define xoff(m, c) ((((size_t)((m) / AL) * AH + ((c) * 16) / ADH) * AL + (m) % AL) * ADH + ((c) * 16) % ADH)
+    #define goff(m, c) ((size_t)(m) * AQW + (((c) * 16) / ADH) * 2 * ADH + ADH + ((c) * 16) % ADH)"""
+    else:
+        offs = """
+    #define xoff(m, c) ((size_t)(m) * K + (size_t)(c) * 16)
+    #define goff(m, c) ((size_t)(m) * K + (size_t)(c) * 16)"""
     return f"""
     constexpr int K = {K}, Mp = {Mp}, NT = {NT}, NIT = {NIT}, NSEG = NIT, D = {D}, TPH = D / 16;
+    constexpr int GS = {gs or K}, GO = {go};{offs}
     constexpr float EPS = {float(eps)!r}f;
     const int m = threadgroup_position_in_grid.x / NSEG;
     const int seg = threadgroup_position_in_grid.x % NSEG;
@@ -405,31 +450,60 @@ class Prepped:
         self.ndim = len(shape)
 
 
-def prep(x, kind="copy", *extra, eps=0.0, d=0, shape=None, natural=False):
-    """Convert ``x`` (M, K) [(M, 2K) for swiglu] plus the ``extra`` inputs of ``kind`` into a ``Prepped``."""
-    M, K = x.shape
+def prep(
+    x,
+    kind="copy",
+    *extra,
+    eps=0.0,
+    d=0,
+    shape=None,
+    natural=False,
+    residual=None,
+    gs=0,
+    go=0,
+    attn=None,
+):
+    """Convert ``x`` (M, K) [(M, 2K) for swiglu] plus the ``extra`` inputs of ``kind`` into a ``Prepped``.
+
+    With ``residual`` (rms_norm only) x + residual is normed and returned as ``p.h``.
+    ``gs`` and ``go`` locate the gate of gated_norm inside a wider array; ``attn`` =
+    (L, H, Dh, QW) is the attention layout of the gate prep (see ``_prep_source``).
+    """
+    if attn:
+        M, K = x.size // (attn[1] * attn[2]), attn[1] * attn[2]
+    else:
+        M, K = x.shape
     if kind == "swiglu":
         K //= 2
     Mp = _mp(M)
+    outputs = ["x16", "xsum", "rscale"]
+    if kind == "rms_norm":
+        # One kernel serves both cases: the add is switched at run time
+        res, rows = residual if isinstance(residual, tuple) else (residual, 1)
+        extra = (x if res is None else res, *extra, int(res is not None), rows)
+        outputs.append("h")
     # The natural-order prep does not depend on M: one kernel per shape and kind.
     kern = _kernel(
         "qmv_small_prep_" + kind + ("_nat" if natural else ""),
-        (K, 0 if natural else M, eps, d, _tag(x.dtype), natural),
-        lambda: _prep_source(K, M, kind, eps, d, natural),
+        (K, 0 if natural else M, eps, d, _tag(x.dtype), natural, gs, go, attn),
+        lambda: _prep_source(K, M, kind, eps, d, natural, gs, go, attn),
         _PREP_INPUTS[kind],
-        ["x16", "xsum", "rscale"],
+        outputs,
         _HEADER,
     )
-    x16, xsum, rscale = kern(
+    x16, xsum, rscale, *h = kern(
         inputs=[x, *extra],
         template=[("T", x.dtype)],
         grid=(_scan_threads(K) * _prep_segments(K) * M, 1, 1),
         threadgroup=(_scan_threads(K), 1, 1),
-        output_shapes=[(M, K), (M, K // 64) if natural else (K // 16, Mp), (Mp,)],
-        output_dtypes=[mx.float16, mx.float32, mx.float32],
+        output_shapes=[(M, K), (M, K // 64) if natural else (K // 16, Mp), (Mp,)]
+        + ([(M, K)] if kind == "rms_norm" else []),
+        output_dtypes=[mx.float16, mx.float32, mx.float32]
+        + ([x.dtype] if kind == "rms_norm" else []),
     )
     p = Prepped(x16, xsum, rscale, shape or (M, K), x.dtype)
     p.natural = natural
+    p.h = h[0] if residual is not None else None
     return p
 
 
@@ -572,22 +646,30 @@ def prep_swiglu(gate_up, module) -> "Prepped | None":
     return prep(gate_up.reshape(-1, k2), "swiglu", shape=shape, natural=_nax_m(_rows(shape)))
 
 
-def prep_gate(x, gate, module) -> "Prepped | None":
-    """``x * sigmoid(gate)`` prepped for ``module``, or None when it does not route."""
-    if not routes(module, x.shape, x.dtype):
+def prep_gate(x, gate, module, attn=None) -> "Prepped | None":
+    """``x * sigmoid(gate)`` prepped for ``module``, or None when it does not route.
+
+    With ``attn`` = (L, H, Dh, QW), ``x`` is the attention output (B, H, L, Dh) and ``gate``
+    the (rows, QW) projection holding the gate of head h at column 2 * h * Dh + Dh.
+    """
+    if attn:
+        B, H, L, Dh = x.shape
+        shape = (B, L, H * Dh)
+    else:
+        shape = tuple(x.shape)
+        gate = gate.reshape(-1, shape[-1])
+    if not routes(module, shape, x.dtype):
         return None
-    k = x.shape[-1]
-    return prep(
-        x.reshape(-1, k),
-        "gate",
-        gate.reshape(-1, k),
-        shape=tuple(x.shape),
-        natural=_nax_m(_rows(x.shape)),
-    )
+    if attn:
+        return prep(x, "gate", gate, shape=shape, natural=_nax_m(_rows(shape)), attn=attn)
+    return prep(x.reshape(-1, shape[-1]), "gate", gate, shape=shape, natural=_nax_m(_rows(shape)))
 
 
-def prep_gated_norm(norm, x, gate, module) -> "Prepped | None":
-    """``norm(x, gate)`` (per-head RMSNorm times silu(gate)) prepped for ``module``, or None."""
+def prep_gated_norm(norm, x, gate, module, gate_offset=0) -> "Prepped | None":
+    """``norm(x, gate)`` (per-head RMSNorm times silu(gate)) prepped for ``module``, or None.
+
+    ``gate`` is (rows, width) with the gate of a row at column ``gate_offset``.
+    """
     *batch, heads, d = x.shape
     shape = (*batch, heads * d)
     k = heads * d
@@ -598,12 +680,14 @@ def prep_gated_norm(norm, x, gate, module) -> "Prepped | None":
     return prep(
         x.reshape(-1, k),
         "gated_norm",
-        gate.reshape(-1, k),
+        gate,
         norm.weight,
         eps=norm.eps,
         d=d,
         shape=shape,
         natural=_nax_m(_rows(shape)),
+        gs=gate.shape[-1],
+        go=gate_offset,
     )
 
 
