@@ -4,9 +4,10 @@
 
 The (token, slot) pairs of a step are token-major, ``P = M * (top_k + 1)`` pairs, and
 slot ``top_k`` is the shared expert stored as the last expert of the weights. The prep
-kernel of x also builds a plan: for each distinct expert its id, its row count and up to
-M pair indices. The gather kernel runs one threadgroup per (plan slot, N tile), so the
-rows that share an expert read and dequantize its weights once. The down projection
+kernel of x also picks each token's top-k experts. The gather kernel runs one threadgroup
+per (plan slot, N tile), where plan slot d is the d-th distinct expert of the pairs (each
+threadgroup derives its slot from the indices), so the rows that share an expert read and
+dequantize its weights once. The down projection
 scales each row by its routing score in the epilogue (softmax over the token's top-k
 logits, sigmoid of the shared gate logit) and the block output is the sum over the slots.
 """
@@ -76,56 +77,26 @@ def _supported(block, projs, x):
     return projs[0].input_dims == k
 
 
-def _plan_source(M, S, TOPK, ESHARED, LW):
-    """Appended to the prep kernel: threadgroup 0 picks the experts and builds the plan.
+def _topk_source(TOPK, ESHARED, LW):
+    """Appended to the prep kernel: the first threadgroup of a token picks its experts.
 
-    The top-k of a token's logits is mx.argpartition's: the k largest in ascending order,
-    ties in index order. Pair t is a "first" when no earlier pair has its expert. Slot d of
-    the plan holds [expert, count, pair_0 .. pair_{M-1}] for the d-th first pair; later
-    slots count 0.
+    The top-k of the logits is mx.argpartition's: the k largest in ascending order, ties in
+    index order (each thread ranks one expert against all).
     """
     return f"""
-    {{
-      constexpr int PT = {M} * {S}, PW = {M} + 2, E = {ESHARED}, LW = {LW}, TK = {TOPK};
-      threadgroup uint ex[PT];
-      threadgroup int first[PT];
+    if (seg == 0) {{
+      constexpr int E = {ESHARED}, LW = {LW}, TK = {TOPK};
       threadgroup float lg[E];
-      threadgroup int tk[{M} * TK];
-      if (threadgroup_position_in_grid.x == 0) {{
-        for (int mm = 0; mm < {M}; mm++) {{
-          for (int j = t; j < E; j += NT) lg[j] = float(logits[mm * LW + j]);
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          for (int j = t; j < E; j += NT) {{
-            const float v = lg[j];
-            int pos = 0;
-            for (int i = 0; i < E; i++) pos += (lg[i] < v) || (lg[i] == v && i < j);
-            if (pos >= E - TK) {{ tk[mm * TK + pos - (E - TK)] = j; inds[mm * TK + pos - (E - TK)] = j; }}
-          }}
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int j = t; j < E; j += NT) lg[j] = float(logits[m * LW + j]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int j = t; j < E; j += NT) {{
+        const float v = lg[j];
+        int pos = 0;
+        for (int i = 0; i < E; i += 4) {{
+          pos += (lg[i] < v) + (lg[i + 1] < v) + (lg[i + 2] < v) + (lg[i + 3] < v);
         }}
-        if (t < PT) ex[t] = (t % {S} < TK) ? uint(tk[(t / {S}) * TK + t % {S}]) : uint(E);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (t < PT) {{
-          int f = 1;
-          for (int q = 0; q < t; q++) f &= (ex[q] != ex[t]);
-          first[t] = f;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (t < PT) {{
-          int d = 0, D = 0;
-          for (int q = 0; q < PT; q++) {{
-            D += first[q];
-            d += (q < t) ? first[q] : 0;
-          }}
-          if (first[t]) {{
-            const uint e = ex[t];
-            int c = 0;
-            for (int q = t; q < PT; q++) if (ex[q] == e) {{ if (c < {M}) plan[d * PW + 2 + c] = q; c++; }}
-            plan[d * PW] = int(e);
-            plan[d * PW + 1] = c;
-          }}
-          if (t >= D) plan[t * PW + 1] = 0;
-        }}
+        for (int i = 0; i < j; i++) pos += (lg[i] == v);
+        if (pos >= E - TK) inds[m * TK + pos - (E - TK)] = j;
       }}
     }}
 """
@@ -133,42 +104,40 @@ def _plan_source(M, S, TOPK, ESHARED, LW):
 
 def _prep(x, kind, logits=None, m=0, top_k=0, eshared=0):
     """``qmv_small``'s prep of (rows, K) x; with ``logits`` (m, E + 1) also the top-k expert
-    indices (m * top_k,) and the plan of the m tokens' pairs."""
+    indices (m * top_k,) of the m tokens."""
     M, K = x.shape
     if kind == "swiglu":
         K //= 2
     Mp = _mp(M)
     S = top_k + 1
-    plan = logits is not None
-    LW = logits.shape[-1] if plan else 0
+    topk = logits is not None
+    LW = logits.shape[-1] if topk else 0
 
     def source():
         src = _prep_source(K, M, kind)
-        return src + _plan_source(m, S, top_k, eshared, LW) if plan else src
+        return src + _topk_source(top_k, eshared, LW) if topk else src
 
-    key = ("prep", kind, plan, K, M, _tag(x.dtype), m, top_k, eshared, LW)
+    key = ("prep", kind, topk, K, M, _tag(x.dtype), m, top_k, eshared, LW)
     call = _calls.get(key)
     if call is None:
         kern = _kernel(
-            "moe_small_prep_" + kind + ("_plan" if plan else ""),
+            "moe_small_prep_" + kind + ("_topk" if topk else ""),
             key[3:],
             source,
-            ["x"] + (["logits"] if plan else []),
-            ["x16", "xsum", "rscale"] + (["inds", "plan"] if plan else []),
+            ["x"] + (["logits"] if topk else []),
+            ["x16", "xsum", "rscale"] + (["inds"] if topk else []),
             _HEADER,
         )
         kwargs = dict(
             template=[("T", x.dtype)],
             grid=(_scan_threads(K) * _prep_segments(K) * M, 1, 1),
             threadgroup=(_scan_threads(K), 1, 1),
-            output_shapes=[(M, K), (K // 16, Mp), (Mp,)]
-            + ([(m * top_k,), (m * S, m + 2)] if plan else []),
-            output_dtypes=[mx.float16, mx.float32, mx.float32]
-            + ([mx.int32, mx.int32] if plan else []),
+            output_shapes=[(M, K), (K // 16, Mp), (Mp,)] + ([(m * top_k,)] if topk else []),
+            output_dtypes=[mx.float16, mx.float32, mx.float32] + ([mx.int32] if topk else []),
         )
         call = _calls[key] = (kern, kwargs)
     kern, kwargs = call
-    return kern(inputs=[x] + ([logits] if plan else []), **kwargs)
+    return kern(inputs=[x] + ([logits] if topk else []), **kwargs)
 
 
 def _body(c, R, MC):
@@ -268,25 +237,55 @@ def _score_source(LW):
 """
 
 
-def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW):
+def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW, ESH):
     NB = K // _KSTEP
     cases = "\n".join(
         f"      case {c}: {{{_body(c, R, MC)}      break; }}" for c in range(1, M + 1)
     )
     return f"""
     constexpr int M = {M}, N = {N}, K = {K}, R = {R}, NSG = {NSG}, VPL = {_VPL}, Mp = {Mp}, MC = {MC};
-    constexpr int TOPK = {TOPK}, S = {S}, RDIV = {RDIV}, PW = M + 2;
+    constexpr int TOPK = {TOPK}, S = {S}, RDIV = {RDIV}, PW = M + 2, ESH = {ESH};
     constexpr int KW = K / 8, KG = K / 64, NB = {NB}, NTILE = N / (R * NSG);
     const int tg = threadgroup_position_in_grid.x;
-    const device int* pl = plan + (tg / NTILE) * PW;
+    const int lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    // Plan slot d = tg / NTILE: the d-th distinct expert of the token-major pairs (a pair's
+    // slot TOPK is the shared expert) and the pairs that use it.
+    constexpr int PT = M * S;
+    threadgroup uint exs[PT];
+    threadgroup int firsts[PT];
+    threadgroup int pl[PW];
+    if (sg == 0) {{
+      for (int q = lane; q < PT; q += 32)
+        exs[q] = (q % S < TOPK) ? uint(inds[(q / S) * TOPK + q % S]) : uint(ESH);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (int q = lane; q < PT; q += 32) {{
+        int f = 1;
+        for (int p = 0; p < q; p++) f &= (exs[p] != exs[q]);
+        firsts[q] = f;
+      }}
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      if (lane == 0) {{
+        const int want = tg / NTILE;
+        int seen = 0, mine = -1;
+        for (int p = 0; p < PT; p++) {{ if (firsts[p] && seen == want) mine = p; seen += firsts[p]; }}
+        pl[1] = 0;
+        if (mine >= 0) {{
+          const uint e = exs[mine];
+          int cnt = 0;
+          for (int p = mine; p < PT; p++) if (exs[p] == e) {{ if (cnt < M) pl[2 + cnt] = p; cnt++; }}
+          pl[0] = int(e);
+          pl[1] = cnt;
+        }}
+      }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const int c = pl[1];
     if (c == 0) return;
     const uint e = uint(pl[0]);
     int prow[M], xrow[M];
     {_UNROLL}
     for (int m = 0; m < M; m++) {{ prow[m] = pl[2 + min(m, c - 1)]; xrow[m] = prow[m] / RDIV; }}
-    const int lane = thread_index_in_simdgroup;
-    const int sg = simdgroup_index_in_threadgroup;
     const int row0 = ((tg % NTILE) * NSG + sg) * R;
     const device uint32_t* wp = w + ((size_t)e * N + row0) * KW + lane * 2;
     const device T* sp = scales + ((size_t)e * N + row0) * KG + lane / 4;
@@ -314,7 +313,7 @@ def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW):
 """
 
 
-def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
+def _gather(prepped, proj, inds, m, top_k, eshared, tokens, logits=None):
     """y (P, N): every pair's expert matvec; the x rows are tokens (``tokens``) or pairs."""
     x16, xsum, rscale = prepped
     w, scales, biases = proj.weight, proj.scales, proj.biases
@@ -325,24 +324,14 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     Mp = xsum.shape[1]
     RDIV = S if tokens else 1
     LW = logits.shape[-1] if logits is not None else 0
-    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype))
+    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, eshared, _tag(scales.dtype))
     call = _calls.get(key)
     if call is None:
         kern = _kernel(
             "moe_small_gather",
             key[1:],
-            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW),
-            [
-                "x16",
-                "xsum",
-                "rscale",
-                "plan",
-                "w",
-                "scales",
-                "biases",
-                "inds",
-                "logits",
-            ],
+            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, eshared),
+            ["x16", "xsum", "rscale", "w", "scales", "biases", "inds", "logits"],
             ["y"],
         )
         kwargs = dict(
@@ -356,9 +345,7 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     kern, kwargs = call
     # An unused input (scores of 1) reuses an existing array so no op is added
     logits = scales if logits is None else logits
-    (y,) = kern(
-        inputs=[x16, xsum, rscale, plan, w, scales, biases, inds, logits], **kwargs
-    )
+    (y,) = kern(inputs=[x16, xsum, rscale, w, scales, biases, inds, logits], **kwargs)
     return y
 
 
@@ -371,11 +358,11 @@ def experts(block, x, logits, slots=False):
     m = math.prod(batch)
     E, top_k = block.num_experts, block.top_k
     logits = logits.reshape(m, -1)
-    x16, xsum, rscale, inds, plan = _prep(x.reshape(m, K), "copy", logits, m, top_k, E)
+    x16, xsum, rscale, inds = _prep(x.reshape(m, K), "copy", logits, m, top_k, E)
     gu = _gather(
-        (x16, xsum, rscale), plan, block.switch_mlp.gate_up_proj, inds, m, top_k, True
+        (x16, xsum, rscale), block.switch_mlp.gate_up_proj, inds, m, top_k, E, True
     )
     h = _prep(gu, "swiglu")
-    y = _gather(h, plan, block.switch_mlp.down_proj, inds, m, top_k, False, logits)
+    y = _gather(h, block.switch_mlp.down_proj, inds, m, top_k, E, False, logits)
     y = y.reshape(*batch, top_k + 1, K)
     return y if slots else y.sum(axis=-2)

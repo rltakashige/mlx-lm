@@ -240,9 +240,33 @@ class TestMergedKernels(unittest.TestCase):
         logits[:, 77] = logits[:, 5]
         logits[:, 200] = logits[:, 9]
         x = (mx.random.normal((m, K)) * 2).astype(mx.bfloat16)
-        x16, xsum, rscale, inds, plan = moe_small._prep(x, "copy", logits, m, k, E)
+        x16, xsum, rscale, inds = moe_small._prep(x, "copy", logits, m, k, E)
         ref = mx.argpartition(logits[:, :E], kth=-k, axis=-1)[:, -k:].reshape(-1)
         self.assertTrue(mx.array_equal(inds, ref.astype(mx.int32)).item(), (inds, ref))
+        # The whole block (top-k, plan slots in the gather kernels, scores) against the ops
+        import sys
+
+        sys.path.insert(0, os.path.dirname(__file__))
+        from test_qwen3_5_fusion import MOE_CONFIG, _moe_block
+        from mlx.utils import tree_map
+
+        config = {**MOE_CONFIG, "hidden_size": 2048, "moe_intermediate_size": 512,
+                  "shared_expert_intermediate_size": 512, "num_experts": 16, "num_experts_per_tok": 8}
+        block = _moe_block(config, scale=0.05)
+        nn.quantize(block, 64, 4)
+        block.update(tree_map(lambda p: p.astype(mx.bfloat16) if p.dtype == mx.float32 else p, block.parameters()))
+        for mm in (1, 3, 8):
+            xx = mx.random.normal((1, mm, 2048)).astype(mx.bfloat16)
+            lg = block.gate(xx)
+            y = moe_small.experts(block, xx, lg).astype(mx.float32)
+            ys = moe_small.experts(block, xx, lg, slots=True)
+            self.assertTrue(mx.array_equal(ys.sum(axis=-2).astype(mx.float32), y).item())
+            from unittest import mock
+
+            with mock.patch.object(moe_small, "routes", return_value=False):
+                expected = block(xx).astype(mx.float32)
+            tol = 0.03 * mx.abs(expected).max().item()
+            self.assertLess(mx.abs(y - expected).max().item(), tol, mm)
         # residual slot rows
         for R, Kd in ((9, 2048), (3, 5120), (1, 2048)):
             norm = nn.RMSNorm(Kd, eps=1e-6)
