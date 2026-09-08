@@ -461,6 +461,9 @@ def load_model(
 
     if not lazy:
         mx.eval(model.parameters())
+        # Compile the model's custom kernels now, not inside the first generation
+        if hasattr(model, "warmup"):
+            model.warmup()
 
     return model, config
 

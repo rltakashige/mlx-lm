@@ -736,6 +736,30 @@ class TextModel(nn.Module):
             out = qlinear(self.lm_head, hidden)
         return (out, hidden) if return_hidden else out
 
+    def warmup(self, rows=(1, 2, 3, 4, 5, 6, 7, 8, 16, 32), siblings=(11, 6)):
+        """Compile the kernels of every verify row count on one layer of each kind
+        and the head, so a generation does not pay the JIT (see qmv_small)."""
+        if not mx.metal.is_available():
+            return
+        layers = list({l.is_linear: l for l in self.layers}.values())
+        cache = [ArraysCache(size=2) if l.is_linear else KVCache() for l in layers]
+        fa = next((c for c in cache if isinstance(c, KVCache)), None)
+        for s, chain in [(r, None) for r in rows] + [siblings]:
+            h = self.model.embed_tokens(mx.zeros((1, s), mx.uint32))
+            if chain:
+                fa_mask = create_sibling_mask(chain, s, fa.offset if fa else 0)
+            else:
+                fa_mask = create_attention_mask(h, fa)
+            pending = None
+            for layer, c in zip(layers, cache):
+                mask = create_ssm_mask(h, c) if layer.is_linear else fa_mask
+                h, pending = layer(h, mask, c, pending, split=True, chain=chain)
+            h = prep_add_rms_norm(self.model.norm, h, pending, None, True)[1]
+            if self.args.tie_word_embeddings:
+                mx.eval(self.model.embed_tokens.as_linear(h))
+            else:
+                mx.eval(qlinear(self.lm_head, h))
+
     @property
     def layers(self):
         return self.model.pipeline_layers
@@ -829,6 +853,9 @@ class Model(nn.Module):
     @property
     def model(self):
         return self.language_model.model
+
+    def warmup(self):
+        self.language_model.warmup()
 
     def sanitize(self, weights):
         sanitized = {}
