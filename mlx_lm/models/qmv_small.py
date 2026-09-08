@@ -233,8 +233,8 @@ def _prep_source(K, M, kind, eps=0.0, D=0, natural=False, gs=0, go=0, attn=None)
     ``natural`` stores the 16 values in k order (for the tensor-op kernel) instead of the
     nibble-pair order of ``qmv_small``. rms_norm adds ``res`` to x first when ``has_res`` is
     set (and stores the sum in ``h``); ``gs`` and ``go`` locate ``gate`` inside a wider row.
-    ``attn`` = (L, H, Dh, QW) reads x as the attention output (B, H, L, Dh) and the gate of
-    head h at column 2 * h * Dh + Dh of the (rows, QW) projection.
+    ``attn`` = (H, Dh, QW) reads x as the attention output (B, H, L, Dh), L from its shape,
+    and the gate of head h at column 2 * h * Dh + Dh of the (rows, QW) projection.
     """
     Mp = 0 if natural else _mp(M)  # the natural-order source is the same for every M
     NT = _scan_threads(K)
@@ -282,9 +282,10 @@ def _prep_source(K, M, kind, eps=0.0, D=0, natural=False, gs=0, go=0, attn=None)
     else:
         xsum_store = "xsum[c * Mp + m] = s * sc;"
     if attn:
-        L, H, Dh, QW = attn
+        H, Dh, QW = attn
         offs = f"""
-    constexpr int AL = {L}, AH = {H}, ADH = {Dh}, AQW = {QW};
+    const int AL = x_shape[2];
+    constexpr int AH = {H}, ADH = {Dh}, AQW = {QW};
     #define xoff(m, c) ((((size_t)((m) / AL) * AH + ((c) * 16) / ADH) * AL + (m) % AL) * ADH + ((c) * 16) % ADH)
     #define goff(m, c) ((size_t)(m) * AQW + (((c) * 16) / ADH) * 2 * ADH + ADH + ((c) * 16) % ADH)"""
     else:
@@ -477,6 +478,8 @@ def prep(
     """
     if attn:
         M, K = x.size // (attn[1] * attn[2]), attn[1] * attn[2]
+        # The kernel reads L from the shape of x: one kernel for every row count
+        attn = attn[1:]
     else:
         M, K = x.shape
     if kind == "swiglu":
