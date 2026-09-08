@@ -380,6 +380,12 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def move_row(self, src, dst):
+        """Copy the row ``src`` onto ``dst`` (indices from the end of the cache)."""
+        src, dst = self.offset - src, self.offset - dst
+        self.keys[..., dst, :] = self.keys[..., src, :]
+        self.values[..., dst, :] = self.values[..., src, :]
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
@@ -702,10 +708,11 @@ class ArraysCache(_BaseCache):
     def is_trimmable(self):
         return self.keep_states
 
-    def stage(self, steps):
-        """Build the state after ``steps`` steps before the trim count is known."""
+    def stage(self, steps, extra=None):
+        """Build the state after the first ``steps`` rows of the last forward and
+        the row ``extra`` (a sibling row, -1 for none) before the trim count is known."""
         if self.rollback is not None:
-            self.staged = self.rollback(steps)
+            self.staged = self.rollback(steps, extra)
 
     def trim(self, n):
         if self.rollback is None:
@@ -714,8 +721,7 @@ class ArraysCache(_BaseCache):
         n = min(n, T - 1)
         if n:
             state = self.staged if self.staged is not None else self.rollback(T - n)
-            self[1] = state
-            self[0] = self.conv_input[:, T - n : self.conv_input.shape[1] - n]
+            self[1], self[0] = state
             self.advance(-n)
         self.rollback = self.staged = self.conv_input = None
         return n

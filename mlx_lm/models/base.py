@@ -55,6 +55,16 @@ def create_attention_mask(
     return "causal"
 
 
+def create_sibling_mask(chain: int, rows: int, offset: int = 0):
+    """Mask of ``chain`` causal rows followed by siblings of chain rows 1..: a
+    sibling attends to the past, to the chain rows before its position and to itself."""
+    S = rows
+    r = mx.arange(S)[:, None]
+    c = mx.arange(S)[None]
+    block = mx.where(r < chain, c <= r, (c < r - chain + 1) | (c == r))
+    return mx.concatenate([mx.ones((S, offset), mx.bool_), block], axis=1)
+
+
 def create_ssm_mask(h, cache=None):
     if cache and hasattr(cache, "make_mask"):
         return cache.make_mask(h.shape[1])

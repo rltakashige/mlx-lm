@@ -4,8 +4,9 @@ Re-runs the loop of ``speculative_generate_step`` for an MTP head with an
 ``mx.eval`` and a wall clock around every phase, so the per-cycle cost splits
 into draft steps, the verify forward, host readback, cache rollback and the
 Python remainder. Greedy sampling only. The draft stop rule, the candidate-set
-head and its fallback follow ``speculative_generate_step``; ``--check-candidates``
-also runs the full head on every candidate draft and counts the misses.
+head, its fallback and the sibling rows follow ``speculative_generate_step``;
+``--check-candidates`` also runs the full head on every candidate draft and
+counts the misses.
 
     python bench/mtp_profile.py --model <target> --draft-model <sidecar|bundled> \\
         --num-draft-tokens 2 --prompt "text" --max-tokens 128 [--verify-layers] [--json out.json]
@@ -21,6 +22,7 @@ import mlx.core as mx
 from layer_profile import Timer, kind
 
 from mlx_lm import load
+from mlx_lm.generate import sibling_rows
 from mlx_lm.models.cache import ArraysCache, make_prompt_cache, trim_prompt_cache
 from mlx_lm.models.qwen3_5_mtp import load_bundled
 
@@ -85,6 +87,7 @@ def run(
     candidates=0,
     fallback=0.0,
     check=False,
+    siblings=False,
 ):
     draft.bind(model)
     cache, draft_cache = make_prompt_cache(model), draft.make_cache()
@@ -115,7 +118,7 @@ def run(
         if cands is not None:
             head = phase("cand_build", lambda: cands.make_head(*recent))
             stats["cand_size"] += head.ids.size
-        drafts, hd, ps, q, i = [], hidden, [], 1.0, 0
+        drafts, alts, hd, ps, q, i = [], [], hidden, [], 1.0, 0
         while i < k:
             inp = draft_y[None] if i == 0 else drafts[-1][None]
             logits, hd_new = phase(
@@ -140,7 +143,14 @@ def run(
                     full = phase("fallback", lambda: draft.lm_head(hd_new)[0, -1])
                     tok = mx.argmax(full, keepdims=True).astype(mx.uint32)
                     p = mx.max(mx.softmax(full.astype(mx.float32)))
-            mx.eval(tok, p)
+            if siblings:
+                # The second choice is the sibling row of this position
+                src = full if (fallback and margin < fallback) else l
+                alt = mx.argmax(mx.put_along_axis(src, mx.argmax(src, keepdims=True), mx.array(-mx.inf), -1), keepdims=True)
+                if head is not None and src is l:
+                    alt = head.ids[alt]
+                alts.append(alt.astype(mx.uint32))
+            mx.eval(tok, p, *alts[-1:])
             drafts.append(tok)
             ps.append(p.item())
             hd = hd_new
@@ -150,15 +160,19 @@ def run(
                 if q < stop:
                     trim_prompt_cache(draft_cache, 1)
                     drafts.pop()
+                    alts = alts[: len(drafts)]
                     break
             i += 1
         kd = len(drafts)
+        n_sib = sibling_rows(kd) if siblings else 0
+        chain = kd + 1 if n_sib else None
         draft_tokens = mx.concatenate(drafts) if drafts else mx.array([], mx.uint32)
-        inputs = mx.concatenate([y, draft_tokens])
+        inputs = mx.concatenate([y, draft_tokens] + ([mx.concatenate(alts[:n_sib])] if chain else []))
         rows = inputs.size
 
         logits, hidden_out = phase(
-            "verify", lambda: model(inputs[None], cache=cache, return_hidden=True)
+            "verify",
+            lambda: model(inputs[None], cache=cache, return_hidden=True, chain=chain),
         )
         tokens = phase("sample", lambda: argmax_tokens(logits[:, -rows:]))
         if cands is not None:
@@ -170,7 +184,11 @@ def run(
             n += 1
         for i in range(n):
             accepted_at[i] += 1
-        got = t[: n + 1]
+        sib = bool(chain) and n < n_sib and alts[n].item() == t[n]
+        stats["sib_tries"] += int(bool(chain) and n < n_sib)
+        stats["sib_rows"] += n_sib
+        stats["sib_hits"] += int(sib)
+        got = t[: n + 1] + ([t[chain + n]] if sib else [])
         tokens_out += got
         produced += len(got)
         cycles += 1
@@ -179,18 +197,30 @@ def run(
         y = draft_y = mx.array(got[-1:], mx.uint32)
         if n == kd:
             draft_y = mx.concatenate([mx.array(d[-1:], mx.uint32), y])
-        hidden = hidden_out[:, n + 1 - draft_y.size : n + 1]
+            hidden = hidden_out[:, n - 1 : n + 1]
+        elif sib:
+            draft_y = mx.concatenate([mx.array(t[n : n + 1], mx.uint32), y])
+            hidden = mx.concatenate(
+                [hidden_out[:, n : n + 1], hidden_out[:, chain + n : chain + n + 1]], axis=1
+            )
+        else:
+            hidden = hidden_out[:, n : n + 1]
         if cands is not None:
             cands.extend(mx.array(got, mx.uint32))
             recent = (draft_tokens, tokens)
-        phase(
-            "rollback",
-            lambda: (
-                trim_prompt_cache(cache, kd - n),
-                trim_prompt_cache(draft_cache, max(kd - n - 1, 0)),
-            ),
-            [],
-        )
+        keep = 1 + n + int(sib)
+
+        def rollback():
+            if sib:
+                for c in cache:
+                    if isinstance(c, ArraysCache):
+                        c.stage(n + 1, chain + n)
+                    else:
+                        c.move_row(rows - chain - n, rows - n - 1)
+            trim_prompt_cache(cache, rows - keep)
+            trim_prompt_cache(draft_cache, max(kd - n - 1, 0))
+
+        phase("rollback", rollback, [])
         phase.times["cycle"] += time.perf_counter() - cycle_tic
         phase.counts["cycle"] += 1
     run.stats = stats
@@ -217,6 +247,7 @@ def main():
     ap.add_argument("--draft-stop-prob", type=float, default=0.0)
     ap.add_argument("--draft-candidates", type=int, default=0)
     ap.add_argument("--draft-fallback-margin", type=float, default=0.0)
+    ap.add_argument("--draft-siblings", action="store_true")
     ap.add_argument(
         "--check-candidates",
         action="store_true",
@@ -252,6 +283,7 @@ def main():
         candidates=args.draft_candidates,
         fallback=args.draft_fallback_margin,
         check=args.check_candidates,
+        siblings=args.draft_siblings,
     )
     k = args.num_draft_tokens
     warm_shapes(model, prompt, 2 * k + 1 if args.draft_siblings else k + 1)
@@ -312,6 +344,12 @@ def main():
         f"drafts per cycle {stats['drafted'] / cycles:.2f}, accepted per position "
         + "/".join(f"{accepted_at[i] / cycles:.2f}" for i in range(k))
     )
+    if stats["sib_tries"]:
+        print(
+            f"sibling rows: {stats['sib_tries']} rejections, {stats['sib_hits']} held the correction "
+            f"({stats['sib_hits'] / stats['sib_tries']:.2f}), {stats['sib_hits'] / cycles:.2f} extra tokens per cycle, "
+            f"{stats['sib_rows'] / cycles:.2f} sibling rows per cycle"
+        )
     if stats["cand_steps"]:
         print(
             f"candidate drafts {stats['cand_steps']}, |C| mean {stats['cand_size'] / cycles:.0f}, "

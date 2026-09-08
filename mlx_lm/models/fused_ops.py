@@ -114,6 +114,9 @@ def _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale):
     else {{ type = 2; h = slot - 2 * Hk; D = Dv; base = 2 * KD + h * Dv; }}
     const int c0 = lid * 4;
     const bool active = c0 < D;
+    // Rows past the first C rows are siblings of chain rows 1..: their conv
+    // window is the chain prefix of their position and the row itself.
+    const int tc = t >= C ? t - C + 1 : t;
     // Depthwise conv over [state; qkv] then silu, rounded like conv1d and nn.silu.
     T sv[4];
     float acc2 = 0.0f;
@@ -122,7 +125,7 @@ def _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale):
         const int c = base + c0 + i;
         float acc = 0.0f;
         for (int j = 0; j < KW; j++) {{
-          const int tt = t + j;
+          const int tt = j < KW - 1 ? tc + j : t + j;
           const T xv = tt < KW - 1 ? state_in[(size_t)(b * (KW - 1) + tt) * CD + c]
                                    : proj[(size_t)(b * S + tt - (KW - 1)) * PW + c];
           acc += static_cast<float>(xv) * w[c * KW + j];
@@ -146,10 +149,10 @@ def _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale):
       device T* o = v + ((size_t)m * Hv + h) * Dv + c0;
       for (int i = 0; i < 4; i++) o[i] = sv[i];
     }}
-    // The next conv state is the last KW - 1 rows of [state; qkv].
+    // The next conv state is the last KW - 1 rows of [state; chain rows].
     if (active && t == 0) {{
       for (int j = 0; j < KW - 1; j++) {{
-        const int tt = S + j;
+        const int tt = C + j;
         for (int i = 0; i < 4; i++) {{
           const int c = base + c0 + i;
           state_out[(size_t)(b * (KW - 1) + j) * CD + c] =
@@ -186,11 +189,12 @@ def gdn_in_ok(net, proj, mask, cache):
     )
 
 
-def gdn_in(net, proj, conv_state):
+def gdn_in(net, proj, conv_state, chain=None):
     """The GDN mixer inputs from the fused in_proj output ``proj`` (B, S, PW).
 
     Returns q, k (B, S, Hk, Dk) normalized and scaled, v (B, S, Hv, Dv), g (B, S, Hv)
-    float32, beta (B, S, Hv) and the next conv state (B, KW - 1, conv_dim).
+    float32, beta (B, S, Hv) and the next conv state (B, KW - 1, conv_dim). With
+    ``chain`` the rows past the first ``chain`` rows are siblings of chain rows 1..
     """
     B, S, PW = proj.shape
     Hk, Hv, Dk, Dv = net.num_k_heads, net.num_v_heads, net.head_k_dim, net.head_v_dim
@@ -204,12 +208,12 @@ def gdn_in(net, proj, conv_state):
         "gdn_in",
         (Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale, str(proj.dtype), str(net.A_log.dtype)),
         lambda: _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale),
-        ["proj", "state_in", "w", "A_log", "dt_bias", "S"],
+        ["proj", "state_in", "w", "A_log", "dt_bias", "S", "C"],
         ["q", "k", "v", "g", "beta", "state_out"],
         _HEADER,
     )
     return kern(
-        inputs=[proj, conv_state, net.conv1d.weight, net.A_log, net.dt_bias, S],
+        inputs=[proj, conv_state, net.conv1d.weight, net.A_log, net.dt_bias, S, chain or S],
         template=[("T", proj.dtype)],
         grid=(TG * (2 * Hk + Hv), B * S, 1),
         threadgroup=(TG, 1, 1),
@@ -388,7 +392,9 @@ def _attn_qkv_source(H, Hkv, Dh, RD, QW, TG, eps, log2base, scale):
     acc = rms_sum(acc, sums, thread_index_in_simdgroup, simdgroup_index_in_threadgroup);
     if (!active) return;
     const float inv = metal::precise::rsqrt(acc / Dh + EPS);
-    const float Lp = SCALE * static_cast<float>(l + offset);
+    // Rows past the first C rows are siblings of chain rows 1.. and share their positions
+    const int pos = l >= C ? l - C + 1 : l;
+    const float Lp = SCALE * static_cast<float>(pos + offset);
     for (int i = 0; i < 4; i++) {{
       const int d = c0 + i;
       const T n = w[d] * static_cast<T>(static_cast<float>(in[d]) * inv);
@@ -424,8 +430,11 @@ def attn_ok(attn, qkv, cache):
     )
 
 
-def attn_qkv(attn, qkv, offset):
-    """q (B, H, L, Dh) and k (B, Hkv, L, Dh) normalized and rotated, v (B, Hkv, L, Dh) from ``qkv``."""
+def attn_qkv(attn, qkv, offset, chain=None):
+    """q (B, H, L, Dh) and k (B, Hkv, L, Dh) normalized and rotated, v (B, Hkv, L, Dh) from ``qkv``.
+
+    With ``chain`` the rows past the first ``chain`` rows are siblings of chain rows 1..
+    """
     import math
 
     B, L, QW = qkv.shape
@@ -437,12 +446,12 @@ def attn_qkv(attn, qkv, offset):
         "attn_qkv",
         (H, Hkv, Dh, rope.dims, QW, TG, attn.q_norm.eps, log2base, rope.scale, str(qkv.dtype)),
         lambda: _attn_qkv_source(H, Hkv, Dh, rope.dims, QW, TG, attn.q_norm.eps, log2base, rope.scale),
-        ["qkv", "q_w", "k_w", "offset", "L"],
+        ["qkv", "q_w", "k_w", "offset", "L", "C"],
         ["q", "k", "v"],
         _HEADER,
     )
     return kern(
-        inputs=[qkv, attn.q_norm.weight, attn.k_norm.weight, offset, L],
+        inputs=[qkv, attn.q_norm.weight, attn.k_norm.weight, offset, L, chain or L],
         template=[("T", qkv.dtype)],
         grid=(TG * (H + 2 * Hkv), B * L, 1),
         threadgroup=(TG, 1, 1),

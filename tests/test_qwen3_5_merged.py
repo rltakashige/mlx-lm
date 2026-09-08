@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import os
+import copy
 import unittest
 
 os.environ.setdefault("MLX_ENABLE_TF32", "0")
@@ -264,6 +265,47 @@ class TestMergedKernels(unittest.TestCase):
         fused_ops._ENABLED = True
         for a, b in zip(*outs):
             self.assertTrue(mx.array_equal(a, b).item())
+
+    def test_sibling_rows_match_paths(self):
+        """The merged tree forward equals the ops tree forward bitwise; its chain
+        rows are those of a plain forward and each sibling row is the last row of
+        its chain path, up to the bf16 rounding of the masked attention kernel."""
+        model = _model()
+        mx.random.seed(4)
+        prompt = mx.random.randint(0, CONFIG["vocab_size"], (1, 12))
+        k = 3
+        rows = mx.random.randint(0, CONFIG["vocab_size"], (1, 2 * k + 1))
+        trees = []
+        for enabled in (True, False):
+            fused_ops._ENABLED = enabled
+            cache = make_prompt_cache(model)
+            mx.eval(model(prompt, cache=cache))
+            # The ArraysCache state is a list the forward mutates: restore copies
+            base = [copy.deepcopy(c.state) for c in cache]
+
+            def restore():
+                for c, st in zip(cache, base):
+                    c.state = copy.deepcopy(st)
+
+            tree = model(rows, cache=cache, chain=k + 1)
+            mx.eval(tree)
+            trees.append(tree)
+            restore()
+            plain = model(rows, cache=cache)
+            mx.eval(plain)
+            self.assertTrue(
+                mx.allclose(tree[:, : k + 1], plain[:, : k + 1], atol=0.1, rtol=0.05).item()
+            )
+            for i in range(1, k + 1):
+                restore()
+                ref = model(rows[:, list(range(i)) + [k + i]], cache=cache)
+                mx.eval(ref)
+                self.assertTrue(
+                    mx.allclose(tree[:, k + i], ref[:, -1], atol=0.1, rtol=0.05).item(),
+                    (enabled, i),
+                )
+        fused_ops._ENABLED = True
+        self.assertTrue(mx.array_equal(*trees).item())
 
 
 if __name__ == "__main__":

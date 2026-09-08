@@ -21,7 +21,11 @@ from mlx_lm.models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+from mlx_lm.models.gated_delta import (
+    gated_delta_kernel,
+    gated_delta_kernel_unpacked,
+    gated_delta_ops,
+)
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 from mlx_lm.utils import load_model
 
@@ -127,7 +131,8 @@ def _speculative(prompt, model, draft, max_tokens, **kwargs):
 
 
 class _OracleDrafter:
-    """Drafts the expected token, except at every third position."""
+    """Drafts the expected token, except at every third position where the
+    expected token is the second choice."""
 
     needs_hidden = True
 
@@ -151,8 +156,10 @@ class _OracleDrafter:
             (self.expected[q + 2] + (q % 3 == 2)) % self.vocab_size
             for q in range(start, start + S)
         ]
-        logits = (
-            mx.arange(self.vocab_size)[None, None] == mx.array(tokens)[None, :, None]
+        second = [self.expected[q + 2] % self.vocab_size for q in range(start, start + S)]
+        ids = mx.arange(self.vocab_size)[None, None]
+        logits = 2.0 * (ids == mx.array(tokens)[None, :, None]) + (
+            ids == mx.array(second)[None, :, None]
         )
         return logits.astype(mx.float32), hidden
 
@@ -189,6 +196,43 @@ class TestQwen3_5MTP(unittest.TestCase):
         _, s, states = gated_delta_ops(q, k, v, g, beta, state, return_states=True)
         self.assertEqual(states.shape, (B, T, Hv, Dv, Dk))
         self.assertTrue(mx.array_equal(states[:, -1], s))
+
+    def test_gated_delta_siblings(self):
+        if mx.default_device() != mx.gpu:
+            raise unittest.SkipTest("gated delta kernels are GPU only")
+        mx.random.seed(5)
+        B, k, Hk, Hv, Dk, Dv = 1, 3, 2, 4, 128, 128
+        T, chain = 2 * k + 1, k + 1
+
+        def normed(shape):
+            x = mx.fast.rms_norm(mx.random.normal(shape), None, 1e-6)
+            return (x * Dk**-0.5).astype(mx.bfloat16)
+
+        q, kk = normed((B, T, Hk, Dk)), normed((B, T, Hk, Dk))
+        v = mx.random.normal((B, T, Hv, Dv)).astype(mx.bfloat16)
+        g = mx.exp(-mx.random.uniform(shape=(B, T, Hv)) * 0.2)
+        beta = mx.random.uniform(shape=(B, T, Hv)).astype(mx.bfloat16)
+        state = mx.random.normal((B, Hv, Dv, Dk)) * 0.3
+        args = (q, kk, v, g, beta, state)
+        y_ops, s_ops = gated_delta_ops(*args, chain=chain)
+        for kernel in (gated_delta_kernel, gated_delta_kernel_unpacked):
+            y, s = kernel(*args, chain=chain)
+            self.assertTrue(mx.allclose(y, y_ops, atol=1e-2, rtol=1e-2))
+            self.assertTrue(mx.allclose(s, s_ops, atol=1e-3))
+            # The chain rows and the state are those of the chain alone
+            y_c, s_c = kernel(*[x[:, :chain] for x in args[:5]], state)
+            self.assertTrue(mx.array_equal(y[:, :chain], y_c))
+            self.assertTrue(mx.array_equal(s, s_c))
+            # Sibling i equals row i of the chain with the sibling in its place
+            for i in range(1, k + 1):
+                rows = list(range(i)) + [chain - 1 + i]
+                y_p, s_p = kernel(*[x[:, rows] for x in args[:5]], state)
+                self.assertTrue(mx.array_equal(y[:, chain - 1 + i], y_p[:, -1]), i)
+                # The rollback onto that path: i chain steps and the sibling as an extra step
+                _, s_e = kernel(*args, steps=i, extra=mx.array(chain - 1 + i))
+                self.assertTrue(mx.array_equal(s_e, s_p), i)
+            _, s_e = kernel(*args, steps=2, extra=mx.array(-1))
+            self.assertTrue(mx.array_equal(s_e, kernel(*[x[:, :2] for x in args[:5]], state)[1]))
 
     def test_arrays_cache_trim(self):
         for moe in (False, True):
@@ -245,6 +289,20 @@ class TestQwen3_5MTP(unittest.TestCase):
                         draft_stop_prob=stop,
                     )
                     self.assertEqual(tokens, expected)
+                # Sibling rows in the verify, alone and with candidate drafts
+                for k in (1, 2, 3):
+                    for cand in (0, 16):
+                        tokens, _ = _speculative(
+                            PROMPT,
+                            target,
+                            head,
+                            32,
+                            num_draft_tokens=k,
+                            draft_siblings=True,
+                            draft_candidates=cand,
+                            draft_stop_prob=0.5 if k == 3 else 0.0,
+                        )
+                        self.assertEqual(tokens, expected, (moe, tie, k, cand))
                 # Candidate-set drafts, with and without the full-head fallback
                 for cand, margin, stop in ((16, 0.0, 0.5), (16, 2.0, 0.5), (128, 0.0, 0.0)):
                     tokens, _ = _speculative(
@@ -328,6 +386,21 @@ class TestQwen3_5MTP(unittest.TestCase):
                 )
                 self.assertEqual(tokens, expected)
                 self.assertTrue(0 < sum(from_draft) < len(from_draft))
+                # The sibling rows hold the rejected positions: more tokens per cycle
+                tokens, sib_draft = _speculative(
+                    PROMPT,
+                    target,
+                    drafter,
+                    32,
+                    num_draft_tokens=k,
+                    prefill_step_size=4,
+                    draft_siblings=True,
+                )
+                self.assertEqual(tokens, expected)
+                # With k=2 the wrong positions fall on the corrections: no rejections
+                self.assertGreaterEqual(sum(sib_draft), sum(from_draft))
+                if k != 2:
+                    self.assertGreater(sum(sib_draft), sum(from_draft))
 
     def test_load_sidecar_and_bundled(self):
         for moe in (False, True):

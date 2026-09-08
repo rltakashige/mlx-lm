@@ -1,6 +1,5 @@
 # Copyright © 2026 Apple Inc.
 
-import functools
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -14,6 +13,7 @@ from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
+    create_sibling_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
@@ -109,7 +109,10 @@ class Attention(Qwen3NextAttention):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        chain: Optional[int] = None,
     ) -> mx.array:
+        """``chain``: the rows past the first ``chain`` rows are siblings of chain
+        rows 1.. (same positions), see ``create_sibling_mask``."""
         B, L, D = x.shape
         q_dim = 2 * self.num_attention_heads * self.head_dim
         kv_dim = self.num_key_value_heads * self.head_dim
@@ -118,7 +121,7 @@ class Attention(Qwen3NextAttention):
         fused = not self.training and fused_ops.attn_ok(self, qkv, cache)
         if fused:
             # One kernel: the q/k norms, the rope and the head layouts
-            queries, keys, values = fused_ops.attn_qkv(self, qkv, cache.offset)
+            queries, keys, values = fused_ops.attn_qkv(self, qkv, cache.offset, chain)
             keys, values = cache.update_and_fetch(keys, values)
         else:
             q_proj_output, keys, values = mx.split(qkv, [q_dim, q_dim + kv_dim], axis=-1)
@@ -135,13 +138,24 @@ class Attention(Qwen3NextAttention):
                 0, 2, 1, 3
             )
 
-            if cache is not None:
-                queries = self.rope(queries, offset=cache.offset)
-                keys = self.rope(keys, offset=cache.offset)
-                keys, values = cache.update_and_fetch(keys, values)
+            offset = cache.offset if cache is not None else 0
+            if chain is not None:
+                # The sibling rows take the positions of chain rows 1..
+                queries, keys = (
+                    mx.concatenate(
+                        [
+                            self.rope(t[:, :, :chain], offset=offset),
+                            self.rope(t[:, :, chain:], offset=offset + 1),
+                        ],
+                        axis=2,
+                    )
+                    for t in (queries, keys)
+                )
             else:
-                queries = self.rope(queries)
-                keys = self.rope(keys)
+                queries = self.rope(queries, offset=offset)
+                keys = self.rope(keys, offset=offset)
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -306,7 +320,11 @@ class GatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        chain: Optional[int] = None,
     ) -> mx.array:
+        """``chain``: the rows past the first ``chain`` rows are siblings of chain
+        rows 1..: each is one step of the conv and the recurrence from the state
+        before its chain row."""
         B, S, _ = inputs.shape
 
         if self.sharding_group is not None:
@@ -315,9 +333,9 @@ class GatedDeltaNet(nn.Module):
         proj = qlinear(self.in_proj, inputs)
         fused = not self.training and fused_ops.gdn_in_ok(self, proj, mask, cache)
         if fused:
-            out, z, z_off = self._mixer_fused(proj, cache)
+            out, z, z_off = self._mixer_fused(proj, cache, chain)
         else:
-            out, z = self._mixer(proj, mask, cache)
+            out, z = self._mixer(proj, mask, cache, chain)
             z_off = 0
 
         gate = z if fused else z.reshape(B * S, -1)
@@ -334,7 +352,7 @@ class GatedDeltaNet(nn.Module):
 
         return out
 
-    def _mixer(self, proj, mask, cache):
+    def _mixer(self, proj, mask, cache, chain=None):
         """conv, norms and the recurrence with MLX ops; returns (out, z (B, S, Hv, Dv))."""
         B, S, _ = proj.shape
         qkv, z, b, a = mx.split(
@@ -359,15 +377,29 @@ class GatedDeltaNet(nn.Module):
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
+        n_keep = self.conv_kernel_size - 1
         if cache is not None:
-            n_keep = self.conv_kernel_size - 1
             if cache.lengths is not None:
                 ends = mx.clip(cache.lengths, 0, S)
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
                 cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
             else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+                rows = S if chain is None else chain
+                cache[0] = mx.contiguous(conv_input[:, rows : rows + n_keep, :])
+        if chain is None:
+            conv_out = nn.silu(self.conv1d(conv_input))
+        else:
+            # A sibling's conv window is the chain prefix of its position and itself
+            windows = [
+                mx.concatenate(
+                    [conv_input[:, i : i + n_keep], qkv[:, chain - 1 + i : chain + i]],
+                    axis=1,
+                )
+                for i in range(1, S - chain + 1)
+            ]
+            sib = self.conv1d(mx.concatenate(windows, axis=0)).reshape(B, -1, qkv.shape[-1])
+            chain_out = self.conv1d(conv_input[:, : chain + n_keep])
+            conv_out = nn.silu(mx.concatenate([chain_out, sib], axis=1))
 
         q, k, v = [
             t.reshape(B, S, h, d)
@@ -385,31 +417,47 @@ class GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
         k = inv_scale * mx.fast.rms_norm(k, None, eps)
 
-        update = functools.partial(
-            gated_delta_update,
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state_in,
-            mask,
-            use_kernel=not self.training,
-        )
+        def update(steps=None, extra=None):
+            return gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state_in,
+                mask,
+                use_kernel=not self.training,
+                steps=steps,
+                chain=chain if steps is None else None,
+                extra=extra,
+            )
+
         out, state = update()
 
         if cache is not None:
             cache[1] = state
             cache.advance(S)
             if cache.keep_states and S > 1:
-                # A rollback reruns the first accepted steps from these inputs
-                cache.rollback = lambda steps: update(steps=steps)[1]
-                cache.steps, cache.conv_input = S, conv_input
+                self._keep_rollback(cache, update, conv_input, S)
         return out, z
 
-    def _mixer_fused(self, proj, cache):
+    def _keep_rollback(self, cache, update, conv_input, S):
+        """Let the cache rebuild the state after the first ``steps`` rows of this
+        forward, plus the row ``extra`` (a sibling row, -1 for none) after them."""
+        n_keep = self.conv_kernel_size - 1
+
+        def rollback(steps, extra=None):
+            kept = steps if extra is None else steps + (extra >= 0)
+            # The conv window: the last rows of [conv state; the kept rows]
+            pos = kept - n_keep + mx.arange(n_keep)
+            src = n_keep + (pos if extra is None else mx.where(pos < steps, pos, extra))
+            return update(steps=steps, extra=extra)[1], mx.take(conv_input, src, axis=1)
+
+        cache.rollback, cache.steps, cache.conv_input = rollback, S, conv_input
+
+    def _mixer_fused(self, proj, cache, chain=None):
         """The same with the small ops merged; returns (out, proj rows, column of z)."""
         B, S, _ = proj.shape
         conv_state = cache[0]
@@ -417,22 +465,32 @@ class GatedDeltaNet(nn.Module):
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim), dtype=proj.dtype
             )
-        q, k, v, g, beta, cache[0] = fused_ops.gdn_in(self, proj, conv_state)
+        q, k, v, g, beta, cache[0] = fused_ops.gdn_in(self, proj, conv_state, chain)
         state = cache[1]
         if state is None:
             state = mx.zeros(
                 (B, self.num_v_heads, self.head_v_dim, self.head_k_dim), mx.float32
             )
-        update = functools.partial(gated_delta_kernel, q, k, v, g, beta, state)
+
+        def update(steps=None, extra=None):
+            return gated_delta_kernel(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+                steps=steps,
+                chain=chain if steps is None else None,
+                extra=extra,
+            )
+
         out, cache[1] = update()
         cache.advance(S)
         if cache.keep_states and S > 1:
-            cache.rollback = lambda steps: update(steps=steps)[1]
-            cache.steps = S
             # Only evaluated when a partial acceptance trims the conv window
-            cache.conv_input = mx.concatenate(
-                [conv_state, proj[..., : self.conv_dim]], axis=1
-            )
+            conv_input = mx.concatenate([conv_state, proj[..., : self.conv_dim]], axis=1)
+            self._keep_rollback(cache, update, conv_input, S)
         # z is read in place from the projection rows
         return out, proj.reshape(B * S, -1), self.conv_dim
 
@@ -465,6 +523,7 @@ class DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         pending: Optional[mx.array] = None,
         split: bool = False,
+        chain: Optional[int] = None,
     ):
         """``pending`` is an output not yet added to ``x`` (the add is merged into the
         norm); with ``split`` the result is returned as such a pair (h, mlp output)."""
@@ -473,12 +532,12 @@ class DecoderLayer(nn.Module):
             # A sharded GDN applies sum_gradients to its input, which needs an array.
             proj = None if self.linear_attn.sharding_group else self.linear_attn.in_proj
             x, xn = prep_add_rms_norm(self.input_layernorm, x, pending, proj, fused)
-            r = self.linear_attn(xn, mask, cache)
+            r = self.linear_attn(xn, mask, cache, chain)
         else:
             x, xn = prep_add_rms_norm(
                 self.input_layernorm, x, pending, self.self_attn.qkv_proj, fused
             )
-            r = self.self_attn(xn, mask, cache)
+            r = self.self_attn(xn, mask, cache, chain)
         h, hn = prep_add_rms_norm(
             self.post_attention_layernorm,
             x,
@@ -524,7 +583,10 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        chain: Optional[int] = None,
     ) -> mx.array:
+        """``chain``: the rows past the first ``chain`` rows are siblings of chain
+        rows 1.., each a branch of one token (speculative verification)."""
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
@@ -538,7 +600,11 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
 
         fa_mask = None
         ssm_mask = None
-        if self.fa_idx is not None:
+        if chain is not None:
+            fa_mask = create_sibling_mask(
+                chain, hidden_states.shape[1], cache[self.fa_idx].offset
+            )
+        elif self.fa_idx is not None:
             fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
         if self.ssm_idx is not None:
             ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
@@ -555,7 +621,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         for i, (layer, c) in enumerate(zip(self.pipeline_layers, cache), 1):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states, pending = layer(
-                hidden_states, mask=mask, cache=c, pending=pending, split=True
+                hidden_states, mask=mask, cache=c, pending=pending, split=True, chain=chain
             )
             if chunk and i % chunk == 0 and i < len(cache):
                 mx.async_eval(hidden_states, pending)
@@ -661,8 +727,9 @@ class TextModel(nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
         return_hidden: bool = False,
+        chain: Optional[int] = None,
     ) -> mx.array:
-        hidden = self.model(inputs, cache, input_embeddings=input_embeddings)
+        hidden = self.model(inputs, cache, input_embeddings=input_embeddings, chain=chain)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(hidden)
         else:
@@ -749,12 +816,14 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         return_hidden: bool = False,
+        chain: Optional[int] = None,
     ):
         return self.language_model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             return_hidden=return_hidden,
+            chain=chain,
         )
 
     @property

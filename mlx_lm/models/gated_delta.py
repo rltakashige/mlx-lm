@@ -28,6 +28,63 @@ def compute_lower_bound_g(A_log, a, dt_bias, lower_bound):
     )
 
 
+def _generic_step(st, q, k, v, y, g, beta):
+    """One recurrence step of the generic kernel on the state array ``st``."""
+    return f"""
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              {st}[i] = {st}[i] * {g};
+              kv_mem += {st}[i] * {k}[s_idx];
+            }}
+            kv_mem = simd_sum(kv_mem);
+
+            auto delta = ({v}[dv_idx] - kv_mem) * {beta};
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              {st}[i] = {st}[i] + {k}[s_idx] * delta;
+              out += {st}[i] * {q}[s_idx];
+            }}
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {{
+              {y}[dv_idx] = static_cast<InT>(out);
+            }}"""
+
+
+def _sibling_source(step, copy, g_stride):
+    """The branch step of a sibling row: row C - 1 + t of a chain of C rows is
+    computed from the state before chain step t, which is left unchanged."""
+    return f"""
+          if (t >= 1 && C - 1 + t < T) {{
+            const int off = C - 1;
+            auto qs = q_ + off * Hk * Dk;
+            auto ks = k_ + off * Hk * Dk;
+            auto vs = v_ + off * Hv * Dv;
+            auto ys = y + off * Hv * Dv;
+            auto gs = g_ + off * {g_stride};
+            auto bs = beta_ + off * Hv;
+            {copy}
+            {step}
+          }}"""
+
+
+def _extra_source(step, q0, v0, g0, beta0):
+    """One more step on row E (a sibling of the kept chain) after the chain steps.
+    ``yb`` is the row-0 output pointer (``y`` has advanced with the chain)."""
+    return f"""
+        if (E >= 0) {{
+          auto qs = {q0} + E * Hk * Dk;
+          auto ks = {q0.replace("q", "k", 1)} + E * Hk * Dk;
+          auto vs = {v0} + E * Hv * Dv;
+          auto ys = yb + E * Hv * Dv;
+          auto gs = {g0};
+          auto bs = {beta0} + E * Hv;
+          {step}
+        }}"""
+
+
 def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_states=False):
     if not mx.metal.is_available():
         return None
@@ -49,13 +106,33 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_states=Fal
     if vectorized:
         g_comment = "// g: [B, T, Hv, Dk]"
         g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
-        g_access = "g_[s_idx]"
+        g_access, gs_access, g_stride = "g_[s_idx]", "gs[s_idx]", "Hv * Dk"
         g_advance = "g_ += Hv * Dk;"
     else:
         g_comment = "// g: [B, T, Hv]"
         g_setup = "auto g_ = g + b_idx * T * Hv;"
-        g_access = "g_[hv_idx]"
+        g_access, gs_access, g_stride = "g_[hv_idx]", "gs[hv_idx]", "Hv"
         g_advance = "g_ += Hv;"
+    chain_step = _generic_step("state", "q_", "k_", "v_", "y", g_access, "beta_[hv_idx]")
+    sibling = extra = ""
+    if not has_mask:
+        sibling = _sibling_source(
+            _generic_step("sst", "qs", "ks", "vs", "ys", gs_access, "bs[hv_idx]"),
+            "float sst[n_per_t];\n            for (int i = 0; i < n_per_t; ++i) sst[i] = state[i];",
+            g_stride,
+        )
+        g0 = (
+            "g + (b_idx * T * Hv + hv_idx) * Dk + E * Hv * Dk"
+            if vectorized
+            else "g + b_idx * T * Hv + E * Hv"
+        )
+        extra = _extra_source(
+            _generic_step("state", "qs", "ks", "vs", "ys", gs_access, "bs[hv_idx]"),
+            "q + b_idx * T * Hk * Dk + hk_idx * Dk",
+            "v + b_idx * T * Hv * Dv + hv_idx * Dv",
+            g0,
+            "beta + b_idx * T * Hv",
+        )
 
     source = f"""
         auto n = thread_position_in_grid.z;
@@ -70,7 +147,8 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_states=Fal
 
         // v, y: [B, T, Hv, Dv]
         auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
-        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto yb = y + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y = yb;
 
         auto dk_idx = thread_position_in_threadgroup.x;
         auto dv_idx = thread_position_in_grid.y;
@@ -91,27 +169,9 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_states=Fal
         auto beta_ = beta + b_idx * T * Hv;
 
         for (int t = 0; t < steps; ++t) {{
+          {sibling}
           if ({mask_source}) {{
-            float kv_mem = 0.0f;
-            for (int i = 0; i < n_per_t; ++i) {{
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] * {g_access};
-              kv_mem += state[i] * k_[s_idx];
-            }}
-            kv_mem = simd_sum(kv_mem);
-
-            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
-
-            float out = 0.0f;
-            for (int i = 0; i < n_per_t; ++i) {{
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] + k_[s_idx] * delta;
-              out += state[i] * q_[s_idx];
-            }}
-            out = simd_sum(out);
-            if (thread_index_in_simdgroup == 0) {{
-              y[dv_idx] = static_cast<InT>(out);
-            }}
+            {chain_step}
           }} else {{
             y[dv_idx] = static_cast<InT>(0);
           }}
@@ -124,12 +184,13 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_states=Fal
           {g_advance}
           beta_ += Hv;
         }}
+        {extra}
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
           o_state[s_idx] = static_cast<StT>(state[i]);
         }}
     """
-    inputs = ["q", "k", "v", "g", "beta", "state_in", "T", "steps"]
+    inputs = ["q", "k", "v", "g", "beta", "state_in", "T", "steps", "C", "E"]
     if has_mask:
         inputs.append("mask")
 
@@ -270,7 +331,66 @@ def _make_gated_delta_packed_kernel():
     if not mx.metal.is_available():
         return None
 
-    source = r"""
+    def step(st, q, k, v, y, g, beta):
+        return f"""
+          float gt = static_cast<float>({g});
+
+          // Partials mirror the generic kernel: each 4-element chain is one
+          // original lane's sequential accumulation.
+          float part[partials_per_lane];
+          for (int pb = 0; pb < partials_per_lane; ++pb) {{
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {{
+              int e = pb * 4 + i;
+              {st}[e] = {st}[e] * gt;
+              acc += {st}[e] * static_cast<float>({k}[e]);
+            }}
+            part[pb] = acc;
+          }}
+          // Butterfly levels xor 1,2,4 stay inside this lane (commutative
+          // pairwise tree); levels xor 8,16 become the row-group shuffles.
+          float kv_mem =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          kv_mem += simd_shuffle_xor(kv_mem, 1);
+          kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+          auto delta =
+              (static_cast<float>({v}[dv_idx]) - kv_mem) *
+              static_cast<float>({beta});
+
+          for (int pb = 0; pb < partials_per_lane; ++pb) {{
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {{
+              int e = pb * 4 + i;
+              {st}[e] = {st}[e] + static_cast<float>({k}[e]) * delta;
+              acc += {st}[e] * static_cast<float>({q}[e]);
+            }}
+            part[pb] = acc;
+          }}
+          float out =
+              ((part[0] + part[1]) + (part[2] + part[3])) +
+              ((part[4] + part[5]) + (part[6] + part[7]));
+          out += simd_shuffle_xor(out, 1);
+          out += simd_shuffle_xor(out, 2);
+          if (lane_in_row == 0) {{
+            {y}[dv_idx] = static_cast<InT>(out);
+          }}"""
+
+    chain_step = step("state", "q_", "k_", "v_", "y", "g_[hv_idx]", "beta_[hv_idx]")
+    sibling = _sibling_source(
+        step("sst", "qs", "ks", "vs", "ys", "gs[hv_idx]", "bs[hv_idx]"),
+        "float sst[values_per_lane];\n            for (int i = 0; i < values_per_lane; ++i) sst[i] = state[i];",
+        "Hv",
+    )
+    extra = _extra_source(
+        step("state", "qs", "ks", "vs", "ys", "gs[hv_idx]", "bs[hv_idx]"),
+        "q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane",
+        "v + (b_idx * T * Hv + hv_idx) * Dv",
+        "g + b_idx * T * Hv + E * Hv",
+        "beta + b_idx * T * Hv",
+    )
+    source = f"""
         constexpr int lanes_per_row = 4;
         constexpr int rows_per_simdgroup = 32 / lanes_per_row;
         constexpr int values_per_lane = Dk / lanes_per_row;
@@ -293,65 +413,25 @@ def _make_gated_delta_packed_kernel():
 
         // v, y: [B, T, Hv, Dv]
         auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
-        y += (b_idx * T * Hv + hv_idx) * Dv;
+        auto yb = y + (b_idx * T * Hv + hv_idx) * Dv;
+        y = yb;
 
         // state_in, state_out: [B, Hv, Dv, Dk]
         auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
         auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
 
         float state[values_per_lane];
-        for (int i = 0; i < values_per_lane; ++i) {
+        for (int i = 0; i < values_per_lane; ++i) {{
           state[i] = static_cast<float>(i_state[i]);
-        }
+        }}
 
         // g, beta: [B, T, Hv]
         auto g_ = g + b_idx * T * Hv;
         auto beta_ = beta + b_idx * T * Hv;
 
-        for (int t = 0; t < steps; ++t) {
-          float gt = static_cast<float>(g_[hv_idx]);
-
-          // Partials mirror the generic kernel: each 4-element chain is one
-          // original lane's sequential accumulation.
-          float part[partials_per_lane];
-          for (int pb = 0; pb < partials_per_lane; ++pb) {
-            float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-              int e = pb * 4 + i;
-              state[e] = state[e] * gt;
-              acc += state[e] * static_cast<float>(k_[e]);
-            }
-            part[pb] = acc;
-          }
-          // Butterfly levels xor 1,2,4 stay inside this lane (commutative
-          // pairwise tree); levels xor 8,16 become the row-group shuffles.
-          float kv_mem =
-              ((part[0] + part[1]) + (part[2] + part[3])) +
-              ((part[4] + part[5]) + (part[6] + part[7]));
-          kv_mem += simd_shuffle_xor(kv_mem, 1);
-          kv_mem += simd_shuffle_xor(kv_mem, 2);
-
-          auto delta =
-              (static_cast<float>(v_[dv_idx]) - kv_mem) *
-              static_cast<float>(beta_[hv_idx]);
-
-          for (int pb = 0; pb < partials_per_lane; ++pb) {
-            float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-              int e = pb * 4 + i;
-              state[e] = state[e] + static_cast<float>(k_[e]) * delta;
-              acc += state[e] * static_cast<float>(q_[e]);
-            }
-            part[pb] = acc;
-          }
-          float out =
-              ((part[0] + part[1]) + (part[2] + part[3])) +
-              ((part[4] + part[5]) + (part[6] + part[7]));
-          out += simd_shuffle_xor(out, 1);
-          out += simd_shuffle_xor(out, 2);
-          if (lane_in_row == 0) {
-            y[dv_idx] = static_cast<InT>(out);
-          }
+        for (int t = 0; t < steps; ++t) {{
+          {sibling}
+          {chain_step}
 
           q_ += Hk * Dk;
           k_ += Hk * Dk;
@@ -359,15 +439,16 @@ def _make_gated_delta_packed_kernel():
           y += Hv * Dv;
           g_ += Hv;
           beta_ += Hv;
-        }
+        }}
+        {extra}
 
-        for (int i = 0; i < values_per_lane; ++i) {
+        for (int i = 0; i < values_per_lane; ++i) {{
           o_state[i] = static_cast<StT>(state[i]);
-        }
+        }}
     """
     return mx.fast.metal_kernel(
         name="gated_delta_step_packed_btree",
-        input_names=["q", "k", "v", "g", "beta", "state_in", "T", "steps"],
+        input_names=["q", "k", "v", "g", "beta", "state_in", "T", "steps", "C", "E"],
         output_names=["y", "state_out"],
         source=source,
     )
@@ -441,6 +522,8 @@ def _gated_delta_kernel_impl(
     allow_packed: bool,
     return_states: bool = False,
     steps=None,
+    chain=None,
+    extra=None,
 ) -> Tuple[mx.array, ...]:
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
@@ -460,7 +543,17 @@ def _gated_delta_kernel_impl(
         and state.dtype == mx.float32
     )
 
-    inputs = [q, k, v, g, beta, state, T, T if steps is None else steps]
+    # Rows past the first ``chain`` rows are siblings: row chain - 1 + t branches
+    # from the state before chain step t.
+    if chain is not None and (mask is not None or return_states):
+        raise ValueError("Sibling rows need an unmasked recurrence")
+    # Only the chain rows are steps of the recurrence; ``extra`` (a row index,
+    # -1 for none) is one more step after them
+    if steps is None:
+        steps = chain or T
+    if extra is not None and (mask is not None or return_states):
+        raise ValueError("An extra row needs an unmasked recurrence")
+    inputs = [q, k, v, g, beta, state, T, steps, chain or T, -1 if extra is None else extra]
     if mask is not None:
         inputs.append(mask)
     output_shapes = [(B, T, Hv, Dv), state.shape]
@@ -538,9 +631,14 @@ def gated_delta_kernel_unpacked(
     beta: mx.array,
     state: mx.array,
     mask: Optional[mx.array] = None,
+    steps=None,
+    chain=None,
+    extra=None,
 ) -> Tuple[mx.array, mx.array]:
     """Run the original one-value-row-per-SIMD-group kernel."""
-    return _gated_delta_kernel_impl(q, k, v, g, beta, state, mask, allow_packed=False)
+    return _gated_delta_kernel_impl(
+        q, k, v, g, beta, state, mask, allow_packed=False, steps=steps, chain=chain, extra=extra
+    )
 
 
 def gated_delta_kernel(
@@ -553,6 +651,8 @@ def gated_delta_kernel(
     mask: Optional[mx.array] = None,
     return_states: bool = False,
     steps=None,
+    chain=None,
+    extra=None,
 ) -> Tuple[mx.array, ...]:
     return _gated_delta_kernel_impl(
         q,
@@ -565,6 +665,8 @@ def gated_delta_kernel(
         allow_packed=True,
         return_states=return_states,
         steps=steps,
+        chain=chain,
+        extra=extra,
     )
 
 
@@ -578,10 +680,15 @@ def gated_delta_ops(
     mask: Optional[mx.array] = None,
     return_states: bool = False,
     steps=None,
+    chain=None,
+    extra=None,
 ) -> Tuple[mx.array, ...]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
-    Supports both scalar and vectorized gating.
+    Supports both scalar and vectorized gating. With ``chain`` the rows past the
+    first ``chain`` rows are siblings: row chain - 1 + t is one step from the
+    state before chain step t. ``extra`` (a row index, -1 for none) is one more
+    step after the first ``steps`` rows.
 
     Shapes:
       - q, k: [B, T, Hk, Dk]
@@ -595,8 +702,9 @@ def gated_delta_ops(
     """
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
-    if steps is not None:
-        T = int(steps)
+    n_steps = T if steps is None else int(steps)
+    if chain is not None:
+        n_steps = chain
     if state is None:
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
@@ -604,9 +712,8 @@ def gated_delta_ops(
         q = mx.repeat(q, repeat_factor, -2)
         k = mx.repeat(k, repeat_factor, -2)
 
-    ys, states = [], []
-    for t in range(T):
-        y, state = _gated_delta_step_ops(
+    def step(t, state):
+        return _gated_delta_step_ops(
             q[:, t],
             k[:, t],
             v[:, t],
@@ -615,9 +722,19 @@ def gated_delta_ops(
             state,
             None if mask is None else mask[:, t],
         )
-        ys.append(y)
+
+    ys, states = [None] * T, []
+    for t in range(n_steps):
+        if chain is not None and 1 <= t and chain - 1 + t < T:
+            ys[chain - 1 + t] = step(chain - 1 + t, state)[0]
+        ys[t], state = step(t, state)
         states.append(state)
-    y = mx.stack(ys, axis=1)
+    if extra is not None and int(extra) >= 0:
+        ys[int(extra)], state = step(int(extra), state)
+    # The rows of the chain steps, or all rows when siblings or an extra row exist
+    if chain is None and extra is None:
+        ys = ys[:n_steps]
+    y = mx.stack([mx.zeros_like(ys[0]) if r is None else r for r in ys], axis=1)
     if return_states:
         return y, state, mx.stack(states, axis=1)
     return y, state
@@ -637,6 +754,8 @@ def gated_delta_update(
     lower_bound: float | None = None,
     return_states: bool = False,
     steps=None,
+    chain=None,
+    extra=None,
 ) -> Tuple[mx.array, ...]:
     """Gated delta rule recurrence.
 
@@ -645,7 +764,8 @@ def gated_delta_update(
     k = inv_scale * rms_norm(k, eps)``). The helper applies no scale of its own.
     With ``return_states`` the state after every step ``[B, T, Hv, Dv, Dk]`` is
     also returned. ``steps`` (an int or a device scalar) runs only the first
-    steps of the sequence.
+    steps of the sequence. With ``chain`` the rows past the first ``chain`` rows
+    are siblings of chain rows 1.. (see ``gated_delta_ops``).
     """
     beta = mx.sigmoid(b)
     if lower_bound is None:
@@ -664,5 +784,9 @@ def gated_delta_update(
         or k.shape[-1] < 32
         or k.shape[-1] % 32 != 0
     ):
-        return gated_delta_ops(q, k, v, g, beta, state, mask, return_states, steps)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask, return_states, steps)
+        return gated_delta_ops(
+            q, k, v, g, beta, state, mask, return_states, steps, chain, extra
+        )
+    return gated_delta_kernel(
+        q, k, v, g, beta, state, mask, return_states, steps, chain, extra
+    )
