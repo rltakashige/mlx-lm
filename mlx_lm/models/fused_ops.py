@@ -61,7 +61,7 @@ def _rms_threads(k):
     """Threads of mx.fast.rms_norm's threadgroup for a row of ``k`` values."""
     if k > 4096:
         return 1024
-    return -(-(-(-k // 4)) // 32) * 32
+    return ((k + 3) // 4 + 31) // 32 * 32
 
 
 def slot_sum(pending):
