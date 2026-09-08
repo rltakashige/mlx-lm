@@ -3,7 +3,9 @@
 Re-runs the loop of ``speculative_generate_step`` for an MTP head with an
 ``mx.eval`` and a wall clock around every phase, so the per-cycle cost splits
 into draft steps, the verify forward, host readback, cache rollback and the
-Python remainder. Greedy sampling only.
+Python remainder. Greedy sampling only. The draft stop rule, the candidate-set
+head and its fallback follow ``speculative_generate_step``; ``--check-candidates``
+also runs the full head on every candidate draft and counts the misses.
 
     python bench/mtp_profile.py --model <target> --draft-model <sidecar|bundled> \\
         --num-draft-tokens 2 --prompt "text" --max-tokens 128 [--verify-layers] [--json out.json]
@@ -12,7 +14,7 @@ Python remainder. Greedy sampling only.
 import argparse
 import json
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import mlx.core as mx
@@ -31,6 +33,8 @@ class Phase:
     def __call__(self, name, fn, *outs):
         tic = time.perf_counter()
         result = fn()
+        if outs == () and hasattr(result, "rows"):
+            outs = (result.first, *result.rows)
         mx.eval(result if outs == () else outs)
         self.times[name] += time.perf_counter() - tic
         self.counts[name] += 1
@@ -41,31 +45,64 @@ def argmax_tokens(logits):
     return mx.argmax(logits[0], axis=-1).astype(mx.uint32)
 
 
+def warm_shapes(model, prompt, max_rows):
+    """Compile the verify kernels of every row count before the timed runs."""
+    cache = make_prompt_cache(model)
+    model(prompt[None, :-1], cache=cache)
+    mx.eval([c.state for c in cache])
+    for c in cache:
+        if isinstance(c, ArraysCache):
+            c.keep_states = True
+    for s in range(1, max_rows + 1):
+        mx.eval(model(mx.tile(prompt[-1:], s)[None], cache=cache))
+        trim_prompt_cache(cache, s)
+
+
 def plain_decode(model, prompt, n):
+    """Mean step time after warm-up and the greedy tokens."""
     cache = make_prompt_cache(model)
     model(prompt[None, :-1], cache=cache)
     mx.eval([c.state for c in cache])
     y = prompt[-1:]
-    times = []
+    times, out = [], []
     for _ in range(n):
         tic = time.perf_counter()
         y = argmax_tokens(model(y[None], cache=cache))
         mx.eval(y)
         times.append(time.perf_counter() - tic)
-    return sum(times[4:]) / len(times[4:])
+        out.append(y.item())
+    return sum(times[4:]) / len(times[4:]), out
 
 
-def run(model, draft, prompt, k, max_tokens, timer=None):
+def run(
+    model,
+    draft,
+    prompt,
+    k,
+    max_tokens,
+    timer=None,
+    stop=0.0,
+    candidates=0,
+    fallback=0.0,
+    check=False,
+):
     draft.bind(model)
     cache, draft_cache = make_prompt_cache(model), draft.make_cache()
     phase = Phase()
+    stats = Counter()
     # Prefill target with hidden states, seed the drafter with (token, previous hidden)
     y = prompt
-    _, h = model(y[None, :-1], cache=cache, return_hidden=True)
+    logits, h = model(y[None, :-1], cache=cache, return_hidden=True)
     draft(y[None, 1:-1], h[:, :-1], cache=draft_cache)
     hidden = h[:, -1:]
+    cands = None
+    if candidates:
+        cands = draft.candidates(candidates)
+        cands.extend(prompt)
+        cands.observe(logits[0, -64:])
     mx.eval([c.state for c in cache], [c.state for c in draft_cache], hidden)
     y = draft_y = prompt[-1:]
+    recent = ()
     for c in cache:
         if isinstance(c, ArraysCache):
             c.keep_states = True
@@ -74,23 +111,62 @@ def run(model, draft, prompt, k, max_tokens, timer=None):
     produced, cycles, tokens_out = 0, 0, []
     while produced < max_tokens:
         cycle_tic = time.perf_counter()
-        drafts, hd = [], hidden
-        for i in range(k):
+        head = None
+        if cands is not None:
+            head = phase("cand_build", lambda: cands.make_head(*recent))
+            stats["cand_size"] += head.ids.size
+        drafts, hd, ps, q, i = [], hidden, [], 1.0, 0
+        while i < k:
             inp = draft_y[None] if i == 0 else drafts[-1][None]
-            logits, hd = phase(f"draft_{i}", lambda: draft(inp, hd, cache=draft_cache))
-            hd = hd[:, -1:]
-            drafts.append(argmax_tokens(logits[:, -1:]))
-            mx.eval(drafts[-1])
+            logits, hd_new = phase(
+                f"draft_{i}", lambda: draft(inp, hd, cache=draft_cache, head=head)
+            )
+            hd_new = hd_new[:, -1:]
+            l = logits[0, -1].astype(mx.float32)
+            tok = mx.argmax(l, keepdims=True).astype(mx.uint32)
+            p = mx.max(mx.softmax(l))
+            if head is not None:
+                tok = head.ids[tok]
+                margin = mx.abs(mx.diff(mx.topk(l, 2))).item()
+                stats["cand_steps"] += 1
+                if check:
+                    full = phase("check", lambda: draft.lm_head(hd_new)[0, -1])
+                    stats["miss"] += int(mx.argmax(full).item() != tok.item())
+                    p_full = mx.max(mx.softmax(full.astype(mx.float32))).item()
+                    stats["p_diff"] += p.item() - p_full
+                    stats["p_lower"] += int(p.item() < p_full - 1e-4)
+                if fallback and margin < fallback:
+                    stats["fallback"] += 1
+                    full = phase("fallback", lambda: draft.lm_head(hd_new)[0, -1])
+                    tok = mx.argmax(full, keepdims=True).astype(mx.uint32)
+                    p = mx.max(mx.softmax(full.astype(mx.float32)))
+            mx.eval(tok, p)
+            drafts.append(tok)
+            ps.append(p.item())
+            hd = hd_new
+            # The stop rule of the generation loop: the previous draft's p is read one late
+            if 0 < i < k - 1:
+                q *= ps[i - 1]
+                if q < stop:
+                    trim_prompt_cache(draft_cache, 1)
+                    drafts.pop()
+                    break
+            i += 1
+        kd = len(drafts)
         draft_tokens = mx.concatenate(drafts) if drafts else mx.array([], mx.uint32)
         inputs = mx.concatenate([y, draft_tokens])
+        rows = inputs.size
 
         logits, hidden_out = phase(
             "verify", lambda: model(inputs[None], cache=cache, return_hidden=True)
         )
-        tokens = phase("sample", lambda: argmax_tokens(logits[:, -(k + 1) :]))
+        tokens = phase("sample", lambda: argmax_tokens(logits[:, -rows:]))
+        if cands is not None:
+            phase("cand_score", lambda: cands.observe(logits[0, -rows:]), [])
+            mx.eval(cands.score)
         d, t = phase("readback", lambda: (draft_tokens.tolist(), tokens.tolist()))
         n = 0
-        while n < k and t[n] == d[n]:
+        while n < kd and t[n] == d[n]:
             n += 1
         for i in range(n):
             accepted_at[i] += 1
@@ -98,21 +174,26 @@ def run(model, draft, prompt, k, max_tokens, timer=None):
         tokens_out += got
         produced += len(got)
         cycles += 1
+        stats["drafted"] += kd
 
-        y = draft_y = mx.array(t[n : n + 1], mx.uint32)
-        if n == k:
+        y = draft_y = mx.array(got[-1:], mx.uint32)
+        if n == kd:
             draft_y = mx.concatenate([mx.array(d[-1:], mx.uint32), y])
         hidden = hidden_out[:, n + 1 - draft_y.size : n + 1]
+        if cands is not None:
+            cands.extend(mx.array(got, mx.uint32))
+            recent = (draft_tokens, tokens)
         phase(
             "rollback",
             lambda: (
-                trim_prompt_cache(cache, k - n),
-                trim_prompt_cache(draft_cache, max(k - n - 1, 0)),
+                trim_prompt_cache(cache, kd - n),
+                trim_prompt_cache(draft_cache, max(kd - n - 1, 0)),
             ),
             [],
         )
         phase.times["cycle"] += time.perf_counter() - cycle_tic
         phase.counts["cycle"] += 1
+    run.stats = stats
     return phase, accepted_at, cycles, produced, tokens_out
 
 
@@ -133,6 +214,14 @@ def main():
         help="random prompt of this length instead of --prompt",
     )
     ap.add_argument("--max-tokens", type=int, default=128)
+    ap.add_argument("--draft-stop-prob", type=float, default=0.0)
+    ap.add_argument("--draft-candidates", type=int, default=0)
+    ap.add_argument("--draft-fallback-margin", type=float, default=0.0)
+    ap.add_argument(
+        "--check-candidates",
+        action="store_true",
+        help="run the full head on every candidate draft and count the misses",
+    )
     ap.add_argument(
         "--verify-layers",
         action="store_true",
@@ -158,8 +247,17 @@ def main():
         )
     mx.eval(prompt)
 
-    run(model, draft, prompt, args.num_draft_tokens, 16)  # warm up
-    plain_ms = plain_decode(model, prompt, 24) * 1e3
+    opts = dict(
+        stop=args.draft_stop_prob,
+        candidates=args.draft_candidates,
+        fallback=args.draft_fallback_margin,
+        check=args.check_candidates,
+    )
+    k = args.num_draft_tokens
+    warm_shapes(model, prompt, 2 * k + 1 if args.draft_siblings else k + 1)
+    run(model, draft, prompt, args.num_draft_tokens, 16, **opts)  # warm up
+    plain_ms, plain_out = plain_decode(model, prompt, max(24, args.max_tokens))
+    plain_ms *= 1e3
     timer = Timer() if args.verify_layers else None
     if timer:
         for layer in model.layers:
@@ -167,8 +265,9 @@ def main():
         if not model.language_model.args.tie_word_embeddings:
             timer.wrap_module(model.language_model.lm_head, "lm_head")
     phase, accepted_at, cycles, produced, out = run(
-        model, draft, prompt, args.num_draft_tokens, args.max_tokens, timer
+        model, draft, prompt, args.num_draft_tokens, args.max_tokens, timer, **opts
     )
+    stats = run.stats
     if timer:
         timer.unwrap()
 
@@ -176,11 +275,17 @@ def main():
     cycle_ms = phase.times["cycle"] * 1e3 / cycles
     rows = []
     for name in [f"draft_{i}" for i in range(k)] + [
+        "cand_build",
+        "cand_score",
+        "check",
+        "fallback",
         "verify",
         "sample",
         "readback",
         "rollback",
     ]:
+        if name not in phase.times:
+            continue
         ms = phase.times[name] * 1e3 / cycles
         rows.append((name, ms, ms / cycle_ms))
     rest = cycle_ms - sum(r[1] for r in rows)
@@ -203,12 +308,29 @@ def main():
             for i in range(k)
         )
     )
+    print(
+        f"drafts per cycle {stats['drafted'] / cycles:.2f}, accepted per position "
+        + "/".join(f"{accepted_at[i] / cycles:.2f}" for i in range(k))
+    )
+    if stats["cand_steps"]:
+        print(
+            f"candidate drafts {stats['cand_steps']}, |C| mean {stats['cand_size'] / cycles:.0f}, "
+            f"fallback rate {stats['fallback'] / stats['cand_steps']:.3f}, "
+            f"miss rate {stats['miss'] / stats['cand_steps']:.3f}"
+        )
+        if args.check_candidates:
+            print(
+                f"p_C - p_full mean {stats['p_diff'] / stats['cand_steps']:+.4f}, "
+                f"p_C < p_full on {stats['p_lower']} steps"
+            )
     if timer:
         print(f"\nverify forward by layer type (S={k + 1}, sync per layer):")
         for name, ts in timer.times.items():
             print(
                 f"  {name:12} n={len(ts) / cycles:5.1f}  {sum(ts) * 1e3 / cycles:8.2f} ms/cycle"
             )
+    first = next((i for i, (a, b) in enumerate(zip(out, plain_out)) if a != b), None)
+    print(f"first token different from plain greedy: {first} (of {min(len(out), len(plain_out))})")
     print("\n" + tok.decode(out[:48]).replace("\n", " ")[:200])
     if args.json:
         args.json.write_text(
@@ -223,6 +345,9 @@ def main():
                     "cycle_ms": cycle_ms,
                     "phases": {n: ms for n, ms, _ in rows},
                     "accepted_at": dict(accepted_at),
+                    "stats": dict(stats),
+                    "first_diff": first,
+                    "tokens_out": out,
                     "verify_layers": (
                         {n: sum(ts) * 1e3 / cycles for n, ts in timer.times.items()}
                         if timer

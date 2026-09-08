@@ -39,6 +39,7 @@ DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.1
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
+DEFAULT_DRAFT_CANDIDATES = 16384
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
@@ -220,6 +221,20 @@ def setup_arg_parser():
         help="Stop drafting once the product of the draft top-1 probabilities "
         "is below this value (0 disables).",
         default=0.5,
+    )
+    parser.add_argument(
+        "--draft-candidates",
+        type=int,
+        help="Draft with a candidate set of the output head: the first N rows of "
+        "the vocabulary plus a running top set (0 uses the full head).",
+        default=DEFAULT_DRAFT_CANDIDATES,
+    )
+    parser.add_argument(
+        "--draft-fallback-margin",
+        type=float,
+        help="Rescore a draft with the full head when its two best candidates "
+        "are closer than this logit margin (0 disables).",
+        default=0.0,
     )
     return parser
 
@@ -487,6 +502,8 @@ def speculative_generate_step(
     *,
     num_draft_tokens: int = 2,
     draft_stop_prob: float = 0.5,
+    draft_candidates: int = 16384,
+    draft_fallback_margin: float = 0.0,
     max_tokens: int = 256,
     sampler: Optional[Sampler] = None,
     logits_processors: Optional[List[LogitsProcessor]] = None,
@@ -511,6 +528,14 @@ def speculative_generate_step(
           the drafts' top-1 probabilities is below this value. The probabilities
           are read one draft late, so the draft computed past the stop is
           dropped. ``0`` disables the stop. Default: ``0.5``.
+        draft_candidates (int, optional): An MTP head scores only a candidate
+          set of the vocabulary per draft: its first ``draft_candidates`` rows,
+          the 8192 rows with the largest running softmax mass in the target's
+          outputs, the recent tokens and the last drafts. ``0`` uses the full
+          head. Default: ``16384``.
+        draft_fallback_margin (float, optional): Rescore a candidate draft with
+          the full head when its two best candidates are closer than this logit
+          margin. ``0`` disables the fallback. Default: ``0``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
         sampler (Sampler, optional): A sampler for sampling a
@@ -536,8 +561,13 @@ def speculative_generate_step(
     prev_tokens = None
     mtp = getattr(draft_model, "needs_hidden", False)
     hidden = None
+    candidates = None
     if mtp:
         draft_model.bind(model)
+        # Logits processors need the full vocabulary
+        if draft_candidates and not logits_processors and hasattr(draft_model, "candidates"):
+            candidates = draft_model.candidates(draft_candidates)
+            candidates.extend(y)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -566,11 +596,12 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1, hidden=None):
+    def _step(model, cache, y, n_predict=1, hidden=None, head=None):
+        """``head`` replaces the drafter's output head (see ``draft_candidates``)."""
         with mx.stream(generation_stream):
             # The MTP drafter is given the hidden states of the tokens
             if hidden is not None:
-                logits, hidden = model(y[None], hidden, cache=cache)
+                logits, hidden = model(y[None], hidden, cache=cache, head=head)
                 hidden = hidden[:, -1:]
             elif mtp:
                 logits, hidden = model(y[None], cache=cache, return_hidden=True)
@@ -597,6 +628,8 @@ def speculative_generate_step(
                 logprobs = mx.concatenate(out_logprobs, axis=0)
             else:
                 y, logprobs = _process_and_sample(None, logits.squeeze(0))
+                if head is not None:
+                    y = head.ids[y]
             return y, logprobs, hidden
 
     def _prefill(model, cache, y):
@@ -613,7 +646,9 @@ def speculative_generate_step(
         nonlocal hidden
         while y.size > 1:
             n = min(prefill_step_size, y.size - 1)
-            _, h = model(y[:n][None], cache=model_cache, return_hidden=True)
+            logits, h = model(y[:n][None], cache=model_cache, return_hidden=True)
+            if candidates is not None:
+                candidates.observe(logits[0, -64:])
             if hidden is not None:
                 h = mx.concatenate([hidden, h], axis=1)
             # Seed the drafter with each token and the hidden state before it
@@ -630,20 +665,38 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
-    def _draft_generate(y, num_draft):
+    def _draft_generate(y, num_draft, head=None):
         nonlocal prev_tokens
-        ys, h, ps, q = [], hidden, [], 1.0
-        for i in range(num_draft):
-            y, logprobs, h = _step(draft_model, draft_cache, y, hidden=h)
-            ys.append(y)
-            if not draft_stop_prob:
-                mx.async_eval(y)
+        ys, hs, ps, ms, q = [], [], [], [], 1.0
+        h, i = hidden, 0
+        fallback = draft_fallback_margin if head is not None else 0
+        while i < num_draft:
+            y_in = y if i == 0 else ys[-1]
+            y_i, logprobs, h = _step(draft_model, draft_cache, y_in, hidden=h, head=head)
+            ys.append(y_i)
+            hs.append(h)
+            if not draft_stop_prob and not fallback:
+                mx.async_eval(y_i)
+                i += 1
                 continue
             ps.append(mx.exp(logprobs.max()))
-            mx.async_eval(y, ps[-1])
-            # Read the previous draft's top-1 probability while this one runs.
+            # The gap of the two best candidates tells when the set was too narrow
+            ms.append(mx.abs(mx.diff(mx.topk(logprobs, 2))) if fallback else None)
+            mx.async_eval([a for a in (y_i, ps[-1], ms[-1]) if a is not None])
+            # Read the previous draft's numbers while this one runs.
             # The last draft is not read, so the verify is built without a wait.
             if 0 < i < num_draft - 1:
+                if ms[i - 1] is not None and ms[i - 1].item() < fallback:
+                    # Rescore the previous draft with the full head and redo this one
+                    logits = draft_model.lm_head(hs[i - 1])
+                    ys[i - 1], logprobs = _process_and_sample(None, logits.squeeze(0))
+                    ps[i - 1], ms[i - 1] = mx.exp(logprobs.max()), None
+                    mx.async_eval(ys[i - 1], ps[i - 1])
+                    trim_prompt_cache(draft_cache, 1)
+                    for seq in (ys, hs, ps, ms):
+                        seq.pop()
+                    h = hs[-1]
+                    continue
                 q *= ps[i - 1].item()
                 if q < draft_stop_prob:
                     # The chain is likely broken: drop the draft computed past it.
@@ -652,6 +705,7 @@ def speculative_generate_step(
                         prev_tokens = prev_tokens[:-1]
                     ys.pop()
                     break
+            i += 1
         return mx.concatenate(ys) if ys else mx.array([], mx.uint32)
 
     with mx.stream(generation_stream):
@@ -681,7 +735,8 @@ def speculative_generate_step(
                     num_draft = min(max_tokens - ntoks, num_draft_tokens)
                     if mtp and hidden is None:
                         num_draft = 0
-                    draft_tokens = _draft_generate(draft_y, num_draft)
+                    head = candidates.make_head() if candidates else None
+                    draft_tokens = _draft_generate(draft_y, num_draft, head)
                 num_draft = draft_tokens.size
                 n = drafted = draft_trim = 0
                 if prev_tokens is not None:
@@ -701,7 +756,14 @@ def speculative_generate_step(
                 for c in gdn_caches:
                     c.stage(accepted + 1)
                 mx.async_eval([c.staged for c in gdn_caches if c.staged is not None])
+                head = None
+                if candidates is not None:
+                    # Build the next candidate set while the tokens are read back
+                    candidates.observe(logprobs)
+                    head = candidates.make_head(draft_tokens, tokens)
+                    mx.async_eval(head.first, *head.rows)
                 mx.eval(tokens, draft_tokens)
+                new_tokens = tokens
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
                 n_accept = 0
@@ -723,6 +785,8 @@ def speculative_generate_step(
                     )
                 if mtp:
                     hidden = hidden_out[:, n_accept + 1 - draft_y.size : n_accept + 1]
+                if candidates is not None:
+                    candidates.extend(new_tokens[: n_accept + 1])
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[: -max(num_draft - n_accept, 1)]
                 draft_trim = trim_prompt_cache(
@@ -732,7 +796,7 @@ def speculative_generate_step(
                 remaining = max_tokens - ntoks - n_accept - 1
                 if remaining > 0:
                     next_draft = _draft_generate(
-                        draft_y, min(remaining, num_draft_tokens)
+                        draft_y, min(remaining, num_draft_tokens), head
                     )
                     drafted = draft_y.size + next_draft.size - 1
 
@@ -813,8 +877,13 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        kwargs.pop("draft_stop_prob", None)
+        for key in (
+            "num_draft_tokens",
+            "draft_stop_prob",
+            "draft_candidates",
+            "draft_fallback_margin",
+        ):
+            kwargs.pop(key, None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -2267,6 +2336,8 @@ def main():
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
         draft_stop_prob=args.draft_stop_prob,
+        draft_candidates=args.draft_candidates,
+        draft_fallback_margin=args.draft_fallback_margin,
     )
     if not args.verbose:
         print(response)

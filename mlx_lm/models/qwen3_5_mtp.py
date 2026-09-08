@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import functools
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,75 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
     block_size: int = 3
+
+
+class CandidateHead:
+    """The output head scored on a candidate set of vocabulary rows only.
+
+    The set is the first ``fixed`` rows (a slice, no copy) and the gathered rows
+    ``ids`` (repeats allowed). The logits come back over ``self.ids``; a repeat
+    of a row scores -inf, so a softmax over them is exact.
+    """
+
+    def __init__(self, head, fixed, ids):
+        quantized = hasattr(head, "scales")
+        params = (head.weight, head.scales, head.biases) if quantized else (head.weight,)
+        self.kwargs = (
+            dict(group_size=head.group_size, bits=head.bits, mode=head.mode)
+            if quantized
+            else None
+        )
+        ids = mx.sort(ids)
+        self.first = mx.concatenate([mx.array([True]), ids[1:] != ids[:-1]])
+        self.first &= ids >= fixed
+        self.ids = mx.concatenate([mx.arange(fixed, dtype=ids.dtype), ids])
+        self.fixed = [p[:fixed] for p in params]
+        self.rows = [mx.take(p, ids, axis=0) for p in params]
+
+    def _logits(self, x, params):
+        if self.kwargs is None:
+            return x @ params[0].T
+        return mx.quantized_matmul(x, *params, transpose=True, **self.kwargs)
+
+    def __call__(self, x):
+        rows = mx.where(self.first, self._logits(x, self.rows), -mx.inf)
+        if not self.fixed[0].shape[0]:
+            return rows
+        return mx.concatenate([self._logits(x, self.fixed), rows], axis=-1)
+
+
+class Candidates:
+    """Candidate rows for the drafts of one cycle: the first ``fixed`` rows of the
+    vocabulary (the frequent tokens of a BPE order), the ``size`` rows with the
+    largest running softmax mass in the target's outputs, the recent tokens and
+    the last drafts."""
+
+    def __init__(self, head, fixed, size=8192, window=2048, decay=0.98):
+        self.head, self.window, self.decay = head, window, decay
+        vocab = head.weight.shape[0]
+        self.size, self.fixed = min(size, vocab), min(fixed, vocab)
+        self.score = None
+        self.context = None
+
+    def observe(self, logits):
+        """Add the softmax mass of the target's logits (.., V) to the score."""
+        logits = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
+        mass = mx.softmax(logits, axis=-1).sum(axis=0)
+        self.score = mass if self.score is None else self.decay * self.score + mass
+
+    def extend(self, tokens):
+        if self.context is not None:
+            tokens = mx.concatenate([self.context, tokens])
+        self.context = tokens[-self.window :]
+
+    def make_head(self, *recent):
+        """The head for the next drafts, or None before the first observation."""
+        if self.score is None:
+            return None
+        top = mx.argpartition(self.score, kth=-self.size)[-self.size :]
+        ids = [top.astype(mx.uint32), self.context, *recent]
+        ids = mx.concatenate([i.astype(mx.uint32) for i in ids])
+        return CandidateHead(self.head, self.fixed, ids)
 
 
 class Model(nn.Module):
@@ -45,11 +115,14 @@ class Model(nn.Module):
         embed_tokens = text_model.model.embed_tokens
         self.embed_tokens = embed_tokens.__call__
         if text_model.args.tie_word_embeddings:
-            self.lm_head = embed_tokens.as_linear
+            head, self.lm_head = embed_tokens, embed_tokens.as_linear
         else:
-            self.lm_head = text_model.lm_head.__call__
+            head, self.lm_head = text_model.lm_head, text_model.lm_head.__call__
+        # A partial keeps the head out of this module's parameters
+        self.candidates = functools.partial(Candidates, head)
 
-    def __call__(self, inputs: mx.array, hidden: mx.array, cache=None):
+    def __call__(self, inputs: mx.array, hidden: mx.array, cache=None, head=None):
+        """``head`` replaces the output head (see ``CandidateHead``)."""
         h = mx.concatenate(
             [
                 self.pre_fc_norm_embedding(self.embed_tokens(inputs)),
@@ -64,7 +137,7 @@ class Model(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
         h = self.norm(h)
-        return self.lm_head(h), h
+        return (self.lm_head if head is None else head)(h), h
 
     def make_cache(self):
         return [KVCache() for _ in self.layers]

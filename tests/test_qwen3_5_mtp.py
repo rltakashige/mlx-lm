@@ -141,7 +141,7 @@ class _OracleDrafter:
     def make_cache(self):
         return [KVCache()]
 
-    def __call__(self, inputs, hidden, cache):
+    def __call__(self, inputs, hidden, cache, head=None):
         assert hidden.shape[:2] == inputs.shape
         S = inputs.shape[1]
         # Position q pairs token q + 1 with hidden state q and predicts token q + 2
@@ -245,9 +245,75 @@ class TestQwen3_5MTP(unittest.TestCase):
                         draft_stop_prob=stop,
                     )
                     self.assertEqual(tokens, expected)
+                # Candidate-set drafts, with and without the full-head fallback
+                for cand, margin, stop in ((16, 0.0, 0.5), (16, 2.0, 0.5), (128, 0.0, 0.0)):
+                    tokens, _ = _speculative(
+                        PROMPT,
+                        target,
+                        head,
+                        32,
+                        num_draft_tokens=3,
+                        draft_stop_prob=stop,
+                        draft_candidates=cand,
+                        draft_fallback_margin=margin,
+                    )
+                    self.assertEqual(tokens, expected)
             # A one token prompt has no hidden state before the first target step
             tokens, _ = _speculative(PROMPT[:1], target, head, 16, num_draft_tokens=2)
             self.assertEqual(tokens, _greedy(PROMPT[:1], target, 16))
+
+    def test_candidate_head(self):
+        V = TEXT_CONFIG["vocab_size"]
+        for tie in (False, True):
+            for quantize in (False, True):
+                target, head = _models(tie)
+                if quantize:
+                    nn.quantize(target, 32, 4)
+                head.bind(target)
+                h = mx.random.normal((1, 1, TEXT_CONFIG["hidden_size"]))
+                full = head.lm_head(h)
+                cands = head.candidates(0, size=4)
+                module = cands.head
+                for fixed in (0, 4):
+                    cand = qwen3_5_mtp.CandidateHead(
+                        module, fixed, mx.array([5, 3, 5, 100, 3, 7], mx.uint32)
+                    )
+                    out = cand(h)
+                    prefix = list(range(fixed))
+                    self.assertEqual(cand.ids.tolist(), prefix + [3, 3, 5, 5, 7, 100])
+                    # A repeat of a row, and a gathered row of the prefix, score -inf
+                    self.assertEqual(cand.first.tolist(), [fixed == 0, 0, 1, 0, 1, 1])
+                    first = [True] * fixed + cand.first.tolist()
+                    for j, (i, ok) in enumerate(zip(cand.ids.tolist(), first)):
+                        if ok:
+                            self.assertTrue(
+                                mx.allclose(out[..., j], full[..., i], atol=1e-2),
+                                (tie, quantize, fixed, j),
+                            )
+                        else:
+                            self.assertEqual(out[..., j].item(), -mx.inf)
+                # The argmax over the set is the full argmax when the set holds it
+                best = mx.argmax(full).item()
+                cand = qwen3_5_mtp.CandidateHead(module, 0, mx.array([1, best, 2], mx.uint32))
+                self.assertEqual(cand.ids[mx.argmax(cand(h))].item(), best)
+
+                # The running set: the top rows by softmax mass, the context, the recent ids
+                self.assertIsNone(cands.make_head())
+                cands.extend(mx.array([9, 8], mx.uint32))
+                logits = mx.zeros((2, V))
+                logits[0, 10] = 5.0
+                logits[1, 20] = 5.0
+                logits[:, 30] = 3.0
+                cands.observe(logits)
+                cand = cands.make_head(mx.array([7], mx.uint32))
+                self.assertEqual(cand.ids.size, 4 + 2 + 1)
+                self.assertTrue({10, 20, 30} <= set(cand.ids.tolist()))
+                self.assertTrue({7, 8, 9} <= set(cand.ids.tolist()))
+                # The fixed prefix is the first rows of the vocabulary
+                cands = head.candidates(16, size=4)
+                cands.extend(mx.array([9], mx.uint32))
+                cands.observe(logits)
+                self.assertTrue(set(range(16)) <= set(cands.make_head().ids.tolist()))
 
     def test_partial_acceptance(self):
         for moe in (False, True):
