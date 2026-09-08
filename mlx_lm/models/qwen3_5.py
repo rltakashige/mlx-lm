@@ -429,7 +429,7 @@ class GatedDeltaNet(nn.Module):
         proj2 = proj.reshape(B * S, -1)
         # The recurrence with the gated norm (and its prep) as its epilogue
         prep = routes(self.out_proj, (B, S, self.value_dim), proj.dtype) and not _nax_m(B * S)
-        if fused_ops.gdn_norm_ok(self, q, state, S, prep):
+        if fused_ops.gdn_norm_ok(self, q, state, S):
             cache[1], out = fused_ops.gdn_norm(
                 self, q, k, v, g, beta, state, proj2, zmax, prep
             )

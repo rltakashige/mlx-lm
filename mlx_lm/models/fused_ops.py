@@ -494,12 +494,12 @@ def attn_gate(x, qkv):
     return out.reshape(B, L, H * Dh)
 
 
-def _gdn_norm_source(Dv, Dk, Hk, Hv, TMAX, PW, ZO, eps, prep):
+def _gdn_norm_source(Dv, Dk, Hk, Hv, TMAX, PW, ZO, eps):
     """The packed gated-delta recurrence (4 lanes per value row, 8 rows per simdgroup, all Dv
     rows of a head in one threadgroup) with the gated norm of the outputs as its epilogue.
 
-    prep=1 writes the ``qmv_small`` prep of norm(y) * silu(z) (fp16 rows, chunk sums, row
-    scales); prep=0 writes it in the activation type. Both round like the ops they replace.
+    With ``do_prep`` it writes the ``qmv_small`` prep of norm(y) * silu(z) (fp16 rows, chunk
+    sums, row scales), else the product in the activation type; both round like the ops.
     """
     order, scale = (0, 4, 1, 5, 2, 6, 3, 7), (1.0, 1.0, 1 / 16, 1 / 16, 1.0, 1.0, 1 / 16, 1 / 16)
     stores = "\n".join(
@@ -507,8 +507,7 @@ def _gdn_norm_source(Dv, Dk, Hk, Hv, TMAX, PW, ZO, eps, prep):
         for c8 in range(2)
         for j in range(8)
     )
-    if prep:
-        epilogue = f"""
+    prep_epilogue = f"""
     // Row scale from the bound sqrt(D) * max|w| * max|z| (the prep's scan), as a power of two
     float wmax = lid < Dv ? metal::fabs(static_cast<float>(weight[lid])) : 0.0f;
     for (int e = lid + TGN; e < Dv; e += TGN) wmax = max(wmax, metal::fabs(static_cast<float>(weight[e])));
@@ -561,8 +560,7 @@ def _gdn_norm_source(Dv, Dk, Hk, Hv, TMAX, PW, ZO, eps, prep):
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 """
-    else:
-        epilogue = """
+    plain_epilogue = """
     // mx.fast.rms_norm with weight (32 lanes x 4 values), then silu(z) * x in float
     for (int t = 0; t < T; t++) {
       const int m = b_idx * T + t;
@@ -657,12 +655,16 @@ def _gdn_norm_source(Dv, Dk, Hk, Hv, TMAX, PW, ZO, eps, prep):
     }}
     for (int i = 0; i < values_per_lane; ++i) o_state[i] = state[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-{epilogue}
+    if (do_prep) {{
+{prep_epilogue}
+    }} else {{
+{plain_epilogue}
+    }}
 """
 
 
-def gdn_norm_ok(net, q, state, T, prep):
-    """The fused recurrence + gated norm handles Dk = 128, Dv a multiple of 8, T <= 8, fp32 state."""
+def gdn_norm_ok(net, q, state, T):
+    """The fused recurrence + gated norm handles Dk = 128, Dv a multiple of 16, T <= 8, fp32 state."""
     Dk, Dv = net.head_k_dim, net.head_v_dim
     return (
         Dk == 128
@@ -683,24 +685,25 @@ def gdn_norm(net, q, k, v, g, beta, state, proj, zmax, prep):
     K = Hv * Dv
     Mp = _mp(M)
     PW, ZO = proj.shape[-1], net.conv_dim
+    # One kernel for both output kinds, so a process compiles it once
     kern = _kernel(
         "gdn_norm",
-        (Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps, prep, str(q.dtype)),
-        lambda: _gdn_norm_source(Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps, prep),
-        ["q", "k", "v", "g", "beta", "state_in", "T", "proj", "weight", "zmax", "Mp"],
-        ["state_out", "x16", "xsum", "rscale"] if prep else ["state_out", "out"],
+        (Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps, str(q.dtype)),
+        lambda: _gdn_norm_source(Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps),
+        ["q", "k", "v", "g", "beta", "state_in", "T", "proj", "weight", "zmax", "Mp", "do_prep"],
+        ["state_out", "x16", "xsum", "rscale", "out"],
         _HEADER + _SMALL_HEADER,
     )
-    outs = kern(
-        inputs=[q, k, v, g, beta, state, T, proj, net.norm.weight, zmax, Mp],
+    state_out, x16, xsum, rscale, out = kern(
+        inputs=[q, k, v, g, beta, state, T, proj, net.norm.weight, zmax, Mp, int(prep)],
         template=[("InT", q.dtype)],
         grid=(32, Dv // 8, B * Hv),
         threadgroup=(32, Dv // 8, 1),
-        output_shapes=[state.shape] + ([(M, K), (K // 16, Mp), (Mp,)] if prep else [(M, K)]),
-        output_dtypes=[mx.float32] + ([mx.float16, mx.float32, mx.float32] if prep else [q.dtype]),
+        output_shapes=[state.shape, (M, K), (K // 16, Mp), (Mp,), (M, K)],
+        output_dtypes=[mx.float32, mx.float16, mx.float32, mx.float32, q.dtype],
     )
     if prep:
-        p = Prepped(outs[1], outs[2], outs[3], (B, T, K), q.dtype)
+        p = Prepped(x16, xsum, rscale, (B, T, K), q.dtype)
         p.natural = False
-        return outs[0], p
-    return outs[0], outs[1].reshape(B, T, K)
+        return state_out, p
+    return state_out, out.reshape(B, T, K)
