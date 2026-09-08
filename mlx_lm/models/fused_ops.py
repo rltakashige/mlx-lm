@@ -310,30 +310,43 @@ def _add_rms_norm_source(K, NT, eps):
     const int lid = thread_position_in_threadgroup.x;
     const device T* xr = x + (size_t)row * K;
     const device T* rr = res + (size_t)row * res_rows * K;
+    constexpr int NCH = (K + NT * 4 - 1) / (NT * 4);
     // The residual summed over its slot rows as mx.sum does, then the add of the ops;
     // the norm reads the rounded sum
-    #define LOAD(j) (has_res ? static_cast<float>(static_cast<T>(static_cast<float>(xr[j]) + static_cast<float>(res_sum(rr, j, K, res_rows)))) : static_cast<float>(xr[j]))
+    float xv[NCH][4];
     float acc = 0.0f;
-    for (int r = 0; r < K; r += NT * 4) {{
-      for (int i = 0; i < 4; i++) {{
-        const int j = r + lid * 4 + i;
-        if (j < K) {{ const float xi = LOAD(j); acc += xi * xi; }}
+    for (int c = 0; c < NCH; c++) {{
+      const int j0 = c * NT * 4 + lid * 4;
+      if (j0 + 4 <= K) {{
+        float4 xf = float4(*(const device vec<T, 4>*)(xr + j0));
+        if (has_res) {{
+          // rows y, y + 8, ... per lane row in the input type, then the lane rows in order
+          const int L = min(8, res_rows);
+          vec<T, 4> tot = vec<T, 4>(T(0.0f));
+          for (int y = 0; y < L; y++) {{
+            vec<T, 4> t = vec<T, 4>(T(0.0f));
+            for (int r = y; r < res_rows; r += L) t = *(const device vec<T, 4>*)(rr + (size_t)r * K + j0) + t;
+            tot = (y == 0) ? t : t + tot;
+          }}
+          xf = float4(vec<T, 4>(xf) + tot);
+        }}
+        for (int i = 0; i < 4; i++) {{ xv[c][i] = xf[i]; acc += xf[i] * xf[i]; }}
+      }} else {{
+        for (int i = 0; i < 4; i++) xv[c][i] = 0.0f;
       }}
     }}
     threadgroup float sums[32];
     acc = rms_sum(acc, sums, thread_index_in_simdgroup, simdgroup_index_in_threadgroup);
     const float inv = metal::precise::rsqrt(acc / K + EPS);
-    for (int r = 0; r < K; r += NT * 4) {{
-      for (int i = 0; i < 4; i++) {{
-        const int j = r + lid * 4 + i;
-        if (j < K) {{
-          const float xi = LOAD(j);
-          if (has_res) h[(size_t)row * K + j] = static_cast<T>(xi);
-          out[(size_t)row * K + j] = weight[j] * static_cast<T>(xi * inv);
+    for (int c = 0; c < NCH; c++) {{
+      const int j0 = c * NT * 4 + lid * 4;
+      if (j0 + 4 <= K) {{
+        for (int i = 0; i < 4; i++) {{
+          if (has_res) h[(size_t)row * K + j0 + i] = static_cast<T>(xv[c][i]);
+          out[(size_t)row * K + j0 + i] = weight[j0 + i] * static_cast<T>(xv[c][i] * inv);
         }}
       }}
     }}
-    #undef LOAD
 """
 
 

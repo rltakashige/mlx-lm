@@ -228,22 +228,12 @@ class TestMergedKernels(unittest.TestCase):
             for a, b in ((p.x16, pr.x16), (p.xsum[:, :M], pr.xsum[:, :M]), (p.rscale[:M], pr.rscale[:M])):
                 self.assertTrue(mx.array_equal(a, b).item())
 
-    def test_moe_topk_plan_and_slot_sum(self):
-        """The fused top-k equals argpartition (ties included); the consumers sum slot rows as mx.sum."""
+    def test_moe_slots_and_slot_sum(self):
+        """The MoE slot rows sum to the block output; the consumers sum slot rows as mx.sum."""
         from mlx_lm.models import moe_small
 
-        E, k, m, K = 256, 8, 4, 2048
-        mx.random.seed(7)
-        logits = (mx.random.normal((m, E + 1)) * 2).astype(mx.bfloat16)
-        # ties at the top and inside the top-k
-        logits[:, 5] = logits[:, :E].max(axis=-1)
-        logits[:, 77] = logits[:, 5]
-        logits[:, 200] = logits[:, 9]
-        x = (mx.random.normal((m, K)) * 2).astype(mx.bfloat16)
-        x16, xsum, rscale, inds = moe_small._prep(x, "copy", logits, m, k, E)
-        ref = mx.argpartition(logits[:, :E], kth=-k, axis=-1)[:, -k:].reshape(-1)
-        self.assertTrue(mx.array_equal(inds, ref.astype(mx.int32)).item(), (inds, ref))
-        # The whole block (top-k, plan slots in the gather kernels, scores) against the ops
+        m = 4
+        # The whole block against the ops, and its slot rows
         import sys
 
         sys.path.insert(0, os.path.dirname(__file__))
@@ -258,8 +248,9 @@ class TestMergedKernels(unittest.TestCase):
         for mm in (1, 3, 8):
             xx = mx.random.normal((1, mm, 2048)).astype(mx.bfloat16)
             lg = block.gate(xx)
-            y = moe_small.experts(block, xx, lg).astype(mx.float32)
-            ys = moe_small.experts(block, xx, lg, slots=True)
+            inds = mx.argpartition(lg[..., :16], kth=-8, axis=-1)[..., -8:]
+            y = moe_small.experts(block, xx, lg, inds).astype(mx.float32)
+            ys = moe_small.experts(block, xx, lg, inds, slots=True)
             self.assertTrue(mx.array_equal(ys.sum(axis=-2).astype(mx.float32), y).item())
             from unittest import mock
 

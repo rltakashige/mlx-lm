@@ -233,10 +233,12 @@ class SparseMoeBlock(nn.Module):
 
         E, k = self.num_experts, self.top_k
         logits = self.gate(x)
+        inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
         if moe_small.routes(self, x):
-            y = moe_small.experts(self, x, logits, slots and self.sharding_group is None)
+            y = moe_small.experts(
+                self, x, logits, inds, slots and self.sharding_group is None
+            )
         else:
-            inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
             if self.norm_topk_prob:
                 top = mx.take_along_axis(logits, inds, axis=-1)
                 scores = mx.softmax(top, axis=-1, precise=True)

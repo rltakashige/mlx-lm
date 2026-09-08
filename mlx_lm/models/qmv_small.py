@@ -81,17 +81,22 @@ inline void store16(device T* p, const thread float* v) {
   for (int i = 0; i < 16; i++) p[i] = static_cast<T>(v[i]);
 }
 
-// mx.sum over the slot rows of a residual: col_reduce_small's order in the input type
+// 16 values of the residual summed over its slot rows as mx.sum does (col_reduce_small: rows
+// y, y + 8, ... per lane row in the input type, then the lane rows in order), into floats.
 template <typename T>
-inline T res_sum(const device T* rr, int j, int K, int rows) {
+inline void load16_res(const device T* rr, int K, int rows, thread float* out) {
+  float v[16];
+  T tot[16], t[16];
   const int L = min(8, rows);
-  T tot = T(0.0f);
   for (int y = 0; y < L; y++) {
-    T t = T(0.0f);
-    for (int r = y; r < rows; r += L) t = rr[(size_t)r * K + j] + t;
-    tot = (y == 0) ? t : t + tot;
+    for (int i = 0; i < 16; i++) t[i] = T(0.0f);
+    for (int r = y; r < rows; r += L) {
+      load16(rr + (size_t)r * K, v);
+      for (int i = 0; i < 16; i++) t[i] = T(v[i]) + t[i];
+    }
+    for (int i = 0; i < 16; i++) tot[i] = (y == 0) ? t[i] : t[i] + tot[i];
   }
-  return tot;
+  for (int i = 0; i < 16; i++) out[i] = float(tot[i]);
 }
 """
 
@@ -111,9 +116,10 @@ def _load_x(cidx, store=False):
       float xx[16];
       load16(x + (size_t)m * K + ({cidx}) * 16, xx);
       if (has_res) {{
-        const device T* rr = res + (size_t)m * res_rows * K + ({cidx}) * 16;
+        float rr[16];
+        load16_res(res + (size_t)m * res_rows * K + ({cidx}) * 16, K, res_rows, rr);
         {_UNROLL}
-        for (int i = 0; i < 16; i++) xx[i] = float(T(xx[i] + float(res_sum(rr, i, K, res_rows))));
+        for (int i = 0; i < 16; i++) xx[i] = float(T(xx[i] + rr[i]));
         {"store16(h + (size_t)m * K + (" + cidx + ") * 16, xx);" if store else ""}
       }}"""
 
