@@ -21,7 +21,7 @@ from .cache import ArraysCache, KVCache
 from .fused_ops import prep_add_rms_norm
 from .gated_delta import gated_delta_kernel, gated_delta_update
 from .pipeline import PipelineMixin
-from .qmv_small import _nax_m, prep_gate, prep_gated_norm, prep_swiglu, qlinear, routes
+from .qmv_small import prep_gate, prep_gated_norm, prep_swiglu, qlinear
 from .qwen3_next import Qwen3NextAttention, Qwen3NextMLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock
@@ -320,18 +320,14 @@ class GatedDeltaNet(nn.Module):
             out, z = self._mixer(proj, mask, cache)
             z_off = 0
 
-        if fused and out.ndim == 3:
-            # The fused mixer already applied the norm (and the prep)
-            out = qlinear(self.out_proj, out)
+        gate = z if fused else z.reshape(B * S, -1)
+        prepped = prep_gated_norm(self.norm, out, gate, self.out_proj, z_off)
+        if prepped is not None:
+            out = qlinear(self.out_proj, prepped)
+        elif fused:
+            out = self.out_proj(fused_ops.gated_norm(self.norm, out, gate, z_off))
         else:
-            gate = z if fused else z.reshape(B * S, -1)
-            prepped = prep_gated_norm(self.norm, out, gate, self.out_proj, z_off)
-            if prepped is not None:
-                out = qlinear(self.out_proj, prepped)
-            elif fused:
-                out = self.out_proj(fused_ops.gated_norm(self.norm, out, gate, z_off))
-            else:
-                out = self.out_proj(self.norm(out, z).reshape(B, S, -1))
+            out = self.out_proj(self.norm(out, z).reshape(B, S, -1))
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -421,22 +417,14 @@ class GatedDeltaNet(nn.Module):
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim), dtype=proj.dtype
             )
-        q, k, v, g, beta, cache[0], zmax = fused_ops.gdn_in(self, proj, conv_state)
+        q, k, v, g, beta, cache[0] = fused_ops.gdn_in(self, proj, conv_state)
         state = cache[1]
         if state is None:
             state = mx.zeros(
                 (B, self.num_v_heads, self.head_v_dim, self.head_k_dim), mx.float32
             )
         update = functools.partial(gated_delta_kernel, q, k, v, g, beta, state)
-        proj2 = proj.reshape(B * S, -1)
-        # The recurrence with the gated norm (and its prep) as its epilogue
-        prep = routes(self.out_proj, (B, S, self.value_dim), proj.dtype) and not _nax_m(B * S)
-        if fused_ops.gdn_norm_ok(self, q, state, S):
-            cache[1], out = fused_ops.gdn_norm(
-                self, q, k, v, g, beta, state, proj2, zmax, prep
-            )
-        else:
-            out, cache[1] = update()
+        out, cache[1] = update()
         cache.advance(S)
         if cache.keep_states and S > 1:
             cache.rollback = lambda steps: update(steps=steps)[1]
@@ -446,7 +434,7 @@ class GatedDeltaNet(nn.Module):
                 [conv_state, proj[..., : self.conv_dim]], axis=1
             )
         # z is read in place from the projection rows
-        return out, proj2, self.conv_dim
+        return out, proj.reshape(B * S, -1), self.conv_dim
 
 
 class DecoderLayer(nn.Module):

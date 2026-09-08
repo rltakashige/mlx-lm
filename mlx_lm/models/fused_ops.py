@@ -158,23 +158,6 @@ def _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale):
         }}
       }}
     }}
-    if (type == 2) {{
-      // max |z| of head h, for the row scale of the gated-norm prep
-      float zm = 0.0f;
-      if (active) {{
-        const device T* zr = proj + (size_t)m * PW + CD + h * Dv + c0;
-        for (int i = 0; i < 4; i++) zm = max(zm, metal::fabs(static_cast<float>(zr[i])));
-      }}
-      zm = simd_max(zm);
-      if (TG > 32) {{
-        threadgroup float zred[32];
-        if (thread_index_in_simdgroup == 0) zred[simdgroup_index_in_threadgroup] = zm;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        zm = zred[0];
-        for (int i = 1; i < TG / 32; i++) zm = max(zm, zred[i]);
-      }}
-      if (lid == 0) zmax[(size_t)m * Hv + h] = zm;
-    }}
     // Gate values of head h: g = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b).
     if (type == 2 && lid == 0) {{
       const device T* row = proj + (size_t)m * PW + CD + VD;
@@ -207,8 +190,7 @@ def gdn_in(net, proj, conv_state):
     """The GDN mixer inputs from the fused in_proj output ``proj`` (B, S, PW).
 
     Returns q, k (B, S, Hk, Dk) normalized and scaled, v (B, S, Hv, Dv), g (B, S, Hv)
-    float32, beta (B, S, Hv), the next conv state (B, KW - 1, conv_dim) and the per-head
-    max |z| (B * S, Hv).
+    float32, beta (B, S, Hv) and the next conv state (B, KW - 1, conv_dim).
     """
     B, S, PW = proj.shape
     Hk, Hv, Dk, Dv = net.num_k_heads, net.num_v_heads, net.head_k_dim, net.head_v_dim
@@ -223,7 +205,7 @@ def gdn_in(net, proj, conv_state):
         (Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale, str(proj.dtype), str(net.A_log.dtype)),
         lambda: _gdn_in_source(Hk, Hv, Dk, Dv, PW, TG, eps, qscale, kscale),
         ["proj", "state_in", "w", "A_log", "dt_bias", "S"],
-        ["q", "k", "v", "g", "beta", "state_out", "zmax"],
+        ["q", "k", "v", "g", "beta", "state_out"],
         _HEADER,
     )
     return kern(
@@ -238,9 +220,8 @@ def gdn_in(net, proj, conv_state):
             (B, S, Hv),
             (B, S, Hv),
             conv_state.shape,
-            (B * S, Hv),
         ],
-        output_dtypes=[proj.dtype] * 3 + [mx.float32, proj.dtype, proj.dtype, mx.float32],
+        output_dtypes=[proj.dtype] * 3 + [mx.float32, proj.dtype, proj.dtype],
     )
 
 
@@ -505,218 +486,3 @@ def attn_gate(x, qkv):
         output_dtypes=[x.dtype],
     )
     return out.reshape(B, L, H * Dh)
-
-
-def _gdn_norm_source(Dv, Dk, Hk, Hv, TMAX, PW, ZO, eps):
-    """The packed gated-delta recurrence (4 lanes per value row, 8 rows per simdgroup, all Dv
-    rows of a head in one threadgroup) with the gated norm of the outputs as its epilogue.
-
-    With ``do_prep`` it writes the ``qmv_small`` prep of norm(y) * silu(z) (fp16 rows, chunk
-    sums, row scales), else the product in the activation type; both round like the ops.
-    """
-    order, scale = (0, 4, 1, 5, 2, 6, 3, 7), (1.0, 1.0, 1 / 16, 1 / 16, 1.0, 1.0, 1 / 16, 1 / 16)
-    stores = "\n".join(
-        f"        x16[xrow + c * 16 + {c8 * 8 + j}] = half(vals[t][c * 16 + {c8 * 8 + order[j]}] * (sc * {scale[j]}f));"
-        for c8 in range(2)
-        for j in range(8)
-    )
-    prep_epilogue = f"""
-    // Row scale from the bound sqrt(D) * max|w| * max|z| (the prep's scan), as a power of two
-    float wmax = lid < Dv ? metal::fabs(static_cast<float>(weight[lid])) : 0.0f;
-    for (int e = lid + TGN; e < Dv; e += TGN) wmax = max(wmax, metal::fabs(static_cast<float>(weight[e])));
-    wmax = simd_max(wmax);
-    if (lane == 0) red[sg] = wmax;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    wmax = red[0];
-    for (int i = 1; i < NSG; i++) wmax = max(wmax, red[i]);
-    for (int t = 0; t < T; t++) {{
-      const int m = b_idx * T + t;
-      float amax = lid < Hv ? zmax[m * Hv + lid] : 0.0f;
-      for (int e = lid + TGN; e < Hv; e += TGN) amax = max(amax, zmax[m * Hv + e]);
-      amax = simd_max(amax);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (lane == 0) red[sg] = amax;
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      amax = red[0];
-      for (int i = 1; i < NSG; i++) amax = max(amax, red[i]);
-      amax *= wmax * metal::sqrt(float(Dv));
-      int e = 0;
-      float sc = 1.0f;
-      if (amax > 0.0f) {{
-        frexp(amax, e);
-        sc = ldexp(1.0f, 3 - e);
-      }}
-      if (hv_idx == 0 && lid == 0) rscale[m] = 1.0f / sc;
-      // ssh: 8 partials of 16 values, then the prep's xor-4,2,1 butterfly
-      if (lid < Dv / 16) {{
-        float acc = 0.0f;
-        for (int i = 0; i < 16; i++) acc += ys[t][lid * 16 + i] * ys[t][lid * 16 + i];
-        part[lid] = acc;
-      }}
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const float ssh = ((part[0] + part[4]) + (part[2] + part[6])) + ((part[1] + part[5]) + (part[3] + part[7]));
-      const float rsh = rsqrt(ssh / Dv + EPS);
-      for (int e2 = lid; e2 < Dv; e2 += TGN) {{
-        const float xx = ys[t][e2];
-        const float ww = static_cast<float>(weight[e2]);
-        const float gg = static_cast<float>(proj[(size_t)m * PW + ZO + hv_idx * Dv + e2]);
-        vals[t][e2] = xx * rsh * ww * (gg * sigmoid_f(gg));
-      }}
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const size_t xrow = (size_t)m * (Hv * Dv) + hv_idx * Dv;
-      for (int c = lid; c < Dv / 16; c += TGN) {{
-        float ssum = 0.0f;
-        for (int i = 0; i < 16; i++) ssum += vals[t][c * 16 + i];
-        xsum[(hv_idx * (Dv / 16) + c) * Mp + m] = ssum * sc;
-{stores}
-      }}
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }}
-"""
-    plain_epilogue = """
-    // mx.fast.rms_norm with weight (32 lanes x 4 values), then silu(z) * x in float
-    for (int t = 0; t < T; t++) {
-      const int m = b_idx * T + t;
-      if (sg == 0) {
-        float acc = 0.0f;
-        for (int i = 0; i < 4; i++) { const float f = ys[t][lane * 4 + i]; acc += f * f; }
-        acc = simd_sum(acc);
-        if (lane == 0) red[0] = metal::precise::rsqrt(acc / Dv + EPS);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const float inv = red[0];
-      for (int e = lid; e < Dv; e += TGN) {
-        const InT n = weight[e] * static_cast<InT>(ys[t][e] * inv);
-        const float gf = static_cast<float>(proj[(size_t)m * PW + ZO + hv_idx * Dv + e]);
-        const float sv = gf * Sigmoid{}(gf);
-        out[(size_t)m * (Hv * Dv) + hv_idx * Dv + e] = static_cast<InT>(sv * static_cast<float>(n));
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-"""
-    return f"""
-    constexpr int Dv = {Dv}, Dk = {Dk}, Hk = {Hk}, Hv = {Hv}, TMAX = {TMAX}, PW = {PW}, ZO = {ZO};
-    constexpr float EPS = {eps!r}f;
-    constexpr int lanes_per_row = 4;
-    constexpr int rows_per_simdgroup = 32 / lanes_per_row;
-    constexpr int values_per_lane = Dk / lanes_per_row;
-    constexpr int partials_per_lane = values_per_lane / 4;
-    constexpr int NSG = Dv / rows_per_simdgroup, TGN = 32 * NSG;
-
-    const int n = thread_position_in_grid.z;
-    const int b_idx = n / Hv;
-    const int hv_idx = n % Hv;
-    const int hk_idx = hv_idx / (Hv / Hk);
-    const int lane = thread_index_in_simdgroup;
-    const int sg = simdgroup_index_in_threadgroup;
-    const int lid = sg * 32 + lane;
-    const int row_in_simdgroup = lane / lanes_per_row;
-    const int lane_in_row = lane & (lanes_per_row - 1);
-    const int dv_idx = sg * rows_per_simdgroup + row_in_simdgroup;
-
-    const device InT* q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
-    const device InT* k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
-    const device InT* v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
-    const device float* i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
-    device float* o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
-
-    float state[values_per_lane];
-    for (int i = 0; i < values_per_lane; ++i) state[i] = i_state[i];
-    auto g_ = g + b_idx * T * Hv;
-    auto beta_ = beta + b_idx * T * Hv;
-
-    threadgroup float ys[TMAX][Dv];
-    threadgroup float vals[TMAX][Dv];
-    threadgroup float part[Dv / 16];
-    threadgroup float red[NSG];
-
-    for (int t = 0; t < T; ++t) {{
-      float gt = static_cast<float>(g_[hv_idx]);
-      float pt[partials_per_lane];
-      for (int pb = 0; pb < partials_per_lane; ++pb) {{
-        float acc = 0.0f;
-        for (int i = 0; i < 4; ++i) {{
-          int e = pb * 4 + i;
-          state[e] = state[e] * gt;
-          acc += state[e] * static_cast<float>(k_[e]);
-        }}
-        pt[pb] = acc;
-      }}
-      float kv_mem = ((pt[0] + pt[1]) + (pt[2] + pt[3])) + ((pt[4] + pt[5]) + (pt[6] + pt[7]));
-      kv_mem += simd_shuffle_xor(kv_mem, 1);
-      kv_mem += simd_shuffle_xor(kv_mem, 2);
-      auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
-      for (int pb = 0; pb < partials_per_lane; ++pb) {{
-        float acc = 0.0f;
-        for (int i = 0; i < 4; ++i) {{
-          int e = pb * 4 + i;
-          state[e] = state[e] + static_cast<float>(k_[e]) * delta;
-          acc += state[e] * static_cast<float>(q_[e]);
-        }}
-        pt[pb] = acc;
-      }}
-      float o = ((pt[0] + pt[1]) + (pt[2] + pt[3])) + ((pt[4] + pt[5]) + (pt[6] + pt[7]));
-      o += simd_shuffle_xor(o, 1);
-      o += simd_shuffle_xor(o, 2);
-      // The norm reads the output rounded to the activation type, as the ops did
-      if (lane_in_row == 0) ys[t][dv_idx] = static_cast<float>(static_cast<InT>(o));
-      q_ += Hk * Dk;
-      k_ += Hk * Dk;
-      v_ += Hv * Dv;
-      g_ += Hv;
-      beta_ += Hv;
-    }}
-    for (int i = 0; i < values_per_lane; ++i) o_state[i] = state[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (do_prep) {{
-{prep_epilogue}
-    }} else {{
-{plain_epilogue}
-    }}
-"""
-
-
-def gdn_norm_ok(net, q, state, T):
-    """The fused recurrence + gated norm handles Dk = 128, Dv a multiple of 16, T <= 8, fp32 state."""
-    Dk, Dv = net.head_k_dim, net.head_v_dim
-    return (
-        Dk == 128
-        and Dv % 16 == 0
-        and Dv <= 256
-        and T <= 8
-        and state.dtype == mx.float32
-    )
-
-
-def gdn_norm(net, q, k, v, g, beta, state, proj, zmax, prep):
-    """The recurrence over ``T`` steps and ``norm(y, z)``; returns (state_out, prepped or out)."""
-    from .qmv_small import Prepped, _mp
-
-    B, T, Hk, Dk = q.shape
-    Hv, Dv = v.shape[2:]
-    M = B * T
-    K = Hv * Dv
-    Mp = _mp(M)
-    PW, ZO = proj.shape[-1], net.conv_dim
-    # One kernel for both output kinds, so a process compiles it once
-    kern = _kernel(
-        "gdn_norm",
-        (Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps, str(q.dtype)),
-        lambda: _gdn_norm_source(Dv, Dk, Hk, Hv, 8, PW, ZO, net.norm.eps),
-        ["q", "k", "v", "g", "beta", "state_in", "T", "proj", "weight", "zmax", "Mp", "do_prep"],
-        ["state_out", "x16", "xsum", "rscale", "out"],
-        _HEADER + _SMALL_HEADER,
-    )
-    state_out, x16, xsum, rscale, out = kern(
-        inputs=[q, k, v, g, beta, state, T, proj, net.norm.weight, zmax, Mp, int(prep)],
-        template=[("InT", q.dtype)],
-        grid=(32, Dv // 8, B * Hv),
-        threadgroup=(32, Dv // 8, 1),
-        output_shapes=[state.shape, (M, K), (K // 16, Mp), (Mp,), (M, K)],
-        output_dtypes=[mx.float32, mx.float16, mx.float32, mx.float32, q.dtype],
-    )
-    if prep:
-        p = Prepped(x16, xsum, rscale, (B, T, K), q.dtype)
-        p.natural = False
-        return state_out, p
-    return state_out, out.reshape(B, T, K)

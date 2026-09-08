@@ -81,8 +81,7 @@ def _gdn_reference(net, proj, conv_state):
     k = inv_scale * mx.fast.rms_norm(k, None, eps)
     from mlx_lm.models.gated_delta import compute_g
 
-    zmax = mx.abs(z.reshape(B * S, net.num_v_heads, net.head_v_dim).astype(mx.float32)).max(axis=-1)
-    return q, k, v, compute_g(net.A_log, a, net.dt_bias), mx.sigmoid(b), state_out, zmax
+    return q, k, v, compute_g(net.A_log, a, net.dt_bias), mx.sigmoid(b), state_out
 
 
 @unittest.skipUnless(mx.metal.is_available(), "Metal only")
@@ -99,7 +98,7 @@ class TestMergedKernels(unittest.TestCase):
             state = (mx.random.normal((B, 3, net.conv_dim)) * 2).astype(mx.bfloat16)
             outs = fused_ops.gdn_in(net, proj, state)
             refs = _gdn_reference(net, proj, state)
-            for name, o, r in zip(("q", "k", "v", "g", "beta", "state", "zmax"), outs, refs):
+            for name, o, r in zip(("q", "k", "v", "g", "beta", "state"), outs, refs):
                 self.assertEqual(o.dtype, r.dtype, name)
                 self.assertTrue(mx.array_equal(o, r).item(), f"{name} B={B} S={S}")
 
@@ -113,41 +112,10 @@ class TestMergedKernels(unittest.TestCase):
         ab = x[:n].reshape(n // Hv, 1, Hv)
         proj[..., net.conv_dim + net.value_dim :] = mx.concatenate([ab, ab], axis=-1)
         state = mx.zeros((n // Hv, 3, net.conv_dim), mx.bfloat16)
-        _, _, _, g, beta, _, _ = fused_ops.gdn_in(net, proj, state)
-        _, _, _, rg, rbeta, _, _ = _gdn_reference(net, proj, state)
+        _, _, _, g, beta, _ = fused_ops.gdn_in(net, proj, state)
+        _, _, _, rg, rbeta, _ = _gdn_reference(net, proj, state)
         self.assertTrue(mx.array_equal(g, rg).item())
         self.assertTrue(mx.array_equal(beta, rbeta).item())
-
-    def test_gdn_norm_matches_ops(self):
-        """The fused recurrence + gated norm equals the packed kernel followed by the norm / prep."""
-        from mlx_lm.models.gated_delta import gated_delta_kernel
-
-        net = _model().layers[0].linear_attn
-        norm = net.norm
-        norm.weight = (mx.random.normal((net.head_v_dim,)) * 0.2 + 1).astype(mx.bfloat16)
-        for B, S in ((1, 1), (1, 4), (2, 3), (1, 8)):
-            mx.random.seed(100 + B * 10 + S)
-            proj = (mx.random.normal((B, S, net.in_proj.weight.shape[0])) * 2).astype(mx.bfloat16)
-            cstate = (mx.random.normal((B, 3, net.conv_dim)) * 2).astype(mx.bfloat16)
-            q, k, v, g, beta, _, zmax = fused_ops.gdn_in(net, proj, cstate)
-            state = mx.random.normal((B, net.num_v_heads, net.head_v_dim, net.head_k_dim)) * 0.5
-            y, rstate = gated_delta_kernel(q, k, v, g, beta, state)
-            proj2 = proj.reshape(B * S, -1)
-            # activation-type output
-            st, out = fused_ops.gdn_norm(net, q, k, v, g, beta, state, proj2, zmax, False)
-            self.assertTrue(mx.array_equal(st, rstate).item())
-            ref = fused_ops.gated_norm(norm, y, proj2, net.conv_dim)
-            self.assertTrue(mx.array_equal(out, ref).item(), f"out B={B} S={S}")
-            # prep output
-            st, p = fused_ops.gdn_norm(net, q, k, v, g, beta, state, proj2, zmax, True)
-            pr = qmv_small.prep(
-                y.reshape(B * S, -1), "gated_norm", proj2, norm.weight, eps=norm.eps,
-                d=net.head_v_dim, gs=proj2.shape[-1], go=net.conv_dim,
-            )
-            M = B * S
-            self.assertTrue(mx.array_equal(st, rstate).item())
-            for name, a, b in (("x16", p.x16, pr.x16), ("xsum", p.xsum[:, :M], pr.xsum[:, :M]), ("rscale", p.rscale[:M], pr.rscale[:M])):
-                self.assertTrue(mx.array_equal(a, b).item(), f"{name} B={B} S={S}")
 
     def test_gated_norm_matches_ops(self):
         D, heads = 128, 4
