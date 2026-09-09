@@ -10,7 +10,9 @@ lane layout of the cooperative tensors is fixed at compile time from the M5 prob
 ``fm = ((l>>2)&4) | ((l>>1)&3)`` and ``cls = ((l>>2)&2) | (l&1)``. A lane reads 16
 consecutive nibbles per row and step; the pair trick yields the nibbles (e, e + 4) of a
 word together, so x is prepped in the pair order (0, 4, 1, 5, 2, 6, 3, 7) and both
-tensors are filled with packed writes. The split-K partials of a tile are summed through
+tensors are filled with packed writes. The K split is interleaved: simdgroup ``sg`` takes the
+groups ``sg``, ``sg + NSG``, ..., so one step of a threadgroup reads NSG consecutive 32-byte
+pieces of every weight row (whole cache lines). The partials of a tile are summed through
 threadgroup memory in simdgroup order.
 """
 
@@ -30,7 +32,7 @@ _UNROLL = "#pragma clang loop unroll(full)"
 
 def _source(MB, N, K, NSG):
     """Kernel for up to MB (8, 16 or 32) rows; the row count M is read from the x16 shape at
-    run time. NSG simdgroups split K; each holds one 32-column tile."""
+    run time. NSG simdgroups split K (interleaved); each holds one 32-column tile."""
     MT = 16 if MB <= 16 else 32
     NH = MB // 8  # x row sets fm + 8h read per lane
     G = K // 64
@@ -45,7 +47,7 @@ def _source(MB, N, K, NSG):
     const int n0 = threadgroup_position_in_grid.x * 32;
     const int fm = ((lane >> 2) & 4) | ((lane >> 1) & 3);
     const int cls = ((lane >> 2) & 2) | (lane & 1);
-    const int g0 = sg * GS;
+    const int g0 = sg;  // groups g0, g0 + NSG, ...
     constexpr auto desc = matmul2d_descriptor(MT, 32, 32, false, true, false,
                                               matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, metal::execution_simdgroup> op;
@@ -61,29 +63,15 @@ def _source(MB, N, K, NSG):
     for (int i = 0; i < MT; i++) tc[i] = 0.0f;""")
     for h in range(NH):
         add(f"    const device half* xp{h} = x16 + (size_t)min(fm + 8 * {h}, M - 1) * K + g0 * 64 + cls * 16;")
-    # x, scale and bias of a step are loaded one step ahead (L2 latency); the weights stream from DRAM.
-    add("    uint4 xn[NH][2];")
-    add("    half sn[4], bn[4];")
-    for h in range(NH):
-        add(f"    xn[{h}][0] = *(const device uint4*)(xp{h}); xn[{h}][1] = *(const device uint4*)(xp{h} + 8);")
-    for r in range(4):
-        add(f"    sn[{r}] = half(sp[{8 * r} * G]); bn[{r}] = half(bp[{8 * r} * G]);")
     add("    for (int u = 0; u < GS; u++) {")
-    add("      uint4 xv[NH][2];")
-    add("      half sv[4], bv[4];")
-    for h in range(NH):
-        add(f"      xv[{h}][0] = xn[{h}][0]; xv[{h}][1] = xn[{h}][1];")
-    for r in range(4):
-        add(f"      sv[{r}] = sn[{r}]; bv[{r}] = bn[{r}];")
-    add("      if (u + 1 < GS) {")
-    for h in range(NH):
-        add(f"        xn[{h}][0] = *(const device uint4*)(xp{h} + u * 64 + 64); xn[{h}][1] = *(const device uint4*)(xp{h} + u * 64 + 72);")
-    for r in range(4):
-        add(f"        sn[{r}] = half(sp[{8 * r} * G + 1]); bn[{r}] = half(bp[{8 * r} * G + 1]);")
-    add("      }")
     add("      uint2 wq[4];")
+    add("      half sv[4], bv[4];")
+    add("      uint4 xv[NH][2];")
     for r in range(4):
         add(f"      wq[{r}] = *(const device uint2*)(wp + {8 * r} * KW);")
+        add(f"      sv[{r}] = half(sp[{8 * r} * G]); bv[{r}] = half(bp[{8 * r} * G]);")
+    for h in range(NH):
+        add(f"      xv[{h}][0] = *(const device uint4*)(xp{h}); xv[{h}][1] = *(const device uint4*)(xp{h} + 8);")
     for o in range(2):
         # Left input element 8*f + 4*h + e, fragment f = (mf, kf): x row fm + 8*(2*mf + h) and the
         # 4 pair-order values of k fragment kf of op o, one 8-byte write per (f, h).
@@ -100,7 +88,9 @@ def _source(MB, N, K, NSG):
                 add(f"      {{ half2 q = as_type<half2>(({sh} & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);")
                 add(f"        *(thread half2*)&tb[{16 * (e >> 1) + 4 * r + 2 * (e & 1)}] = fma(q, half2(sv[{r}]), half2(bv[{r}])); }}")
         add("      op.run(ta, tb, tc);")
-    add("      wp += 8; sp += 1; bp += 1;")
+    add("      wp += 8 * NSG; sp += NSG; bp += NSG;")
+    for h in range(NH):
+        add(f"      xp{h} += 64 * NSG;")
     add("    }")
     # Split-K partials: simdgroup 0 adds the others in order, then stores.
     add("    if (sg > 0) {")
