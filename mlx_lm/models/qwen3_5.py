@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -563,8 +564,9 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
-    # Layers per mx.async_eval while generating (0 disables)
-    eval_every = 8
+    # Layers per mx.async_eval while generating (0 disables). 2 starts the GPU on the first
+    # layers while the host builds the rest; 8 left the GPU waiting at the chunk ends.
+    eval_every = int(os.environ.get("MLX_QWEN_EVAL_EVERY", 2))
 
     def __init__(self, args: TextModelArgs):
         super().__init__()
