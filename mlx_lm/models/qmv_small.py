@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Small-M (3..8 rows) quantized matvec for the MTP verify pass.
+"""Small-M (3..4 rows) quantized matvec for the MTP verify pass.
 
 ``mx.quantized_matmul`` routes 2 <= M < 13 to ``qmv_wide``, which dequantizes
 each weight in fp32 per input row and is ALU bound on M5. This kernel keeps the
@@ -26,8 +26,9 @@ import mlx.nn as nn
 _VPL = 16  # K values per lane per step of the 4-bit kernels
 # At M = 2 mx.quantized_matmul is already weight-bound and the prep launch costs more than it saves.
 _MIN_M, _MAX_M = 3, 8
-# From 6 rows the tensor-op kernel (qmv_nax) is faster than the SIMD kernel, also under sustained load.
-_NAX_MIN_M, _NAX_MAX_M = 6, 32
+# From 5 rows the tensor-op kernel (qmv_nax) is faster than the SIMD kernel, also under sustained load
+# (the 5-row SIMD configs cost 3.8-9.4 ms more per verify than the tensor-op kernel).
+_NAX_MIN_M, _NAX_MAX_M = 5, 32
 _NAX_KSTEP = 1024  # K values per split-K slice at the largest split
 # Below 8 MB of weights the prep launch and the low threadgroup count cost more than the kernel saves.
 _MIN_BYTES = 8 << 20

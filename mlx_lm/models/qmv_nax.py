@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Small-M (6..32 rows) quantized matmul on the M5 Neural Accelerators.
+"""Small-M (5..32 rows) quantized matmul on the M5 Neural Accelerators.
 
 Each simdgroup runs ``matmul2d<MT x 32 x 32, execution_simdgroup>`` (Metal 4 tensor ops)
 over one 32-column tile and a slice of K, with both inputs in cooperative tensors: the x
