@@ -634,6 +634,13 @@ def speculative_generate_step(
         draft_cache = prompt_cache[len(model.layers) :]
 
     sampler = sampler or greedy_sampler
+    # Greedy MTP drafts: one kernel samples the draft after the head
+    fused_draft = (
+        mtp
+        and not logits_processors
+        and sampler is greedy_sampler
+        and hasattr(draft_model, "sample")
+    )
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -657,6 +664,11 @@ def speculative_generate_step(
         also returns the second choice when siblings are on."""
         second, drafting = None, hidden is not None
         with mx.stream(generation_stream):
+            if drafting and fused_draft:
+                # The two best tokens, the top probability and the margin from one kernel
+                tokens, stats, hidden = model.sample(y[None], hidden, cache=cache, head=head)
+                quantize_cache_fn(cache)
+                return tokens[:1], stats, hidden[:, -1:], tokens[1:]
             # The MTP drafter is given the hidden states of the tokens
             if hidden is not None:
                 logits, hidden = model(y[None], hidden, cache=cache, head=head)
@@ -752,9 +764,14 @@ def speculative_generate_step(
                 mx.async_eval(y_i, *([alt] if siblings else []))
                 i += 1
                 continue
-            ps.append(mx.exp(logprobs.max()))
-            # The gap of the two best candidates tells when the set was too narrow
-            ms.append(mx.abs(mx.diff(mx.topk(logprobs, 2))) if fallback else None)
+            if fused_draft:
+                # The fused step returns (top probability, margin) instead of logprobs
+                ps.append(logprobs[0])
+                ms.append(logprobs[1] if fallback else None)
+            else:
+                ps.append(mx.exp(logprobs.max()))
+                # The gap of the two best candidates tells when the set was too narrow
+                ms.append(mx.abs(mx.diff(mx.topk(logprobs, 2))) if fallback else None)
             mx.async_eval([a for a in (y_i, alt, ps[-1], ms[-1]) if a is not None])
             # Read the previous draft's numbers while this one runs.
             # The last draft is not read, so the verify is built without a wait.

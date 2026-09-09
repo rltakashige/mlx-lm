@@ -120,8 +120,35 @@ def run(
             head = phase("cand_build", lambda: cands.make_head(*recent))
             stats["cand_size"] += head.ids.size
         drafts, alts, hd, ps, q, i = [], [], hidden, [], 1.0, 0
+        fused = hasattr(draft, "sample") and not (check or siblings)
         while i < k:
             inp = draft_y[None] if i == 0 else drafts[-1][None]
+            if fused:
+                # The generation loop's path: one kernel samples the draft after the head
+                tok2, stat, hd_new = phase(
+                    f"draft_{i}", lambda: draft.sample(inp, hd, cache=draft_cache, head=head)
+                )
+                hd_new = hd_new[:, -1:]
+                tok, p, margin = tok2[:1], stat[0], stat[1].item()
+                if head is not None:
+                    stats["cand_steps"] += 1
+                    if fallback and margin < fallback:
+                        stats["fallback"] += 1
+                        full = phase("fallback", lambda: draft.lm_head(hd_new)[0, -1])
+                        tok = mx.argmax(full, keepdims=True).astype(mx.uint32)
+                        p = mx.max(mx.softmax(full.astype(mx.float32)))
+                mx.eval(tok, p)
+                drafts.append(tok)
+                ps.append(p.item())
+                hd = hd_new
+                if 0 < i < k - 1:
+                    q *= ps[i - 1]
+                    if q < stop:
+                        trim_prompt_cache(draft_cache, 1)
+                        drafts.pop()
+                        break
+                i += 1
+                continue
             logits, hd_new = phase(
                 f"draft_{i}", lambda: draft(inp, hd, cache=draft_cache, head=head)
             )
