@@ -53,6 +53,17 @@ inline float rms_sum(float acc, threadgroup float* sums, uint lane, uint sg) {
 """
 
 
+# The compiled Sigmoid op in the activation type: every step rounds to T
+_SIGMOID_T = """
+template <typename T>
+inline float sigmoid_t(float x) {
+  const float a = float(T(metal::exp(metal::abs(x))));
+  const float y = float(T(1.0f / float(T(1.0f + a))));
+  return (x < 0.0f) ? y : float(T(1.0f - y));
+}
+"""
+
+
 def enabled():
     return _ENABLED and mx.metal.is_available()
 

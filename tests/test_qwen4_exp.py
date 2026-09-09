@@ -254,3 +254,85 @@ class TestTinyModel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHyperConnectionKernels(unittest.TestCase):
+    """hc_small against the compiled ops of a quantized bf16 site (bf16 rounding noise)."""
+
+    def _site(self, inject, group_size, seed=0):
+        args = qwen4_exp.TextArgs(hidden_size=512, hc_count=4, hc_lowrank=64, rms_norm_eps=1e-6)
+        block = qwen4_exp.GatedResidual(args, use_combine=inject)
+        mx.random.seed(seed)
+        params = {k: mx.random.normal(v.shape) * 0.2 for k, v in tree_flatten(block.parameters())}
+        block.load_weights(list(params.items()))
+        nn.quantize(block, group_size=group_size, bits=4)
+        block.set_dtype(mx.bfloat16)
+        return block
+
+    @staticmethod
+    def _reference(block, h):
+        """The site in float32 from the dequantized weights, rounded to bf16 where the ops round."""
+        f = lambda a: a.astype(mx.bfloat16).astype(mx.float32)
+        hc, dims, lr = block.hc, block.dims, block.lowrank
+        down, up = block.input_mix_weight_down, block.input_mix_weight_up
+        deq = lambda m: mx.dequantize(m.weight, m.scales, m.biases, group_size=m.group_size, bits=m.bits).astype(mx.float32)
+        g = h.astype(mx.float32).reshape(1, -1, hc, dims)
+        normed = f(g * mx.rsqrt((g * g).mean(-1, keepdims=True) + block.hc_norm.eps))
+        normed = f(normed.reshape(1, -1, hc * dims) * block.hc_norm.gain().astype(mx.float32))
+        d = f(normed @ deq(down).T) * (1 / hc)
+        gate = f(d[..., :lr] * mx.sigmoid(d[..., :lr]))
+        w = f(mx.sigmoid(f(gate @ deq(up).T))).reshape(1, -1, hc, dims)
+        mixed = f(f(w * normed.reshape(1, -1, hc, dims)).mean(-2))
+        inject = 2 * f(mx.sigmoid(d[..., lr:])) if block.inject else None
+        return mixed, inject
+
+    def _check(self, block, rows, pending, group_size):
+        from mlx_lm.models import hc_small
+
+        mx.random.seed(rows)
+        h = mx.random.normal((1, rows, 4 * 512)).astype(mx.bfloat16)
+        self.assertTrue(hc_small.routes(block, h))
+        if pending:
+            x = mx.random.normal((1, rows, 512)).astype(mx.bfloat16)
+            inject = (2 * mx.sigmoid(mx.random.normal((1, rows, 4)))).astype(mx.bfloat16)
+            pending = (x, inject)
+            ref_h = block.combine(h, x, inject)
+        else:
+            pending, ref_h = None, h
+        mixed, inject_out, combined = hc_small.mix(block, h, pending)
+        self.assertTrue(mx.array_equal(combined, ref_h))
+        ops = block(ref_h)
+        ops = ops if block.inject else (ops, None)
+        for got, op, want in zip((mixed, inject_out), ops, self._reference(block, ref_h)):
+            if want is None:
+                self.assertIsNone(got)
+                continue
+            self.assertEqual(got.shape, want.shape)
+            err = (got.astype(mx.float32) - want).abs()
+            err_ops = (op.astype(mx.float32) - want).abs()
+            # bf16 rounding noise: no worse than the ops path, at most two ulps
+            self.assertLessEqual(err.mean().item(), 1.5 * err_ops.mean().item() + 1e-4)
+            self.assertLess((err / (1 + want.abs())).max().item(), 2e-2)
+        if rows > 1:
+            # The kernels give the same rows at every M
+            one = hc_small.mix(block, h[:, :1], None if pending is None else (pending[0][:, :1], pending[1][:, :1]))
+            self.assertTrue(mx.array_equal(one[0], mixed[:, :1]))
+
+    def test_sites_match_the_compiled_ops(self):
+        for group_size in (32, 64):
+            block = self._site(True, group_size)
+            for rows in (1, 3, 8):
+                self._check(block, rows, True, group_size)
+            self._check(block, 2, False, group_size)
+            self._check(self._site(False, group_size), 1, True, group_size)
+
+    def test_unsupported_shapes_use_the_ops(self):
+        from mlx_lm.models import hc_small
+
+        block = self._site(True, 32)
+        h = mx.random.normal((1, 9, 4 * 512)).astype(mx.bfloat16)
+        self.assertFalse(hc_small.routes(block, h))
+        self.assertFalse(hc_small.routes(block, h[:, :1].astype(mx.float32)))
+        args = qwen4_exp.TextArgs(hidden_size=64, hc_count=4, hc_lowrank=16)
+        small = qwen4_exp.GatedResidual(args)
+        self.assertFalse(hc_small.routes(small, mx.zeros((1, 1, 256), mx.bfloat16)))

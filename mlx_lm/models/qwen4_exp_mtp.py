@@ -79,8 +79,8 @@ class Model(nn.Module):
         if cache is None:
             cache = [None]
         mask = create_attention_mask(h, cache[0])
-        h = self.layers[0](h, mask, cache[0])
-        out = self.hyper_connection_mixer(h)
+        h, pending = self.layers[0](h, mask, cache[0])
+        out, _, h = self.hyper_connection_mixer.mix(h, pending)
         return (self.lm_head if head is None else head)(out), h
 
     def make_cache(self):

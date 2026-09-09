@@ -23,7 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import fused_ops
+from . import fused_ops, hc_small
 from .base import BaseModelArgs, create_attention_mask, create_ssm_mask
 from .base import scaled_dot_product_attention
 from .cache import ArraysCache, KVCache
@@ -200,6 +200,18 @@ class GatedResidual(nn.Module):
     def combine(self, hyper: mx.array, x: mx.array, inject: mx.array) -> mx.array:
         streams = hyper.reshape(*hyper.shape[:-1], self.hc, self.dims)
         return _combine(streams, x, inject).reshape(hyper.shape)
+
+    def mix(self, hyper: mx.array, pending=None):
+        """The site on ``hyper`` with the previous block's ``pending`` (x, inject)
+        combined first: (mixed, inject or None, combined streams)."""
+        if hc_small.routes(self, hyper):
+            return hc_small.mix(self, hyper, pending)
+        if pending is not None:
+            hyper = self.combine(hyper, *pending)
+        out = self(hyper)
+        if self.inject:
+            return out[0], out[1], hyper
+        return out, None, hyper
 
 
 _MIX_FUNCTIONS = {}
@@ -804,17 +816,21 @@ class DecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
-    def __call__(self, h: mx.array, mask, cache, ids: Optional[np.ndarray] = None):
+    def __call__(self, h: mx.array, mask, cache, ids: Optional[np.ndarray] = None, pending=None):
+        """``pending`` is the previous block's (output, inject), combined into the
+        streams by the next site; returns the streams and this layer's pending pair."""
         if "ple" in self:
+            if pending is not None:
+                h = self.attn_hyper_connection.combine(h, *pending)
+                pending = None
             h = h + self.ple(h, ids, cache)
-        x, inject = self.attn_hyper_connection(h)
+        x, inject, h = self.attn_hyper_connection.mix(h, pending)
         if self.is_linear:
             x = self.linear_attn(x, mask, cache)
         else:
             x = self.self_attn(x, mask, cache)
-        h = self.attn_hyper_connection.combine(h, x, inject)
-        x, inject = self.mlp_hyper_connection(h)
-        return self.mlp_hyper_connection.combine(h, self.mlp(x), inject)
+        x, inject2, h = self.mlp_hyper_connection.mix(h, (x, inject))
+        return h, (self.mlp(x), inject2)
 
 
 class Qwen4ExpModel(nn.Module):
@@ -844,11 +860,12 @@ class Qwen4ExpModel(nn.Module):
         h = mx.tile(h, (1, 1, self.args.hc_count))
         chunk = 0 if (cache[0] is None or self.training) else self.eval_every
         first = self.ple_idx if self.ple_idx is not None else 0
+        pending = None
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
-            h = layer(h, ssm_mask if layer.is_linear else fa_mask, c, ids)
+            h, pending = layer(h, ssm_mask if layer.is_linear else fa_mask, c, ids, pending)
             if chunk and i >= first and (i - first) % chunk == 0 and i < len(cache) - 1:
-                mx.async_eval(h)
-        out = self.hyper_connection_mixer(h)
+                mx.async_eval(h, *pending)
+        out, _, h = self.hyper_connection_mixer.mix(h, pending)
         return (out, h) if return_hidden else out
 
 
