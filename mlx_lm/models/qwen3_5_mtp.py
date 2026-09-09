@@ -31,12 +31,12 @@ class CandidateHead:
 
     def __init__(self, head, fixed, ids):
         quantized = hasattr(head, "scales")
-        params = (head.weight, head.scales, head.biases) if quantized else (head.weight,)
-        self.kwargs = (
-            dict(group_size=head.group_size, bits=head.bits, mode=head.mode)
-            if quantized
-            else None
-        )
+        params = [head.weight]
+        self.kwargs = None
+        if quantized:
+            # The e2m1 formats have no biases
+            params += [p for p in (head.scales, head.get("biases")) if p is not None]
+            self.kwargs = dict(group_size=head.group_size, bits=head.bits, mode=head.mode)
         ids = mx.sort(ids)
         self.first = mx.concatenate([mx.array([True]), ids[1:] != ids[:-1]])
         self.first &= ids >= fixed

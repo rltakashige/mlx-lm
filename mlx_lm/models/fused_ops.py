@@ -12,7 +12,7 @@ import os
 import mlx.core as mx
 
 from .qmv_small import _HEADER as _SMALL_HEADER
-from .qmv_small import _kernel, _nax_m, _rows, prep, prep_rms_norm, routes
+from .qmv_small import _kernel, _target, prep, prep_rms_norm, routes
 
 _ENABLED = os.environ.get("MLX_QWEN_FUSED", "1") != "0"
 
@@ -88,8 +88,8 @@ def prep_add_rms_norm(norm, x, residual, module, fused=True):
             norm.weight,
             eps=norm.eps,
             shape=tuple(x.shape),
-            natural=_nax_m(_rows(x.shape)),
             residual=(residual.reshape(-1, k), rows),
+            **_target(module, x.shape),
         )
         return p.h.reshape(x.shape), p
     if fused and enabled():
