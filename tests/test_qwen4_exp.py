@@ -147,11 +147,13 @@ class TestHyperConnection(unittest.TestCase):
         w = {k: np.array(v) for k, v in params.items()}
         g = h.reshape(2, 3, 4, 8)
         normed = (g / np.sqrt((g**2).mean(-1, keepdims=True) + 1e-6)).reshape(2, 3, 32) * (1 + w["hc_norm.weight"])
-        d = normed @ w["input_mix_weight_down.weight"].T / 4
+        # The last hc rows of the down projection are the reference's block_inject_weight
+        w_down, w_inject = w["input_mix_weight_down.weight"][:6], w["input_mix_weight_down.weight"][6:]
+        d = normed @ w_down.T / 4
         d = d / (1 + np.exp(-d))
         mix = 1 / (1 + np.exp(-(d @ w["input_mix_weight_up.weight"].T)))
         ref_mixed = (mix.reshape(2, 3, 4, 8) * normed.reshape(2, 3, 4, 8)).mean(-2)
-        ref_inject = 2 / (1 + np.exp(-(normed @ w["block_inject_weight.weight"].T) / 4))
+        ref_inject = 2 / (1 + np.exp(-(normed @ w_inject.T) / 4))
         ref_out = h + (x[:, :, None, :] * ref_inject[..., None]).reshape(2, 3, 32)
         self.assertTrue(np.allclose(np.array(mixed), ref_mixed, atol=1e-5))
         self.assertTrue(np.allclose(np.array(inject), ref_inject, atol=1e-5))

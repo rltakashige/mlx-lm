@@ -175,27 +175,26 @@ class GatedResidual(nn.Module):
         self.hc = args.hc_count
         self.dims = args.hidden_size
         hc_dims = self.hc * self.dims
+        self.lowrank = args.hc_lowrank
+        self.inject = use_combine
         self.hc_norm = RMSNorm(hc_dims, eps=args.rms_norm_eps, group_size=self.dims)
-        self.input_mix_weight_down = nn.Linear(hc_dims, args.hc_lowrank, bias=False)
+        # The injection weights (block_inject_weight) are the last hc rows of the down
+        # projection: both read the normed streams (see fuse_hyper_connections)
+        rows = args.hc_lowrank + (self.hc if use_combine else 0)
+        self.input_mix_weight_down = nn.Linear(hc_dims, rows, bias=False)
         self.input_mix_weight_up = nn.Linear(args.hc_lowrank, hc_dims, bias=False)
-        if use_combine:
-            self.block_inject_weight = nn.Linear(hc_dims, self.hc, bias=False)
 
     def __call__(self, hyper: mx.array):
         # The whole site is one compiled graph: one Python call instead of ~15
-        linears = [self.input_mix_weight_down, self.input_mix_weight_up]
-        inject = "block_inject_weight" in self
-        if inject:
-            linears.append(self.block_inject_weight)
         quant = None
         params = []
-        for m in linears:
+        for m in (self.input_mix_weight_down, self.input_mix_weight_up):
             if hasattr(m, "scales"):
                 quant = (m.group_size, m.bits, m.mode)
                 params += [m.weight, m.scales, m.biases]
             else:
                 params.append(m.weight)
-        fn = _mix_function(self.hc, self.dims, self.hc_norm.eps, quant, inject)
+        fn = _mix_function(self.hc, self.dims, self.lowrank, self.hc_norm.eps, quant, self.inject)
         return fn(hyper, self.hc_norm.gain(), *params)
 
     def combine(self, hyper: mx.array, x: mx.array, inject: mx.array) -> mx.array:
@@ -206,9 +205,9 @@ class GatedResidual(nn.Module):
 _MIX_FUNCTIONS = {}
 
 
-def _mix_function(hc, dims, eps, quant, inject):
+def _mix_function(hc, dims, lowrank, eps, quant, inject):
     """The compiled mix of a hyper-connection site, shared by the sites of a shape."""
-    key = (hc, dims, eps, quant, inject)
+    key = (hc, dims, lowrank, eps, quant, inject)
     fn = _MIX_FUNCTIONS.get(key)
     if fn is not None:
         return fn
@@ -227,15 +226,27 @@ def _mix_function(hc, dims, eps, quant, inject):
         normed = mx.fast.rms_norm(hyper.reshape(B, L, hc, dims), None, eps)
         normed = normed.reshape(B, L, hc * dims) * gain
         streams = normed.reshape(B, L, hc, dims)
-        g = nn.silu(matmul(normed, *params[:per]) * inv_hc)
-        weights = mx.sigmoid(matmul(g, *params[per : 2 * per])).reshape(B, L, hc, dims)
+        down = matmul(normed, *params[:per]) * inv_hc
+        g = nn.silu(down[..., :lowrank])
+        weights = mx.sigmoid(matmul(g, *params[per:])).reshape(B, L, hc, dims)
         mixed = (weights * streams).mean(axis=-2)
         if not inject:
             return mixed
-        return mixed, 2 * mx.sigmoid(matmul(normed, *params[2 * per :]) * inv_hc)
+        return mixed, 2 * mx.sigmoid(down[..., lowrank:])
 
     fn = _MIX_FUNCTIONS[key] = mx.compile(mix)
     return fn
+
+
+def fuse_hyper_connections(weights):
+    """Append the injection weights to the down projection of every site (exact:
+    the parameters of quantized rows are indexed by output row on axis 0)."""
+    marker = ".block_inject_weight."
+    for key in [k for k in weights if marker in k]:
+        prefix, param = key.split(marker)
+        down = f"{prefix}.input_mix_weight_down.{param}"
+        weights[down] = mx.concatenate([weights[down], weights.pop(key)], axis=0)
+    return weights
 
 
 @mx.compile
@@ -930,7 +941,7 @@ class Model(nn.Module):
                 v = v.transpose(0, 2, 1)
             out[k] = v
         self._finish_resident()
-        weights = fuse_projections(out)
+        weights = fuse_hyper_connections(fuse_projections(out))
         if self.args.model_path is not None:
             self.attach_table(self.args.model_path)
         return weights

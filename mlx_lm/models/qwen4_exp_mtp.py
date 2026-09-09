@@ -19,7 +19,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask
 from .qwen3_5_mtp import Candidates
 from .qwen4_exp import DecoderLayer, GatedResidual, QSAKVCache, RMSNorm, TextArgs
-from .qwen4_exp import fuse_projections
+from .qwen4_exp import fuse_hyper_connections, fuse_projections
 
 
 @dataclass
@@ -106,7 +106,7 @@ class Model(nn.Module):
                 continue
             out[k] = v
         self._match_shared_expert(out)
-        return fuse_projections(out)
+        return fuse_hyper_connections(fuse_projections(out))
 
     def _match_shared_expert(self, weights):
         """Requantize a shared expert stored at another group size or bit width
