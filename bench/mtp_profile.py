@@ -111,7 +111,7 @@ def run(
             c.keep_states = True
 
     accepted_at = defaultdict(int)
-    produced, cycles, tokens_out = 0, 0, []
+    produced, cycles, tokens_out, per_cycle = 0, 0, [], []
     while produced < max_tokens:
         cycle_tic = time.perf_counter()
         head = None
@@ -193,6 +193,7 @@ def run(
         produced += len(got)
         cycles += 1
         stats["drafted"] += kd
+        per_cycle.append((n, kd))
 
         y = draft_y = mx.array(got[-1:], mx.uint32)
         if n == kd:
@@ -224,6 +225,7 @@ def run(
         phase.times["cycle"] += time.perf_counter() - cycle_tic
         phase.counts["cycle"] += 1
     run.stats = stats
+    run.per_cycle = per_cycle
     return phase, accepted_at, cycles, produced, tokens_out
 
 
@@ -386,6 +388,7 @@ def main():
                     "stats": dict(stats),
                     "first_diff": first,
                     "tokens_out": out,
+                    "per_cycle": run.per_cycle,
                     "verify_layers": (
                         {n: sum(ts) * 1e3 / cycles for n, ts in timer.times.items()}
                         if timer
