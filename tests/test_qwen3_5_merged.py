@@ -376,3 +376,73 @@ class TestLatencyKernels(unittest.TestCase):
             # Only column 0 of xsum and rscale[0] are written for one row
             for name, a, b in (("x16", x16, r16), ("xsum", xsum[:, :1], rsum[:, :1]), ("rscale", rscale[:1], rrs[:1]), ("plan", plan, rplan)):
                 self.assertTrue(mx.array_equal(a, b).item(), f"{name} seed {seed}")
+
+
+class TestDraftKernels(unittest.TestCase):
+    """The kernels of the MTP draft step against the ops they replace."""
+
+    def setUp(self):
+        if not mx.metal.is_available():
+            raise unittest.SkipTest("Metal only")
+
+    def test_mtp_in_matches_ops(self):
+        D, V, M = 5120, 300, 3
+        for dtype in (mx.bfloat16, mx.float32):
+            for q in (None, (4, 64), (8, 64), (4, 32)):
+                mx.random.seed(1)
+                emb = nn.Embedding(V, D)
+                emb.weight = (mx.random.normal((V, D)) * 0.05).astype(dtype)
+                if q:
+                    emb = nn.QuantizedEmbedding.from_embedding(emb, q[1], q[0])
+                ne, nh = nn.RMSNorm(D, eps=1e-6), nn.RMSNorm(D, eps=1e-5)
+                ne.weight = (mx.random.normal((D,)) * 0.2 + 1).astype(dtype)
+                nh.weight = (mx.random.normal((D,)) * 0.2 + 1).astype(dtype)
+                tok = mx.random.randint(0, V, (1, M)).astype(mx.uint32)
+                hid = (mx.random.normal((1, M, D)) * 2).astype(dtype)
+                ref = mx.concatenate([ne(emb(tok)), nh(hid)], axis=-1)
+                out = fused_ops.mtp_in(emb, ne, nh, tok, hid)
+                self.assertTrue(mx.array_equal(out, ref).item(), (dtype, q))
+
+    def test_swiglu_matches_ops(self):
+        from mlx_lm.models.activations import swiglu
+
+        x = (mx.random.normal((5, 2 * 17408)) * 3).astype(mx.bfloat16)
+        ref = swiglu(x[:, :17408], x[:, 17408:])
+        self.assertTrue(mx.array_equal(fused_ops.swiglu(x), ref).item())
+        # Every bf16 gate value against a random up
+        g = _bf16_values()
+        g = g[: g.size // 4 * 4].reshape(1, -1)
+        u = (mx.random.normal(g.shape) * 3).astype(mx.bfloat16)
+        out = fused_ops.swiglu(mx.concatenate([g, u], axis=-1))
+        self.assertTrue(mx.array_equal(out, swiglu(g, u)).item())
+
+    def test_draft_sample_matches_ops(self):
+        def reference(fixed, rows, first, ids):
+            if first is not None:
+                rows = mx.where(first, rows, -mx.inf)
+            logits = rows if fixed is None else mx.concatenate([fixed, rows])
+            lp = logits.astype(mx.float32)
+            lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+            y = mx.argmax(lp, axis=-1)
+            masked = mx.put_along_axis(lp, y[None], mx.array(-mx.inf), -1)
+            second = mx.argmax(masked, axis=-1)
+            if ids is not None:
+                y, second = ids[y], ids[second]
+            return y, second, mx.exp(lp.max()), mx.abs(mx.diff(mx.topk(lp, 2)))
+
+        # Both logsumexp kernels (one block up to 4096 values, looped above), ties, masks, ids
+        for dtype in (mx.bfloat16, mx.float32):
+            for n in (128, 4096, 4100, 26600, 248320):
+                for cfg in range(4):
+                    mx.random.seed(n + cfg)
+                    F = n // 3 if cfg & 1 else 0
+                    rows = (mx.random.normal((n - F,)) * 4).astype(dtype)
+                    if cfg >= 2:
+                        rows[mx.random.randint(0, n - F, (5,))] = rows.max()
+                    fixed = (mx.random.normal((F,)) * 4).astype(dtype) if F else None
+                    first = (mx.random.uniform(shape=(n - F,)) > 0.3) if cfg & 2 else None
+                    ids = mx.random.randint(0, 250000, (n,)).astype(mx.uint32) if cfg & 1 else None
+                    tok, stats = fused_ops.draft_sample(rows, first, ids, fixed)
+                    y, second, p, m = reference(fixed, rows, first, ids)
+                    self.assertEqual(tok.tolist(), [y.item(), second.item()], (dtype, n, cfg))
+                    self.assertEqual(stats.tolist(), [p.item(), m.item()], (dtype, n, cfg))

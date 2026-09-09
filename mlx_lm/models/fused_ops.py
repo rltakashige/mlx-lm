@@ -681,3 +681,325 @@ def sdpa_two_pass(queries, keys, values, scale):
         output_dtypes=[queries.dtype],
     )
     return out
+
+
+def _mtp_in_source(D, NT, eps_e, eps_h, bits, GS, WPR):
+    if bits:
+        # The library's dequantize: scale * value + bias in float, rounded to T once
+        load = f"""
+        constexpr int BITS = {bits}, GS = {GS}, WPR = {WPR}, VPW = 32 / BITS;
+        constexpr uint MASK = (1u << BITS) - 1;
+        const uint word = ew[(size_t)tok * WPR + j0 / VPW];
+        const size_t g = (size_t)tok * (D / GS) + j0 / GS;
+        const float s = static_cast<float>(es[g]), b = static_cast<float>(eb[g]);
+        for (int i = 0; i < 4; i++) {{
+          const uint d = (word >> (BITS * ((j0 + i) % VPW))) & MASK;
+          xv[c][i] = static_cast<float>(static_cast<T>(metal::fma(s, static_cast<float>(d), b)));
+        }}"""
+    else:
+        load = """
+        const float4 xf = float4(*(const device vec<T, 4>*)(ew + (size_t)tok * D + j0));
+        for (int i = 0; i < 4; i++) xv[c][i] = xf[i];"""
+    return f"""
+    constexpr int D = {D}, NT = {NT}, NCH = (D + NT * 4 - 1) / (NT * 4);
+    constexpr float EPS_E = {eps_e!r}f, EPS_H = {eps_h!r}f;
+    const int part = threadgroup_position_in_grid.x;
+    const int m = threadgroup_position_in_grid.y;
+    const int lid = thread_position_in_threadgroup.x;
+    const uint tok = tokens[m];
+    float xv[NCH][4];
+    float acc = 0.0f;
+    for (int c = 0; c < NCH; c++) {{
+      const int j0 = c * NT * 4 + lid * 4;
+      if (j0 + 4 > D) {{
+        for (int i = 0; i < 4; i++) xv[c][i] = 0.0f;
+        continue;
+      }}
+      if (part) {{
+        const float4 xf = float4(*(const device vec<T, 4>*)(hidden + (size_t)m * D + j0));
+        for (int i = 0; i < 4; i++) xv[c][i] = xf[i];
+      }} else {{{load}
+      }}
+      for (int i = 0; i < 4; i++) acc += xv[c][i] * xv[c][i];
+    }}
+    threadgroup float sums[32];
+    acc = rms_sum(acc, sums, thread_index_in_simdgroup, simdgroup_index_in_threadgroup);
+    const float inv = metal::precise::rsqrt(acc / D + (part ? EPS_H : EPS_E));
+    const device T* w = part ? h_w : e_w;
+    device T* o = out + ((size_t)m * 2 + part) * D;
+    for (int c = 0; c < NCH; c++) {{
+      const int j0 = c * NT * 4 + lid * 4;
+      if (j0 + 4 <= D) {{
+        for (int i = 0; i < 4; i++) o[j0 + i] = w[j0 + i] * static_cast<T>(xv[c][i] * inv);
+      }}
+    }}
+"""
+
+
+def mtp_in(embed, norm_e, norm_h, tokens, hidden):
+    """``[norm_e(embed(tokens)); norm_h(hidden)]`` (.., 2D) as one kernel, or None when
+    the embedding is not plain or affine-quantized. The rows are dequantized in place."""
+    D = hidden.shape[-1]
+    quantized = hasattr(embed, "scales")
+    weight, scales, biases = embed.weight, embed.get("scales"), embed.get("biases")
+    if quantized:
+        bits, GS = embed.bits, embed.group_size
+        ok = (
+            embed.mode == "affine"
+            and bits in (2, 4, 8)
+            and GS % 4 == 0
+            and biases is not None
+            and scales.dtype == hidden.dtype
+        )
+    else:
+        bits, GS = 0, 0
+        ok = weight.dtype == hidden.dtype
+    if not (
+        enabled()
+        and ok
+        and hidden.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and D % 4 == 0
+        and norm_e.weight.dtype == hidden.dtype
+        and norm_h.weight.dtype == hidden.dtype
+    ):
+        return None
+    M = hidden.size // D
+    NT = _rms_threads(D)
+    WPR = weight.shape[-1]
+    kern = _kernel(
+        "mtp_in",
+        (D, NT, norm_e.eps, norm_h.eps, bits, GS, WPR, str(hidden.dtype)),
+        lambda: _mtp_in_source(D, NT, norm_e.eps, norm_h.eps, bits, GS, WPR),
+        ["tokens", "ew", "es", "eb", "e_w", "hidden", "h_w"],
+        ["out"],
+        _HEADER,
+    )
+    aux = scales if quantized else norm_e.weight
+    (out,) = kern(
+        inputs=[
+            tokens.reshape(-1),
+            weight,
+            aux,
+            biases if quantized else aux,
+            norm_e.weight,
+            hidden.reshape(M, D),
+            norm_h.weight,
+        ],
+        template=[("T", hidden.dtype)],
+        grid=(NT * 2, M, 1),
+        threadgroup=(NT, 1, 1),
+        output_shapes=[(M, 2 * D)],
+        output_dtypes=[hidden.dtype],
+    )
+    return out.reshape(*hidden.shape[:-1], 2 * D)
+
+
+def _swiglu_source(K):
+    return f"""
+    constexpr int K = {K};
+    const int m = thread_position_in_grid.y;
+    const int j = thread_position_in_grid.x * 4;
+    if (j >= K) return;
+    const vec<T, 4> g = *(const device vec<T, 4>*)(x + (size_t)m * 2 * K + j);
+    const vec<T, 4> u = *(const device vec<T, 4>*)(x + (size_t)m * 2 * K + K + j);
+    vec<T, 4> o;
+    for (int i = 0; i < 4; i++) {{
+      // nn.silu(gate) * up as the compiled ops round it: every step in T
+      const T s = Sigmoid{{}}(g[i]);
+      const T a = g[i] * s;
+      o[i] = a * u[i];
+    }}
+    *(device vec<T, 4>*)(out + (size_t)m * K + j) = o;
+"""
+
+
+def swiglu(gate_up):
+    """``silu(gate) * up`` of the fused (.., 2K) projection output, read in place; bitwise
+    the compiled ``activations.swiglu``. None when the shape is not handled."""
+    *batch, K2 = gate_up.shape
+    K = K2 // 2
+    M = gate_up.size // K2
+    if not (enabled() and K % 4 == 0 and gate_up.dtype in (mx.bfloat16, mx.float16)):
+        return None
+    kern = _kernel(
+        "swiglu",
+        (K, str(gate_up.dtype)),
+        lambda: _swiglu_source(K),
+        ["x"],
+        ["out"],
+        _HEADER,
+    )
+    (out,) = kern(
+        inputs=[gate_up.reshape(M, K2)],
+        template=[("T", gate_up.dtype)],
+        grid=(K // 4, M, 1),
+        threadgroup=(min(256, K // 4), 1, 1),
+        output_shapes=[(M, K)],
+        output_dtypes=[gate_up.dtype],
+    )
+    return out.reshape(*batch, K)
+
+
+# mx.logsumexp runs its one-block kernel up to this many values, its looped kernel above.
+_LSE_LOOPED_LIMIT = 4096
+
+
+def _draft_sample_source(looped, has_fixed, has_first, has_ids):
+    """One threadgroup over the virtual row [fixed; rows masked by first]: the top-2 (value,
+    index) with the smaller index winning ties (mx.argmax's rule), and the log-sum-exp as
+    mx.logsumexp computes it (its one-block or looped kernel)."""
+    value = "i < F ? static_cast<float>(fixed[i]) : " if has_fixed else ""
+    masked = "(!first[i - F]) ? -INFINITY : " if has_first else ""
+    if looped:
+        lse = """
+    float prevmax;
+    float maxval = -FLT_MAX;
+    float normalizer = 0.0f;
+    for (int r = 0; r < (n + NR * lsize - 1) / (NR * lsize); r++) {
+      const int offset = r * lsize * NR + lid * NR;
+      float vals[NR];
+      for (int i = 0; i < NR; i++) vals[i] = offset + i < n ? value(offset + i) : -INFINITY;
+      prevmax = maxval;
+      for (int i = 0; i < NR; i++) maxval = (maxval < vals[i]) ? vals[i] : maxval;
+      normalizer *= metal::fast::exp(prevmax - maxval);
+      for (int i = 0; i < NR; i++) {
+        normalizer += metal::fast::exp(vals[i] - maxval);
+        if (offset + i < n) insert(vals[i], offset + i, v1, i1, v2, i2);
+      }
+    }
+    prevmax = maxval;
+    maxval = simd_max(maxval);
+    normalizer *= metal::fast::exp(prevmax - maxval);
+    normalizer = simd_sum(normalizer);
+    prevmax = maxval;
+    if (lane == 0) local_max[sg] = maxval;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    maxval = simd_max(local_max[lane]);
+    normalizer *= metal::fast::exp(prevmax - maxval);
+    if (lane == 0) local_normalizer[sg] = normalizer;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    normalizer = simd_sum(local_normalizer[lane]);"""
+    else:
+        lse = """
+    float ld[NR];
+    for (int i = 0; i < NR; i++) {
+      const int j = lid * NR + i;
+      ld[i] = j < n ? value(j) : -INFINITY;
+      if (j < n) insert(ld[i], j, v1, i1, v2, i2);
+    }
+    if (sg == 0) {
+      local_max[lane] = -INFINITY;
+      local_normalizer[lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maxval = -FLT_MAX;
+    for (int i = 0; i < NR; i++) maxval = (maxval < ld[i]) ? ld[i] : maxval;
+    maxval = simd_max(maxval);
+    if (lane == 0) local_max[sg] = maxval;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      maxval = simd_max(local_max[lane]);
+      if (lane == 0) local_max[0] = maxval;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    maxval = local_max[0];
+    float normalizer = 0.0f;
+    for (int i = 0; i < NR; i++) normalizer += metal::fast::exp(ld[i] - maxval);
+    normalizer = simd_sum(normalizer);
+    if (lane == 0) local_normalizer[sg] = normalizer;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) normalizer = simd_sum(local_normalizer[lane]);"""
+    return f"""
+    constexpr int NR = 4;
+    const int lid = thread_position_in_threadgroup.x;
+    const int lsize = threads_per_threadgroup.x;
+    const int lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int n = count;
+    const int F = fixed_count;
+    (void)F;
+    #define value(i) ({value}{masked}static_cast<float>(rows[(i) - F]))
+    threadgroup float local_max[32];
+    threadgroup float local_normalizer[32];
+    threadgroup float tv1[32], tv2[32];
+    threadgroup int ti1[32], ti2[32];
+    float v1 = -INFINITY, v2 = -INFINITY;
+    int i1 = INT_MAX, i2 = INT_MAX;
+    {lse}
+    // Top-2 across the lanes, then across the simdgroups
+    for (int off = 16; off > 0; off >>= 1) {{
+      const float ov1 = simd_shuffle_xor(v1, off), ov2 = simd_shuffle_xor(v2, off);
+      const int oi1 = simd_shuffle_xor(i1, off), oi2 = simd_shuffle_xor(i2, off);
+      insert(ov1, oi1, v1, i1, v2, i2);
+      insert(ov2, oi2, v1, i1, v2, i2);
+    }}
+    if (lane == 0) {{ tv1[sg] = v1; ti1[sg] = i1; tv2[sg] = v2; ti2[sg] = i2; }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {{
+      for (int s = 1; s < (lsize + 31) / 32; s++) {{
+        insert(tv1[s], ti1[s], v1, i1, v2, i2);
+        insert(tv2[s], ti2[s], v1, i1, v2, i2);
+      }}
+      const float lse = metal::isinf(maxval) ? maxval : metal::precise::log(normalizer) + maxval;
+      // logprobs = logits - lse; p = exp(max), margin = |top-1 - top-2| of the logprobs
+      const float lp1 = v1 - lse, lp2 = v2 - lse;
+      stats[0] = metal::precise::exp(lp1);
+      stats[1] = metal::abs(lp2 - lp1);
+      tok[0] = {"ids[i1]" if has_ids else "uint(i1)"};
+      tok[1] = {"ids[i2]" if has_ids else "uint(i2)"};
+    }}
+"""
+
+
+_DRAFT_HEADER = """
+// Keep the two best (value, index) pairs; on equal values the smaller index wins.
+inline bool better(float v, int i, float bv, int bi) {
+  return v > bv || (v == bv && i < bi);
+}
+inline void insert(float v, int i, thread float& v1, thread int& i1, thread float& v2, thread int& i2) {
+  if (better(v, i, v1, i1)) {
+    v2 = v1; i2 = i1; v1 = v; i1 = i;
+  } else if (i != i1 && better(v, i, v2, i2)) {
+    v2 = v; i2 = i;
+  }
+}
+"""
+
+
+def draft_sample(rows, first=None, ids=None, fixed=None):
+    """The greedy draft from the logits of one row, as one kernel.
+
+    The row is ``[fixed; rows]`` with the ``rows`` entries whose ``first`` is False scored
+    -inf. Returns ``tok`` (2,) uint32 = the best and the second best entry (mapped through
+    ``ids`` when given) and ``stats`` (2,) float32 = the probability of the best under the
+    softmax of the row and the log-probability margin of the two best; bitwise the ops
+    ``argmax``, ``exp(max(logprobs))`` and ``abs(diff(topk(logprobs, 2)))``.
+    """
+    n = rows.size + (fixed.size if fixed is not None else 0)
+    looped = n > _LSE_LOOPED_LIMIT
+    threads = 1024 if looped else min(1024, (-(-n // 4) + 31) // 32 * 32)
+    key = (looped, fixed is not None, first is not None, ids is not None, str(rows.dtype))
+    kern = _kernel(
+        "draft_sample",
+        key,
+        lambda: _draft_sample_source(*key[:4]),
+        ["rows", "fixed", "first", "ids", "count", "fixed_count"],
+        ["tok", "stats"],
+        _HEADER + _DRAFT_HEADER,
+    )
+    tok, stats = kern(
+        inputs=[
+            rows,
+            rows if fixed is None else fixed,
+            rows if first is None else first,
+            rows if ids is None else ids,
+            n,
+            0 if fixed is None else fixed.size,
+        ],
+        template=[("T", rows.dtype)],
+        grid=(threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(2,), (2,)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return tok, stats

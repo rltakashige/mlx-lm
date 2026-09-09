@@ -195,8 +195,14 @@ class MLP(Qwen3NextMLP):
         prepped = prep_swiglu(gate_up, self.down_proj)
         if prepped is not None:
             return qlinear(self.down_proj, prepped)
-        gate, up = mx.split(gate_up, 2, axis=-1)
-        return self.down_proj(swiglu(gate, up))
+        # A few rows: one kernel reads gate and up in place (the compiled swiglu copies a slice)
+        act = None
+        if not self.training and gate_up.size <= 32 * gate_up.shape[-1]:
+            act = fused_ops.swiglu(gate_up)
+        if act is None:
+            gate, up = mx.split(gate_up, 2, axis=-1)
+            act = swiglu(gate, up)
+        return self.down_proj(act)
 
 
 class FusedSwitchGLU(nn.Module):

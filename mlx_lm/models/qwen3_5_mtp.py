@@ -8,8 +8,10 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import fused_ops
 from .base import BaseModelArgs, create_attention_mask
 from .cache import KVCache
+from .fused_ops import prep_add_rms_norm
 from .qwen3_5 import DecoderLayer, TextModelArgs, fuse_projections
 from .qwen3_5_moe import split_experts
 
@@ -54,6 +56,13 @@ class CandidateHead:
         if not self.fixed[0].shape[0]:
             return rows
         return mx.concatenate([self._logits(x, self.fixed), rows], axis=-1)
+
+    def sample(self, x):
+        """The greedy draft of the last row of ``x`` (see ``fused_ops.draft_sample``)."""
+        x = x.reshape(-1, x.shape[-1])
+        # The logits of every row, as the plain call computes them (same matmul kernel)
+        fixed = self._logits(x, self.fixed)[-1] if self.fixed[0].shape[0] else None
+        return fused_ops.draft_sample(self._logits(x, self.rows)[-1], self.first, self.ids, fixed)
 
 
 class Candidates:
@@ -114,6 +123,8 @@ class Model(nn.Module):
         text_model = getattr(target, "language_model", target)
         embed_tokens = text_model.model.embed_tokens
         self.embed_tokens = embed_tokens.__call__
+        # A partial keeps the embedding out of this module's parameters
+        self.embed_in = functools.partial(fused_ops.mtp_in, embed_tokens)
         if text_model.args.tie_word_embeddings:
             head, self.lm_head = embed_tokens, embed_tokens.as_linear
         else:
@@ -121,23 +132,45 @@ class Model(nn.Module):
         # A partial keeps the head out of this module's parameters
         self.candidates = functools.partial(Candidates, head)
 
-    def __call__(self, inputs: mx.array, hidden: mx.array, cache=None, head=None):
-        """``head`` replaces the output head (see ``CandidateHead``)."""
-        h = mx.concatenate(
-            [
-                self.pre_fc_norm_embedding(self.embed_tokens(inputs)),
-                self.pre_fc_norm_hidden(hidden),
-            ],
-            axis=-1,
-        )
+    def _hidden(self, inputs, hidden, cache):
+        """fc of [norm(embed(inputs)); norm(hidden)], the layers and the final norm."""
+        fused = not self.training
+        h = None
+        if fused:
+            h = self.embed_in(
+                self.pre_fc_norm_embedding, self.pre_fc_norm_hidden, inputs, hidden
+            )
+        if h is None:
+            h = mx.concatenate(
+                [
+                    self.pre_fc_norm_embedding(self.embed_tokens(inputs)),
+                    self.pre_fc_norm_hidden(hidden),
+                ],
+                axis=-1,
+            )
         h = self.fc(h)
         if cache is None:
             cache = [None] * len(self.layers)
         mask = create_attention_mask(h, cache[0])
+        pending = None
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
-        h = self.norm(h)
+            h, pending = layer(h, mask, c, pending, split=True)
+        # The last residual add is merged into the final norm
+        return prep_add_rms_norm(self.norm, h, pending, None, fused)[1]
+
+    def __call__(self, inputs: mx.array, hidden: mx.array, cache=None, head=None):
+        """``head`` replaces the output head (see ``CandidateHead``)."""
+        h = self._hidden(inputs, hidden, cache)
         return (self.lm_head if head is None else head)(h), h
+
+    def sample(self, inputs: mx.array, hidden: mx.array, cache=None, head=None):
+        """The greedy draft of one sequence as one kernel after the head: the two best
+        tokens (2,), the probability and margin of the best (2,) (see
+        ``fused_ops.draft_sample``) and the hidden states."""
+        h = self._hidden(inputs, hidden, cache)
+        if head is None:
+            return (*fused_ops.draft_sample(self.lm_head(h)[0, -1]), h)
+        return (*head.sample(h), h)
 
     def make_cache(self):
         return [KVCache() for _ in self.layers]

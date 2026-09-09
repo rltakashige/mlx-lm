@@ -374,6 +374,39 @@ class TestQwen3_5MTP(unittest.TestCase):
                 cands.observe(logits)
                 self.assertTrue(set(range(16)) <= set(cands.make_head().ids.tolist()))
 
+    def test_sample_matches_call(self):
+        """The fused draft step (one kernel after the head) matches the ops on the logits."""
+        for quantize in (False, True):
+            target, head = _models()
+            if quantize:
+                nn.quantize(target, 32, 4)
+                nn.quantize(head, 32, 4)
+            head.bind(target)
+            mx.random.seed(2)
+            hidden = mx.random.normal((1, 2, TEXT_CONFIG["hidden_size"]))
+            tokens = mx.array([[5, 9]], mx.uint32)
+            cands = head.candidates(8, size=4)
+            cands.extend(PROMPT)
+            logits = mx.zeros((1, TEXT_CONFIG["vocab_size"]))
+            logits[0, 20] = 3.0
+            cands.observe(logits)
+            for cand in (None, cands.make_head()):
+                caches = [head.make_cache() for _ in range(2)]
+                logits, h = head(tokens, hidden, cache=caches[0], head=cand)
+                tok, stats, h2 = head.sample(tokens, hidden, cache=caches[1], head=cand)
+                self.assertTrue(mx.array_equal(h, h2).item())
+                lp = logits[0, -1].astype(mx.float32)
+                lp = lp - mx.logsumexp(lp)
+                y = mx.argmax(lp)
+                second = mx.argmax(mx.put_along_axis(lp, y[None], mx.array(-mx.inf), -1))
+                if cand is not None:
+                    y, second = cand.ids[y], cand.ids[second]
+                self.assertEqual(tok.tolist(), [y.item(), second.item()], quantize)
+                self.assertEqual(stats[0].item(), mx.exp(lp.max()).item())
+                self.assertEqual(stats[1].item(), mx.abs(mx.diff(mx.topk(lp, 2))).item())
+                for a, b in zip(caches[0], caches[1]):
+                    self.assertTrue(mx.array_equal(a.keys[..., : a.offset, :], b.keys[..., : b.offset, :]).item())
+
     def test_partial_acceptance(self):
         for moe in (False, True):
             target, _ = _models(moe=moe)
