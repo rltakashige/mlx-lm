@@ -12,6 +12,7 @@ that is a sigmoid. Norm gains are stored zero-centered: y = norm(x) * (1 + w).
 import json
 import math
 import struct
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -362,6 +363,18 @@ class NGramTable:
         self.lru = OrderedDict()
         self.lookups = self.rows = self.hits = self.misses = self.bytes = 0
         self.seconds = 0.0
+        self.prewarm_seconds = None
+
+    def prewarm(self):
+        """Read the shard files once so the rows come from the page cache: a cold
+        row costs ~0.3 ms of disk latency, a warm one ~10 us (M5 Max)."""
+        tic = time.perf_counter()
+        buf = bytearray(64 << 20)
+        for file in sorted({arr.filename for arrays in self.shards for arr in arrays.values()}):
+            with open(file, "rb", buffering=0) as f:
+                while f.readinto(buf):
+                    pass
+        self.prewarm_seconds = time.perf_counter() - tic
 
     def _read(self, ids: np.ndarray) -> np.ndarray:
         """Dequantized rows (n, width) of distinct ``ids``, read shard by shard."""
@@ -426,10 +439,13 @@ class NGramEmbedding(nn.Module):
         # A resident table lives under a "_" key: outside the parameters
         self._resident = None
 
-    def attach(self, model_path: str, prefix: str):
+    def attach(self, model_path: str, prefix: str, prewarm: bool = True):
         self.table = NGramTable(model_path, prefix)
         if self.table.rows_total != self.hasher.rows or self.table.width != self.width:
             raise ValueError("The n-gram table on disk does not match the config")
+        if prewarm:
+            # Overlaps with the weight load
+            threading.Thread(target=self.table.prewarm, daemon=True).start()
 
     def rows(self, ids: np.ndarray, dtype) -> mx.array:
         """Embeddings (.., ple_embed_dim) of row ids (.., ngram_heads)."""
