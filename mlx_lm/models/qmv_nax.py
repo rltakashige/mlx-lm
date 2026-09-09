@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Small-M (4..32 rows) 4-bit affine g64 matmul on the M5 Neural Accelerators.
+"""Small-M (4..32 rows) 4-bit affine (group size 64 or 32) matmul on the M5 Neural Accelerators.
 
 Each simdgroup runs ``matmul2d<MT x 32 x KOP, execution_simdgroup>`` (Metal 4 tensor ops)
 with both inputs in cooperative tensors: the x rows in fp16 and the weight nibbles either
@@ -27,11 +27,12 @@ using namespace mpp::tensor_ops;
 _UNROLL = "#pragma clang loop unroll(full)"
 
 
-def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL):
+def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL, GROUP=64):
     """Kernel for up to MB (8, 16 or 32) rows; the row count M is read from the x16 shape at run time.
     NSG simdgroups split K; NT tiles of NCOL (16 or 32) columns per simdgroup at once; NTS tiles in
     sequence; GU groups (64 k) per load step (GU = 2: 16-byte weight loads); PF steps requested ahead."""
     i8 = mode != "f16"
+    assert GROUP == 64 or not i8, "the int8 modes sum x per 64-group"
     BT = "int8_t" if i8 else "half"
     MT = 16 if MB <= 16 else 32
     NH = MB // 8  # x row sets fm + 8h read per lane
@@ -51,6 +52,8 @@ def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL):
     constexpr int N = {N}, K = {K}, NSG = {NSG}, NT = {NT}, NTS = {NTS}, MT = {MT}, NH = {NH}, NCOL = {NCOL};
     const int M = x16_shape[0];
     constexpr int G = {G}, GS = {GS}, NU = {NU}, GU = {GU}, KW = K / 8, CC = {CC};
+    // Scale rows have SG groups of GROUP values; a 64-value block holds GPB of them.
+    constexpr int SG = K / {GROUP}, GPB = 64 / {GROUP};
     const int lane = thread_index_in_simdgroup;
     const int sg = simdgroup_index_in_threadgroup;
     const int tile0 = threadgroup_position_in_grid.x * (NT * NTS);
@@ -89,8 +92,8 @@ def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL):
       if (tile0 + tt * NT >= N / NCOL) break;
       const int n0 = (tile0 + tt * NT) * NCOL;
       const device uint32_t* wp = w + (size_t)(n0 + fm) * KW + g0 * 8 + cls * 2 * GU;
-      const device T* sp = scales + (size_t)(n0 + fm) * G + g0 + (GU == 2 ? cls >> 1 : 0);
-      const device T* bp = biases + (size_t)(n0 + fm) * G + g0 + (GU == 2 ? cls >> 1 : 0);
+      const device T* sp = scales + (size_t)(n0 + fm) * SG + g0 * GPB + (16 * GU * cls) / {GROUP};
+      const device T* bp = biases + (size_t)(n0 + fm) * SG + g0 * GPB + (16 * GU * cls) / {GROUP};
       const device T* sq = scales + (size_t)(n0 + 4 * cls) * G + g0;
       (void)sp; (void)bp; (void)sq;""")
     for t in range(NT):
@@ -139,7 +142,7 @@ def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL):
         add("        half sv[NT][4], bv[NT][4];")
         for t in range(NT):
             for r in range(NR):
-                add(f"        sv[{t}][{r}] = half(sp[({t} * NCOL + {r} * 8) * G]); bv[{t}][{r}] = half(bp[({t} * NCOL + {r} * 8) * G]);")
+                add(f"        sv[{t}][{r}] = half(sp[({t} * NCOL + {r} * 8) * SG]); bv[{t}][{r}] = half(bp[({t} * NCOL + {r} * 8) * SG]);")
     for h in range(NH):
         for c in range(2 * GU):
             add(f"        xv[{h}][{c}] = *(const device uint4*)(xp{h} + u * {64 * GU} + {8 * c});")
@@ -189,7 +192,7 @@ def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL):
                 f, rem = divmod(i, 8)
                 nf = (f % 2 if MT == 32 else f) if NCOL == 32 else 0
                 add(f"        acc{t}[{i}] = fma(tc{t}[{i}], s{t}_{nf}{rem % 4}, acc{t}[{i}]); tc{t}[{i}] = 0.0f;")
-    add(f"        wp += {8 * GU}; sp += {GU}; bp += {GU}; sq += 1;")
+    add(f"        wp += {8 * GU}; sp += GU * GPB; bp += GU * GPB; sq += 1;")
     for u in range(PF - 1):
         for t in range(NT):
             for r in range(NR):
@@ -246,7 +249,7 @@ def _config(M, N, K):
 
 
 def supported(x, w, scales, biases, group_size, bits):
-    if x.ndim != 2 or bits != 4 or group_size != 64 or biases is None:
+    if x.ndim != 2 or bits != 4 or group_size not in (32, 64) or biases is None:
         return False
     if x.dtype not in (mx.bfloat16, mx.float16) or scales.dtype != x.dtype or biases.dtype != x.dtype:
         return False
@@ -259,13 +262,14 @@ def nax_main(p, w, scales, biases, cfg=None, out_dtype=None):
     """``x @ dequant(w).T`` from a ``Prepped`` x stored in natural k order."""
     M, K = p.x16.shape
     N = w.shape[0]
+    GROUP = K // scales.shape[1]
     out_dtype = out_dtype or p.dtype
     MB = 8 if M <= 8 else (16 if M <= 16 else 32)  # one kernel per row bucket
     NSG, NT, KOP, mode, NTS, GU, PF, NCOL = (tuple(cfg) + ("f16", 1, 1, 1, 32))[:8] if cfg else _config(MB, N, K)
     kern = _kernel(
         "qmv_nax_" + mode,
-        (MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL, _tag(p.dtype), _tag(out_dtype)),
-        lambda: _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL),
+        (MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL, GROUP, _tag(p.dtype), _tag(out_dtype)),
+        lambda: _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL, GROUP),
         ["x16", "xsum", "rscale", "w", "scales", "biases"],
         ["y"],
         _HEADER,

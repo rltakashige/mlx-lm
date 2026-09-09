@@ -756,7 +756,7 @@ class Attention(nn.Module):
         sparse = self.indexer(x, cache)
         offset = cache.offset if cache is not None else 0
 
-        qkv = self.qkv_proj(x)
+        qkv = qlinear(self.qkv_proj, x)
         q, k, v = mx.split(qkv, [self.q_dim, self.q_dim + self.kv_dim], axis=-1)
         q, gate = mx.split(q.reshape(B, L, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, L, -1)
@@ -773,7 +773,7 @@ class Attention(nn.Module):
             mask = sparse if mask is None or isinstance(mask, str) else (mask & sparse)
         out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(out * mx.sigmoid(gate))
+        return qlinear(self.o_proj, out * mx.sigmoid(gate))
 
 
 # ------------------------------------------------------------------- GDN
@@ -889,7 +889,7 @@ class TextModel(nn.Module):
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
-            out = self.lm_head(out)
+            out = qlinear(self.lm_head, out)
         return (out, hidden) if return_hidden else out
 
     @property

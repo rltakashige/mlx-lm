@@ -540,12 +540,17 @@ def _shape_ok(m, n, k):
     return _MIN_M <= m <= _MAX_M and k % _KSTEP == 0 and n % 8 == 0
 
 
+def _group_ok(group_size, m):
+    """The SIMD kernel is g64 only; the tensor-op kernel also takes g32."""
+    return group_size == _GROUP or (group_size == 32 and _nax_m(m))
+
+
 def supported(x, w, scales, biases, group_size, bits):
     if (
         not _m5()
         or x.ndim != 2
         or bits != _BITS
-        or group_size != _GROUP
+        or not _group_ok(group_size, x.shape[0])
         or biases is None
     ):
         return False
@@ -612,7 +617,7 @@ def routes(module, shape, dtype):
         _m5()
         and isinstance(module, nn.QuantizedLinear)
         and module.bits == _BITS
-        and module.group_size == _GROUP
+        and _group_ok(module.group_size, m)
         and getattr(module, "mode", "affine") == "affine"
         and "bias" not in module
         and dtype in (mx.bfloat16, mx.float16)
@@ -701,7 +706,7 @@ def prep_gated_norm(norm, x, gate, module, gate_offset=0) -> "Prepped | None":
 
 
 def qlinear(module, x):
-    """Apply a bias-free 4-bit g64 ``QuantizedLinear`` through the small-M kernels when 3 <= M <= 32."""
+    """Apply a bias-free 4-bit ``QuantizedLinear`` (g64; g32 on the tensor-op rows) through the small-M kernels when 3 <= M <= 32."""
     if isinstance(x, Prepped):
         return _main(x, module.weight, module.scales, module.biases).reshape(
             *x.shape[:-1], -1
