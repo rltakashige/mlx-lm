@@ -47,6 +47,7 @@ class Model(nn.Module):
             }
         )
         self.hc, self.dims = text_args.hc_count, text_args.hidden_size
+        self.moe_dims = text_args.moe_intermediate_size
         eps = text_args.rms_norm_eps
         self.pre_fc_norm_embedding = RMSNorm(self.dims, eps=eps)
         # One statistic over every stream, as the reference
@@ -104,7 +105,35 @@ class Model(nn.Module):
                 out[k[: -len("experts.down_proj")] + "switch_mlp.down_proj.weight"] = v
                 continue
             out[k] = v
+        self._match_shared_expert(out)
         return fuse_projections(out)
+
+    def _match_shared_expert(self, weights):
+        """Requantize a shared expert stored at another group size or bit width
+        like the routed experts, so it can be fused as the last expert."""
+        for i in range(len(self.layers)):
+            for part, K in (("gate_proj", self.dims), ("up_proj", self.dims), ("down_proj", self.moe_dims)):
+                shared = f"layers.{i}.mlp.shared_expert.{part}"
+                routed = f"layers.{i}.mlp.switch_mlp.{part}"
+                if f"{shared}.scales" not in weights or f"{routed}.scales" not in weights:
+                    continue
+                params = lambda name: (
+                    K // weights[f"{name}.scales"].shape[-1],
+                    32 * weights[f"{name}.weight"].shape[-1] // K,
+                )
+                if params(shared) == params(routed):
+                    continue
+                x = mx.dequantize(
+                    weights[f"{shared}.weight"],
+                    weights[f"{shared}.scales"],
+                    weights.get(f"{shared}.biases"),
+                    group_size=params(shared)[0],
+                    bits=params(shared)[1],
+                )
+                gs, bits = params(routed)
+                weights[f"{shared}.weight"], weights[f"{shared}.scales"], weights[f"{shared}.biases"] = mx.quantize(
+                    x, group_size=gs, bits=bits
+                )
 
     @property
     def quant_predicate(self):
