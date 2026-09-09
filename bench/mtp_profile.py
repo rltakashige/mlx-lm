@@ -88,6 +88,7 @@ def run(
     fallback=0.0,
     check=False,
     siblings=False,
+    points=None,
 ):
     draft.bind(model)
     cache, draft_cache = make_prompt_cache(model), draft.make_cache()
@@ -175,6 +176,13 @@ def run(
             lambda: model(inputs[None], cache=cache, return_hidden=True, chain=chain),
         )
         tokens = phase("sample", lambda: argmax_tokens(logits[:, -rows:]))
+        if points is not None and drafts:
+            # Per draft position: the target's logprob of the draft, its top logprob and its entropy
+            lp = logits[0, -rows:-1].astype(mx.float32)
+            lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+            at = mx.take_along_axis(lp, draft_tokens[:, None], axis=-1)[:, 0]
+            ent = -mx.sum(mx.exp(lp) * lp, axis=-1)
+            phase("points", lambda: points.append((at, lp.max(axis=-1), ent, cycles)), [])
         if cands is not None:
             phase("cand_score", lambda: cands.observe(logits[0, -rows:]), [])
             mx.eval(cands.score)
@@ -261,6 +269,7 @@ def main():
         help="per-layer-type time inside the verify forward",
     )
     ap.add_argument("--json", type=Path)
+    ap.add_argument("--points", type=Path, help="save (logprob of draft, top logprob, entropy, cycle) per draft position")
     args = ap.parse_args()
 
     model, tok = load(args.model)
@@ -287,6 +296,7 @@ def main():
         check=args.check_candidates,
         siblings=args.draft_siblings,
     )
+    points = [] if args.points else None
     k = args.num_draft_tokens
     warm_shapes(model, prompt, 2 * k + 1 if args.draft_siblings else k + 1)
     run(model, draft, prompt, args.num_draft_tokens, 16, **opts)  # warm up
@@ -299,8 +309,13 @@ def main():
         if not model.language_model.args.tie_word_embeddings:
             timer.wrap_module(model.language_model.lm_head, "lm_head")
     phase, accepted_at, cycles, produced, out = run(
-        model, draft, prompt, args.num_draft_tokens, args.max_tokens, timer, **opts
+        model, draft, prompt, args.num_draft_tokens, args.max_tokens, timer, points=points, **opts
     )
+    if points:
+        mx.eval([x for p in points for x in p[:3]])
+        cols = [mx.concatenate([p[i] for p in points]) for i in range(3)]
+        cycle = mx.concatenate([mx.full(p[0].shape, p[3]) for p in points])
+        mx.savez(str(args.points), draft=cols[0], top=cols[1], entropy=cols[2], cycle=cycle)
     stats = run.stats
     if timer:
         timer.unwrap()
