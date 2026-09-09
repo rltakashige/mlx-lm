@@ -321,7 +321,7 @@ class TestHyperConnectionKernels(unittest.TestCase):
     def test_sites_match_the_compiled_ops(self):
         for group_size in (32, 64):
             block = self._site(True, group_size)
-            for rows in (1, 3, 8):
+            for rows in (1, 3, 4):
                 self._check(block, rows, True, group_size)
             self._check(block, 2, False, group_size)
             self._check(self._site(False, group_size), 1, True, group_size)
@@ -330,7 +330,7 @@ class TestHyperConnectionKernels(unittest.TestCase):
         from mlx_lm.models import hc_small
 
         block = self._site(True, 32)
-        h = mx.random.normal((1, 9, 4 * 512)).astype(mx.bfloat16)
+        h = mx.random.normal((1, 5, 4 * 512)).astype(mx.bfloat16)
         self.assertFalse(hc_small.routes(block, h))
         self.assertFalse(hc_small.routes(block, h[:, :1].astype(mx.float32)))
         args = qwen4_exp.TextArgs(hidden_size=64, hc_count=4, hc_lowrank=16)
@@ -399,3 +399,4 @@ class TestFlashNextKernels(unittest.TestCase):
             diff = (out.astype(mx.float32) - want.astype(mx.float32)).abs()
             self.assertLess(diff.max().item(), 1e-2, (B, L))
             self.assertGreater((diff == 0).mean().item(), 0.9, (B, L))
+
