@@ -336,3 +336,36 @@ class TestHyperConnectionKernels(unittest.TestCase):
         args = qwen4_exp.TextArgs(hidden_size=64, hc_count=4, hc_lowrank=16)
         small = qwen4_exp.GatedResidual(args)
         self.assertFalse(hc_small.routes(small, mx.zeros((1, 1, 256), mx.bfloat16)))
+
+
+@unittest.skipUnless(mx.metal.is_available(), "Metal only")
+class TestFlashNextKernels(unittest.TestCase):
+    def test_g32_moe_gather_matches_ops(self):
+        """The expert-grouped gather at group size 32 and K = 640 (8-lane row groups)."""
+        import os
+        import sys
+        from unittest import mock
+
+        from mlx.utils import tree_map
+
+        from mlx_lm.models import moe_small
+
+        sys.path.insert(0, os.path.dirname(__file__))
+        from test_qwen3_5_fusion import MOE_CONFIG, _moe_block
+
+        for hidden, inter, group in ((2560, 640, 32), (1024, 512, 64)):
+            config = {**MOE_CONFIG, "hidden_size": hidden, "moe_intermediate_size": inter,
+                      "shared_expert_intermediate_size": inter, "num_experts": 16, "num_experts_per_tok": 8}
+            block = _moe_block(config, scale=0.05)
+            nn.quantize(block, group, 4)
+            block.update(tree_map(lambda p: p.astype(mx.bfloat16) if p.dtype == mx.float32 else p, block.parameters()))
+            for mm in (1, 3, 8):
+                xx = mx.random.normal((1, mm, hidden)).astype(mx.bfloat16)
+                lg = block.gate(xx)
+                inds = mx.argpartition(lg[..., :16], kth=-8, axis=-1)[..., -8:]
+                y = moe_small.experts(block, xx, lg, inds).astype(mx.float32)
+                with mock.patch.object(moe_small, "routes", return_value=False):
+                    expected = block(xx).astype(mx.float32)
+                tol = 0.03 * mx.abs(expected).max().item()
+                self.assertLess(mx.abs(y - expected).max().item(), tol, (hidden, group, mm))
+

@@ -36,12 +36,23 @@ _calls = {}
 
 
 def _config(K):
-    """(rows per simdgroup, simdgroups per threadgroup), measured on M5 for K = 2048 and 512."""
-    return (4, 2) if K >= 2048 else (4, 4)
+    """(rows per lane group, simdgroups per threadgroup, lanes per row group).
+
+    32 lanes span 512 values of K per step (measured on M5 for K = 2048 and 512);
+    a K that is a multiple of 128 only gets 8-lane row groups, 4 per simdgroup.
+    """
+    if K % _KSTEP:
+        return (1, 4, 8)
+    return (4, 2, 32) if K >= 2048 else (4, 4, 32)
+
+
+def _rows_per_simdgroup(K):
+    R, NSG, LPR = _config(K)
+    return R * (32 // LPR)
 
 
 def routes(block, x):
-    """True when ``experts`` runs this step: M5, 4-bit g64 affine experts, 1 <= M <= 8."""
+    """True when ``experts`` runs this step: M5, 4-bit affine g64 or g32 experts, 1 <= M <= 8."""
     projs = (block.switch_mlp.gate_up_proj, block.switch_mlp.down_proj)
     key = (id(block), type(projs[0]), x.shape, x.dtype)
     use = _routes.get(key)
@@ -64,12 +75,12 @@ def _supported(block, projs, x):
         if (
             not isinstance(p, QuantizedSwitchLinear)
             or p.bits != 4
-            or p.group_size != 64
+            or p.group_size not in (32, 64)
             or p.mode != "affine"
             or "bias" in p
             or p.scales.dtype != x.dtype
-            or p.input_dims % _KSTEP
-            or p.output_dims % (math.prod(_config(p.input_dims)))
+            or p.input_dims % 128
+            or p.output_dims % (_rows_per_simdgroup(p.input_dims) * _config(p.input_dims)[1])
         ):
             return False
     return projs[0].input_dims == k
@@ -153,7 +164,7 @@ def _prep(x, kind, inds=None, m=0, top_k=0, eshared=0):
     return kern(inputs=[x] + ([inds] if plan else []), **kwargs)
 
 
-def _body(c, R, MC):
+def _body(c, R, MC, LPR):
     """The main loop over K for ``c`` gathered rows (the ``qmv_small`` loop with per-row x)."""
     wload = "\n".join(
         f"        {{dst}}[{r}] = *(const device uint2*)(wp + {r} * KW);"
@@ -207,26 +218,32 @@ def _body(c, R, MC):
         + " }"
         for m in range(c)
     )
+    # The lanes of a row group hold the row's partial sums
+    reduce = "\n".join(
+        f"      {_UNROLL}\n      for (int o = {LPR // 2}; o > 0; o >>= 1) acc[{r}][{m}] += simd_shuffle_xor(acc[{r}][{m}], o);"
+        for r in range(R)
+        for m in range(c)
+    )
     nl = "\n"
     return f"""
 {wload.format(dst="wv")}
       for (int b = 0; b < NB; b++) {{
         // Request the next step's weights before this step's math.
-        wp += 32 * VPL / 8;
+        wp += LPR * VPL / 8;
         if (b + 1 < NB) {{
 {wload.format(dst="wn")}
         }}
 {nl.join(f"        s[{r}] = float(sp[{r} * KG]); bb[{r}] = float(bp[{r} * KG]);" for r in range(R))}
 {nl.join(deq)}
 {nl.join(chunks)}
-        sp += 32 * VPL / 64;
-        bp += 32 * VPL / 64;
-        xp += 32 * VPL;
-        xsp += 32 * Mp;
+        sp += LPR * VPL / G;
+        bp += LPR * VPL / G;
+        xp += LPR * VPL;
+        xsp += LPR * Mp;
 {nl.join(f"        wv[{r}] = wn[{r}];" for r in range(R))}
       }}
-{nl.join(f"      acc[{r}][{m}] = simd_sum(acc[{r}][{m}]);" for r in range(R) for m in range(c))}
-      if (lane == 0) {{
+{reduce}
+      if (l == 0) {{
 {store}
       }}
 """
@@ -250,15 +267,16 @@ def _score_source(LW):
 """
 
 
-def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW):
-    NB = K // _KSTEP
+def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW, LPR, G):
+    NB = K // (LPR * _VPL)
+    NRG = 32 // LPR  # row groups per simdgroup
     cases = "\n".join(
-        f"      case {c}: {{{_body(c, R, MC)}      break; }}" for c in range(1, M + 1)
+        f"      case {c}: {{{_body(c, R, MC, LPR)}      break; }}" for c in range(1, M + 1)
     )
     return f"""
     constexpr int M = {M}, N = {N}, K = {K}, R = {R}, NSG = {NSG}, VPL = {_VPL}, Mp = {Mp}, MC = {MC};
-    constexpr int TOPK = {TOPK}, S = {S}, RDIV = {RDIV}, PW = M + 2;
-    constexpr int KW = K / 8, KG = K / 64, NB = {NB}, NTILE = N / (R * NSG);
+    constexpr int TOPK = {TOPK}, S = {S}, RDIV = {RDIV}, PW = M + 2, LPR = {LPR}, NRG = {NRG}, G = {G};
+    constexpr int KW = K / 8, KG = K / G, NB = {NB}, NTILE = N / (R * NRG * NSG);
     const int tg = threadgroup_position_in_grid.x;
     const device int* pl = plan + (tg / NTILE) * PW;
     const int c = pl[1];
@@ -269,12 +287,14 @@ def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW):
     for (int m = 0; m < M; m++) {{ prow[m] = pl[2 + min(m, c - 1)]; xrow[m] = prow[m] / RDIV; }}
     const int lane = thread_index_in_simdgroup;
     const int sg = simdgroup_index_in_threadgroup;
-    const int row0 = ((tg % NTILE) * NSG + sg) * R;
-    const device uint32_t* wp = w + ((size_t)e * N + row0) * KW + lane * 2;
-    const device T* sp = scales + ((size_t)e * N + row0) * KG + lane / 4;
-    const device T* bp = biases + ((size_t)e * N + row0) * KG + lane / 4;
-    const device half* xp = x16 + lane * VPL;
-    const device float* xsp = xsum + (size_t)lane * Mp;
+    // Lane l of row group rg: R rows, 16 values of K per step
+    const int rg = lane / LPR, l = lane % LPR;
+    const int row0 = (((tg % NTILE) * NSG + sg) * NRG + rg) * R;
+    const device uint32_t* wp = w + ((size_t)e * N + row0) * KW + l * 2;
+    const device T* sp = scales + ((size_t)e * N + row0) * KG + (l * VPL) / G;
+    const device T* bp = biases + ((size_t)e * N + row0) * KG + (l * VPL) / G;
+    const device half* xp = x16 + l * VPL;
+    const device float* xsp = xsum + (size_t)l * Mp;
     size_t xo[M];
     {_UNROLL}
     for (int m = 0; m < M; m++) xo[m] = (size_t)xrow[m] * K;
@@ -301,19 +321,20 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     x16, xsum, rscale = prepped
     w, scales, biases = proj.weight, proj.scales, proj.biases
     N, K = w.shape[1], w.shape[2] * 8
+    G = K // scales.shape[2]
     S = top_k + 1
-    R, NSG = _config(K)
+    R, NSG, LPR = _config(K)
     MC = min(4, m)
     Mp = xsum.shape[1]
     RDIV = S if tokens else 1
     LW = logits.shape[-1] if logits is not None else 0
-    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype))
+    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, LPR, G, _tag(scales.dtype))
     call = _calls.get(key)
     if call is None:
         kern = _kernel(
             "moe_small_gather",
             key[1:],
-            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW),
+            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, LPR, G),
             [
                 "x16",
                 "xsum",
@@ -329,7 +350,7 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
         )
         kwargs = dict(
             template=[("T", scales.dtype)],
-            grid=(32 * NSG * m * S * (N // (R * NSG)), 1, 1),
+            grid=(32 * NSG * m * S * (N // (R * (32 // LPR) * NSG)), 1, 1),
             threadgroup=(32 * NSG, 1, 1),
             output_shapes=[(m * S, N)],
             output_dtypes=[scales.dtype],
