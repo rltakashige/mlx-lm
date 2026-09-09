@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import math
 import sys
 import time
 from collections import deque
@@ -221,6 +222,12 @@ def setup_arg_parser():
         help="Stop drafting once the product of the draft top-1 probabilities "
         "is below this value (0 disables).",
         default=0.5,
+    )
+    parser.add_argument(
+        "--accept-ratio",
+        type=float,
+        default=0.0,
+        help="Keep a draft token when the target gives it at least this fraction of its top probability (0 = exact greedy)",
     )
     parser.add_argument(
         "--draft-candidates",
@@ -516,6 +523,7 @@ def speculative_generate_step(
     *,
     num_draft_tokens: int = 2,
     draft_stop_prob: float = 0.5,
+    accept_ratio: float = 0.0,
     draft_candidates: int = 16384,
     draft_fallback_margin: float = 0.0,
     draft_siblings: bool = False,
@@ -539,6 +547,8 @@ def speculative_generate_step(
           and fed its hidden states.
         num_draft_tokens (int, optional): The number of draft tokens for
           speculative decoding. Default: ``2``.
+        accept_ratio (float, optional): Keep a draft token when the target gives it
+          at least this fraction of its top probability (0 = exact greedy).
         draft_stop_prob (float, optional): Stop drafting once the product of
           the drafts' top-1 probabilities is below this value. The probabilities
           are read one draft late, so the draft computed past the stop is
@@ -585,7 +595,11 @@ def speculative_generate_step(
     siblings = mtp and draft_siblings and not logits_processors
     if mtp:
         draft_model.bind(model)
-        if draft_candidates and not logits_processors and hasattr(draft_model, "candidates"):
+        if (
+            draft_candidates
+            and not logits_processors
+            and hasattr(draft_model, "candidates")
+        ):
             candidates = draft_model.candidates(draft_candidates)
             candidates.extend(y)
 
@@ -655,7 +669,9 @@ def speculative_generate_step(
             else:
                 y, logprobs = _process_and_sample(None, logits.squeeze(0))
                 if siblings and drafting:
-                    masked = mx.put_along_axis(logprobs, y[:, None], mx.array(-mx.inf), -1)
+                    masked = mx.put_along_axis(
+                        logprobs, y[:, None], mx.array(-mx.inf), -1
+                    )
                     second = mx.argmax(masked, axis=-1)
                     if head is not None:
                         second = head.ids[second]
@@ -803,14 +819,20 @@ def speculative_generate_step(
                 tokens, logprobs, hidden_out, _ = _step(
                     model, model_cache, y, rows, chain=chain
                 )
-                mx.async_eval(tokens, draft_tokens, *([sibling_tokens] if chain else []))
+                mx.async_eval(
+                    tokens, draft_tokens, *([sibling_tokens] if chain else [])
+                )
                 # Build and run the state rollback for the accepted path while the
                 # verify runs, so the GPU has work queued during the readback
-                accepted = mx.sum(
-                    mx.cumprod(
-                        (tokens[:num_draft] == draft_tokens).astype(mx.int32)
-                    )
-                )
+                if accept_ratio and num_draft:
+                    lp = logprobs[:num_draft]
+                    at_draft = mx.take_along_axis(lp, draft_tokens[:, None], axis=-1)[
+                        :, 0
+                    ]
+                    ok = at_draft >= mx.max(lp, axis=-1) + math.log(accept_ratio)
+                else:
+                    ok = tokens[:num_draft] == draft_tokens
+                accepted = mx.sum(mx.cumprod(ok.astype(mx.int32)))
                 extra = None
                 if chain:
                     # The sibling of the first rejected draft may hold the correction
@@ -826,15 +848,16 @@ def speculative_generate_step(
                     candidates.observe(logprobs)
                     head = candidates.make_head(draft_tokens, tokens)
                     mx.async_eval(head.first, *head.rows)
-                mx.eval(tokens, draft_tokens)
-                new_tokens = tokens
+                mx.eval(tokens, draft_tokens, ok)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
+                ok = ok.tolist()
                 n_accept = 0
-                while (
-                    n_accept < num_draft and tokens[n_accept] == draft_tokens[n_accept]
-                ):
+                while n_accept < num_draft and ok[n_accept]:
                     n_accept += 1
+                # The accepted drafts are the emitted tokens; the target's token follows them
+                tokens[:n_accept] = draft_tokens[:n_accept]
+                new_tokens = mx.array(tokens, mx.uint32)
                 # A rejected draft whose sibling is the correction: the sibling row
                 # is accepted and the target's token after it is one more token
                 sibling = (
@@ -872,7 +895,9 @@ def speculative_generate_step(
                 if candidates is not None:
                     candidates.extend(new_tokens[: n_accept + 1])
                     if sibling:
-                        candidates.extend(new_tokens[chain + n_accept : chain + n_accept + 1])
+                        candidates.extend(
+                            new_tokens[chain + n_accept : chain + n_accept + 1]
+                        )
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[: -max(num_draft - n_accept, 1)]
                 draft_trim = trim_prompt_cache(
@@ -977,6 +1002,7 @@ def stream_generate(
         for key in (
             "num_draft_tokens",
             "draft_stop_prob",
+            "accept_ratio",
             "draft_candidates",
             "draft_fallback_margin",
             "draft_siblings",
@@ -2434,6 +2460,7 @@ def main():
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
         draft_stop_prob=args.draft_stop_prob,
+        accept_ratio=args.accept_ratio,
         draft_candidates=args.draft_candidates,
         draft_fallback_margin=args.draft_fallback_margin,
         draft_siblings=args.draft_siblings,
