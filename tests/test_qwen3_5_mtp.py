@@ -411,7 +411,7 @@ class TestQwen3_5MTP(unittest.TestCase):
             PROMPT, target, head, 32, num_draft_tokens=3, accept_entropy=0.0
         )
         self.assertEqual(tokens, expected)
-        for e, ratio in ((0.3, 0.0), (0.9, 0.0), (0.3, 0.5)):
+        for e, ratio, floor in ((0.3, 0.0, 0.0), (0.9, 0.0, 0.0), (0.3, 0.5, 0.0), (0.2, 0.0, 0.1)):
             out = list(
                 speculative_generate_step(
                     PROMPT,
@@ -421,6 +421,7 @@ class TestQwen3_5MTP(unittest.TestCase):
                     num_draft_tokens=3,
                     accept_entropy=e,
                     accept_ratio=ratio,
+                    accept_floor=floor,
                 )
             )
             tokens = mx.array([t for t, _, _ in out])
@@ -439,6 +440,8 @@ class TestQwen3_5MTP(unittest.TestCase):
                 bound = min(2 * math.log(e), math.log(e) + mx.sum(p * lp).item())
                 if ratio:
                     bound = max(bound, mx.max(lp).item() + math.log(ratio))
+                if floor:
+                    bound = max(bound, math.log(floor))
                 # A kept draft passes the bound, so it is one of the top choices
                 self.assertGreaterEqual(lp[token].item(), bound - 1e-4)
                 self.assertLess(mx.sum(lp > lp[token]).item(), math.exp(-bound))

@@ -237,6 +237,12 @@ def setup_arg_parser():
         "at least min(e^2, e * exp(-entropy)) (0 = off; composes with --accept-ratio)",
     )
     parser.add_argument(
+        "--accept-floor",
+        type=float,
+        default=0.0,
+        help="Never keep a draft token whose target probability is below this (0 = off)",
+    )
+    parser.add_argument(
         "--draft-candidates",
         type=int,
         help="Draft with a candidate set of the output head: the first N rows of "
@@ -532,6 +538,7 @@ def speculative_generate_step(
     draft_stop_prob: float = 0.5,
     accept_ratio: float = 0.0,
     accept_entropy: float = 0.0,
+    accept_floor: float = 0.0,
     draft_candidates: int = 16384,
     draft_fallback_margin: float = 0.0,
     draft_siblings: bool = False,
@@ -562,6 +569,8 @@ def speculative_generate_step(
           ``min(e^2, e * exp(-H))``, ``H`` the entropy of the target's distribution
           at that position (Medusa's ``eps`` and ``delta`` at ``e = 0.3``). ``0``
           turns it off. With ``accept_ratio`` a draft must pass both bounds.
+        accept_floor (float, optional): Never keep a draft token whose target
+          probability is below this (0 = off).
         draft_stop_prob (float, optional): Stop drafting once the product of
           the drafts' top-1 probabilities is below this value. The probabilities
           are read one draft late, so the draft computed past the stop is
@@ -837,24 +846,27 @@ def speculative_generate_step(
                 )
                 # Build and run the state rollback for the accepted path while the
                 # verify runs, so the GPU has work queued during the readback
-                if (accept_ratio or accept_entropy) and num_draft:
+                if (accept_ratio or accept_entropy or accept_floor) and num_draft:
                     lp = logprobs[:num_draft]
                     at_draft = mx.take_along_axis(lp, draft_tokens[:, None], axis=-1)[
                         :, 0
                     ]
-                    bound = None
+                    bounds = []
                     if accept_ratio:
-                        bound = mx.max(lp, axis=-1) + math.log(accept_ratio)
+                        bounds.append(mx.max(lp, axis=-1) + math.log(accept_ratio))
                     if accept_entropy:
                         # Typical acceptance: the bound follows the target's entropy
                         p = mx.exp(lp)
                         entropy = -mx.sum(mx.where(p > 0, p * lp, 0.0), axis=-1)
-                        typical = mx.minimum(
-                            2 * math.log(accept_entropy),
-                            math.log(accept_entropy) - entropy,
+                        bounds.append(
+                            mx.minimum(
+                                2 * math.log(accept_entropy),
+                                math.log(accept_entropy) - entropy,
+                            )
                         )
-                        bound = typical if bound is None else mx.maximum(bound, typical)
-                    ok = at_draft >= bound
+                    if accept_floor:
+                        bounds.append(mx.full(at_draft.shape, math.log(accept_floor)))
+                    ok = at_draft >= functools.reduce(mx.maximum, bounds)
                 else:
                     ok = tokens[:num_draft] == draft_tokens
                 accepted = mx.sum(mx.cumprod(ok.astype(mx.int32)))
@@ -1029,6 +1041,7 @@ def stream_generate(
             "draft_stop_prob",
             "accept_ratio",
             "accept_entropy",
+            "accept_floor",
             "draft_candidates",
             "draft_fallback_margin",
             "draft_siblings",
@@ -2488,6 +2501,7 @@ def main():
         draft_stop_prob=args.draft_stop_prob,
         accept_ratio=args.accept_ratio,
         accept_entropy=args.accept_entropy,
+        accept_floor=args.accept_floor,
         draft_candidates=args.draft_candidates,
         draft_fallback_margin=args.draft_fallback_margin,
         draft_siblings=args.draft_siblings,
