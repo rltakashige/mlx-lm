@@ -397,6 +397,7 @@ class NGramTable:
             rows = self._read(uniq)
             out[missing] = rows[inverse]
             self.misses += len(uniq)
+            self.hits += len(missing) - len(uniq)
             for r, row in zip(uniq.tolist(), rows):
                 self.lru[r] = row
             while len(self.lru) > self.cache_rows:
