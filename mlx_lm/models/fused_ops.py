@@ -969,8 +969,8 @@ inline void insert(float v, int i, thread float& v1, thread int& i1, thread floa
 def draft_sample(rows, first=None, ids=None, fixed=None):
     """The greedy draft from the logits of one row, as one kernel.
 
-    The row is ``[fixed; rows]`` with the ``rows`` entries whose ``first`` is False scored
-    -inf. Returns ``tok`` (2,) uint32 = the best and the second best entry (mapped through
+    The row is ``[fixed; rows]`` (any shapes, read flat) with the ``rows`` entries whose
+    ``first`` is False scored -inf. Returns ``tok`` (2,) uint32 = the best and the second best entry (mapped through
     ``ids`` when given) and ``stats`` (2,) float32 = the probability of the best under the
     softmax of the row and the log-probability margin of the two best; bitwise the ops
     ``argmax``, ``exp(max(logprobs))`` and ``abs(diff(topk(logprobs, 2)))``.

@@ -402,8 +402,8 @@ class TestQwen3_5MTP(unittest.TestCase):
                 if cand is not None:
                     y, second = cand.ids[y], cand.ids[second]
                 self.assertEqual(tok.tolist(), [y.item(), second.item()], quantize)
-                self.assertEqual(stats[0].item(), mx.exp(lp.max()).item())
-                self.assertEqual(stats[1].item(), mx.abs(mx.diff(mx.topk(lp, 2))).item())
+                self.assertEqual(stats[:1].item(), mx.exp(lp.max()).item())
+                self.assertEqual(stats[1:].item(), mx.abs(mx.diff(mx.topk(lp, 2))).item())
                 for a, b in zip(caches[0], caches[1]):
                     self.assertTrue(mx.array_equal(a.keys[..., : a.offset, :], b.keys[..., : b.offset, :]).item())
 

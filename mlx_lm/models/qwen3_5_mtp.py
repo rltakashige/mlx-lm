@@ -60,9 +60,10 @@ class CandidateHead:
     def sample(self, x):
         """The greedy draft of the last row of ``x`` (see ``fused_ops.draft_sample``)."""
         x = x.reshape(-1, x.shape[-1])
-        # The logits of every row, as the plain call computes them (same matmul kernel)
-        fixed = self._logits(x, self.fixed)[-1] if self.fixed[0].shape[0] else None
-        return fused_ops.draft_sample(self._logits(x, self.rows)[-1], self.first, self.ids, fixed)
+        # The logits of every row, as the plain call computes them (same matmul kernel);
+        # the last row as a slice (an integer index would be a gather dispatch)
+        fixed = self._logits(x, self.fixed)[-1:] if self.fixed[0].shape[0] else None
+        return fused_ops.draft_sample(self._logits(x, self.rows)[-1:], self.first, self.ids, fixed)
 
 
 class Candidates:
@@ -169,7 +170,8 @@ class Model(nn.Module):
         ``fused_ops.draft_sample``) and the hidden states."""
         h = self._hidden(inputs, hidden, cache)
         if head is None:
-            return (*fused_ops.draft_sample(self.lm_head(h)[0, -1]), h)
+            logits = self.lm_head(h)
+            return (*fused_ops.draft_sample(logits.reshape(-1, logits.shape[-1])[-1:]), h)
         return (*head.sample(h), h)
 
     def make_cache(self):

@@ -129,7 +129,7 @@ def run(
                     f"draft_{i}", lambda: draft.sample(inp, hd, cache=draft_cache, head=head)
                 )
                 hd_new = hd_new[:, -1:]
-                tok, p, margin = tok2[:1], stat[0], stat[1].item()
+                tok, p, margin = tok2[:1], stat[:1], stat[1:].item()
                 if head is not None:
                     stats["cand_steps"] += 1
                     if fallback and margin < fallback:

@@ -766,8 +766,8 @@ def speculative_generate_step(
                 continue
             if fused_draft:
                 # The fused step returns (top probability, margin) instead of logprobs
-                ps.append(logprobs[0])
-                ms.append(logprobs[1] if fallback else None)
+                ps.append(logprobs[:1])
+                ms.append(logprobs[1:] if fallback else None)
             else:
                 ps.append(mx.exp(logprobs.max()))
                 # The gap of the two best candidates tells when the set was too narrow
