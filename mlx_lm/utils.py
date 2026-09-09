@@ -378,7 +378,8 @@ def load_model(
         if "quantization_config" in text_config:
             config["quantization_config"] = text_config["quantization_config"]
 
-    model_args = model_args_class.from_dict(config)
+    # A model that reads part of its weights from disk gets the checkpoint path
+    model_args = model_args_class.from_dict({**config, "model_path": str(model_path)})
 
     model = model_class(model_args)
 
