@@ -183,17 +183,37 @@ class GatedResidual(nn.Module):
 
     def __call__(self, hyper: mx.array):
         normed = self.hc_norm(hyper)
-        mix = nn.silu(self.input_mix_weight_down(normed) / self.hc)
-        mix = mx.sigmoid(self.input_mix_weight_up(mix))
+        mix = _gate(self.input_mix_weight_down(normed), 1 / self.hc)
         streams = normed.reshape(*normed.shape[:-1], self.hc, self.dims)
-        mixed = (mix.reshape(streams.shape) * streams).mean(axis=-2)
+        mixed = _weigh(self.input_mix_weight_up(mix).reshape(streams.shape), streams).mean(axis=-2)
         if "block_inject_weight" not in self:
             return mixed
-        inject = 2 * mx.sigmoid(self.block_inject_weight(normed) / self.hc)
-        return mixed, inject
+        return mixed, _inject(self.block_inject_weight(normed), 1 / self.hc)
 
     def combine(self, hyper: mx.array, x: mx.array, inject: mx.array) -> mx.array:
-        return hyper + (x[..., None, :] * inject[..., None]).reshape(hyper.shape)
+        streams = hyper.reshape(*hyper.shape[:-1], self.hc, self.dims)
+        return _combine(streams, x, inject).reshape(hyper.shape)
+
+
+# The elementwise chains of a hyper-connection site, each compiled into one kernel
+@mx.compile
+def _gate(x, inv_hc):
+    return nn.silu(x * inv_hc)
+
+
+@mx.compile
+def _weigh(logits, streams):
+    return mx.sigmoid(logits) * streams
+
+
+@mx.compile
+def _inject(x, inv_hc):
+    return 2 * mx.sigmoid(x * inv_hc)
+
+
+@mx.compile
+def _combine(streams, x, inject):
+    return streams + x[..., None, :] * inject[..., None]
 
 
 # ------------------------------------------------------------ n-gram / PLE
