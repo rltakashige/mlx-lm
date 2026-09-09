@@ -231,7 +231,8 @@ def _prep_source(K, M, kind, eps=0.0, D=0, natural=False, gs=0, go=0, attn=None)
     (silu(gate) * up with gate = x[:, :K] and up = x[:, K:]), "gate" (x * sigmoid(gate)),
     "gated_norm" (per-head RMSNorm over D values times silu(gate)).
     ``natural`` stores the 16 values in k order (for the tensor-op kernel) instead of the
-    nibble-pair order of ``qmv_small``. rms_norm adds ``res`` to x first when ``has_res`` is
+    nibble-pair order of ``qmv_small``; ``natural == 2`` keeps the pair order without the
+    pre-scales. rms_norm adds ``res`` to x first when ``has_res`` is
     set (and stores the sum in ``h``); ``gs`` and ``go`` locate ``gate`` inside a wider row.
     ``attn`` = (H, Dh, QW) reads x as the attention output (B, H, L, Dh), L from its shape,
     and the gate of head h at column 2 * h * Dh + Dh of the (rows, QW) projection.
@@ -239,7 +240,8 @@ def _prep_source(K, M, kind, eps=0.0, D=0, natural=False, gs=0, go=0, attn=None)
     Mp = 0 if natural else _mp(M)  # the natural-order source is the same for every M
     NT = _scan_threads(K)
     NIT = _prep_segments(K)
-    order = range(8) if natural else _ORDER
+    # natural: k order; 2: the pair order of _ORDER without the pre-scales (packed tensor fills)
+    order = range(8) if natural == 1 else _ORDER
     scale = (1.0,) * 8 if natural else _SCALE
     stores = "\n".join(
         f"      h[{c * 8 + j}] = half(v[{c * 8 + order[j]}] * (sc * {scale[j]}f));"
@@ -531,8 +533,8 @@ def _m5():
 
 
 def _nax_m(m):
-    """True when rows ``m`` go to the tensor-op kernel instead of the SIMD kernel."""
-    return _NAX_MIN_M <= m <= _NAX_MAX_M
+    """2 (the pair-order prep) when rows ``m`` go to the tensor-op kernel, else False."""
+    return 2 if _NAX_MIN_M <= m <= _NAX_MAX_M else False
 
 
 def _shape_ok(m, n, k):
