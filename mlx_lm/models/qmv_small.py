@@ -26,8 +26,8 @@ _GROUP = 64
 _VPL = 16  # K values per lane per step
 # At M = 2 mx.quantized_matmul is already weight-bound and the prep launch costs more than it saves.
 _MIN_M, _MAX_M = 3, 8
-# From 8 rows the tensor-op kernel (qmv_nax) beats the SIMD kernel by enough to pay its JIT compile.
-_NAX_MIN_M, _NAX_MAX_M = 8, 32
+# From 6 rows the tensor-op kernel (qmv_nax) is faster than the SIMD kernel, also under sustained load.
+_NAX_MIN_M, _NAX_MAX_M = 6, 32
 _NAX_KSTEP = 1024  # K values per split-K slice at the largest split
 # Below 8 MB of weights the prep launch and the low threadgroup count cost more than the kernel saves.
 _MIN_BYTES = 8 << 20
