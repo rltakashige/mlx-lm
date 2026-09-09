@@ -310,3 +310,69 @@ class TestMergedKernels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(mx.metal.is_available(), "Metal only")
+class TestLatencyKernels(unittest.TestCase):
+    """The router matvec and the two-pass sdpa are bitwise the MLX kernels they replace."""
+
+    def test_router_matches_quantized_matmul(self):
+        from mlx_lm.models import moe_small
+
+        for N, K in ((257, 2048), (513, 2560), (129, 1024), (8, 128)):
+            gate = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=8)
+            for seed in range(20):
+                mx.random.seed(seed)
+                w = mx.random.randint(0, 2**32 - 1, gate.weight.shape, dtype=mx.uint32)
+                gate.weight = w
+                gate.scales = (mx.random.uniform(0.001, 0.05, gate.scales.shape) * (1 + seed % 3)).astype(mx.bfloat16)
+                gate.biases = (mx.random.normal(gate.biases.shape) * 0.5).astype(mx.bfloat16)
+                x = (mx.random.normal((1, 1, K)) * (0.5 + seed)).astype(mx.bfloat16)
+                self.assertTrue(moe_small.router_ok(gate, x))
+                got = moe_small.router(gate, x)
+                ref = gate(x)
+                self.assertEqual(got.shape, ref.shape)
+                self.assertTrue(
+                    mx.array_equal(got.view(mx.uint16), ref.view(mx.uint16)).item(),
+                    f"N={N} K={K} seed={seed}",
+                )
+
+    def test_sdpa_two_pass_matches_sdpa_vector(self):
+        for H, Hkv, D in ((16, 2, 256), (8, 2, 128), (4, 4, 64)):
+            scale = D**-0.5
+            for N in (1, 2, 31, 32, 33, 64, 100, 257, 500, 512, 777, 1000, 1023):
+                mx.random.seed(N)
+                cap = (N + 255) // 256 * 256
+                q = (mx.random.normal((1, H, 1, D)) * 2).astype(mx.bfloat16)
+                k = (mx.random.normal((1, Hkv, cap, D)) * 2).astype(mx.bfloat16)
+                v = (mx.random.normal((1, Hkv, cap, D)) * 2).astype(mx.bfloat16)
+                kv, vv = k[..., :N, :], v[..., :N, :]
+                self.assertTrue(fused_ops.sdpa_ok(q, kv, None))
+                got = fused_ops.sdpa_two_pass(q, kv, vv, scale)
+                ref = mx.fast.scaled_dot_product_attention(q, kv, vv, scale=scale)
+                self.assertEqual(got.shape, ref.shape)
+                self.assertTrue(
+                    mx.array_equal(got.view(mx.uint16), ref.view(mx.uint16)).item(),
+                    f"H={H} Hkv={Hkv} D={D} N={N}",
+                )
+
+    def test_topk_prep_matches_argpartition_and_prep(self):
+        from mlx_lm.models import moe_small
+
+        E, top_k, K = 256, 8, 2048
+        for seed in range(60):
+            mx.random.seed(seed)
+            lg = mx.random.normal((1, 1, E + 1)) * 3
+            if seed % 3 == 1:
+                lg = mx.round(lg * 2) / 2  # many exact ties
+            if seed % 3 == 2:
+                lg = mx.round(lg) / 4
+            logits = lg.astype(mx.bfloat16)
+            x = (mx.random.normal((1, 1, K)) * (1 + seed % 5)).astype(mx.bfloat16)
+            ref_inds = mx.argpartition(logits[..., :E], kth=-top_k, axis=-1)[..., -top_k:].reshape(-1)
+            x16, xsum, rscale, plan, inds = moe_small.topk_prep(x.reshape(1, K), logits, E, top_k)
+            self.assertTrue(mx.array_equal(inds, ref_inds).item(), f"seed {seed}: {inds.tolist()} vs {ref_inds.tolist()}")
+            r16, rsum, rrs, rplan = moe_small._prep(x.reshape(1, K), "copy", ref_inds, 1, top_k, E)
+            # Only column 0 of xsum and rscale[0] are written for one row
+            for name, a, b in (("x16", x16, r16), ("xsum", xsum[:, :1], rsum[:, :1]), ("rscale", rscale[:1], rrs[:1]), ("plan", plan, rplan)):
+                self.assertTrue(mx.array_equal(a, b).item(), f"{name} seed {seed}")

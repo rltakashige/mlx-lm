@@ -432,7 +432,7 @@ def _main_source(M, N, K, R, NSG, MC):
 """
 
 
-def _kernel(kind, key, source, inputs, outputs, header=""):
+def _kernel(kind, key, source, inputs, outputs, header="", **kwargs):
     kern = _kernels.get((kind, key))
     if kern is None:
         name = kind + "_" + "_".join(str(v) for v in key)
@@ -443,6 +443,7 @@ def _kernel(kind, key, source, inputs, outputs, header=""):
             output_names=outputs,
             source=source(),
             header=header,
+            **kwargs,
         )
         _kernels[(kind, key)] = kern
     return kern

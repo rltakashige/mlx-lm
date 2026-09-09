@@ -14,7 +14,9 @@ logits, sigmoid of the shared gate logit) and the block output is the sum over t
 import math
 
 import mlx.core as mx
+import mlx.nn as nn
 
+from .fused_ops import enabled
 from .qmv_small import (
     _HEADER,
     _UNROLL,
@@ -153,8 +155,14 @@ def _prep(x, kind, inds=None, m=0, top_k=0, eshared=0):
     return kern(inputs=[x] + ([inds] if plan else []), **kwargs)
 
 
-def _body(c, R, MC):
-    """The main loop over K for ``c`` gathered rows (the ``qmv_small`` loop with per-row x)."""
+def _body(c, R, MC, NB=0, full=False):
+    """The main loop over K for ``c`` gathered rows (the ``qmv_small`` loop with per-row x).
+
+    With ``full`` every weight, scale, bias and x load of the tile's ``NB`` steps is issued
+    before the math; the math and its order are unchanged, so the outputs are the same bits.
+    """
+    if full:
+        return _body_full(c, R, NB)
     wload = "\n".join(
         f"        {{dst}}[{r}] = *(const device uint2*)(wp + {r} * KW);"
         for r in range(R)
@@ -232,6 +240,89 @@ def _body(c, R, MC):
 """
 
 
+def _body_full(c, R, NB):
+    """``_body`` with all loads of the tile hoisted above the math (``c`` <= 2 rows)."""
+    nl = "\n"
+    wl = nl.join(
+        f"        wa[{b}][{r}] = *(const device uint2*)(wp + {b} * (32 * VPL / 8) + {r} * KW);"
+        for b in range(NB)
+        for r in range(R)
+    )
+    sl = nl.join(
+        f"        sa[{b}][{r}] = float(sp[{b} * (32 * VPL / 64) + {r} * KG]); ba[{b}][{r}] = float(bp[{b} * (32 * VPL / 64) + {r} * KG]);"
+        for b in range(NB)
+        for r in range(R)
+    )
+    xl = nl.join(
+        f"        xa[{b}][{m}][{cc}] = *(const device uint4*)(xp + {b} * 32 * VPL + xo[{m}] + {cc} * 8);"
+        for b in range(NB)
+        for m in range(c)
+        for cc in range(2)
+    )
+    xsl = nl.join(
+        f"        xsa[{b}][{m}] = xsp[{b} * 32 * Mp + xrow[{m}]];" for b in range(NB) for m in range(c)
+    )
+    steps = []
+    for b in range(NB):
+        deq = []
+        for r in range(R):
+            for wi in range(2):
+                wd = f"wa[{b}][{r}][{wi}]"
+                deq.append(f"        {{ const uint lo = {wd}, hi = {wd} >> 8;")
+                for j, (src, mask) in enumerate(
+                    (
+                        ("lo", "0x000F000Fu"),
+                        ("lo", "0x00F000F0u"),
+                        ("hi", "0x000F000Fu"),
+                        ("hi", "0x00F000F0u"),
+                    )
+                ):
+                    deq.append(
+                        f"          q2[{r}][{wi * 4 + j}] = as_type<half2>(({src} & {mask}) | 0x64006400u) - half2(1024.0h);"
+                    )
+                deq[-1] += " }"
+        fm = []
+        for r in range(R):
+            for m in range(c):
+                fm.append(
+                    f"        {{ half2 p = q2[{r}][0] * x2b({b}, {m}, 0);\n"
+                    + nl.join(
+                        f"          p = fma(q2[{r}][{j}], x2b({b}, {m}, {j}), p);"
+                        for j in range(1, 8)
+                    )
+                    + f"\n          acc[{r}][{m}] = fma(sa[{b}][{r}], float(p.x + p.y), fma(ba[{b}][{r}], xsa[{b}][{m}], acc[{r}][{m}])); }}"
+                )
+        steps.append(nl.join(deq) + nl + nl.join(fm))
+    store = nl.join(
+        f"        {{ const float sc = rscale[xrow[{m}]] * score(prow[{m}]);\n"
+        + nl.join(
+            f"          y[(size_t)prow[{m}] * N + row0 + {r}] = T(acc[{r}][{m}] * sc);"
+            for r in range(R)
+        )
+        + " }"
+        for m in range(c)
+    )
+    return f"""
+      {{
+        uint2 wa[{NB}][R];
+        float sa[{NB}][R], ba[{NB}][R];
+        uint4 xa[{NB}][{c}][2];
+        float xsa[{NB}][{c}];
+        #define x2b(b, m, j) as_type<half2>(xa[b][m][(j) / 4][(j) % 4])
+{wl}
+{sl}
+{xl}
+{xsl}
+{nl.join(steps)}
+        #undef x2b
+      }}
+{nl.join(f"      acc[{r}][{m}] = simd_sum(acc[{r}][{m}]);" for r in range(R) for m in range(c))}
+      if (lane == 0) {{
+{store}
+      }}
+"""
+
+
 def _score_source(LW):
     """Routing score of pair q from the logits (width LW, the shared gate last), or 1."""
     if not LW:
@@ -250,10 +341,17 @@ def _score_source(LW):
 """
 
 
-def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW):
+# Hoist all loads of a tile above the math for tiles of up to this many rows.
+_FULL_ROWS = 0
+
+
+def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW, full_rows=None):
     NB = K // _KSTEP
+    if full_rows is None:
+        full_rows = _FULL_ROWS
     cases = "\n".join(
-        f"      case {c}: {{{_body(c, R, MC)}      break; }}" for c in range(1, M + 1)
+        f"      case {c}: {{{_body(c, R, MC, NB, c <= full_rows)}      break; }}"
+        for c in range(1, M + 1)
     )
     return f"""
     constexpr int M = {M}, N = {N}, K = {K}, R = {R}, NSG = {NSG}, VPL = {_VPL}, Mp = {Mp}, MC = {MC};
@@ -307,13 +405,13 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     Mp = xsum.shape[1]
     RDIV = S if tokens else 1
     LW = logits.shape[-1] if logits is not None else 0
-    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype))
+    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype), _FULL_ROWS)
     call = _calls.get(key)
     if call is None:
         kern = _kernel(
             "moe_small_gather",
             key[1:],
-            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW),
+            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _FULL_ROWS),
             [
                 "x16",
                 "xsum",
@@ -368,5 +466,255 @@ def experts(block, x, logits, inds, slots=False):
         False,
         logits.reshape(m, -1),
     )
+    y = y.reshape(*batch, top_k + 1, K)
+    return y if slots else y.sum(axis=-2)
+
+
+_ROUTER_HEADER = """
+// qdot of MLX's qmv kernel for 8-bit weights (quantized.h), 4 values per lane per step.
+inline float qdot8(uint w, const thread float* x_thread, float scale, float bias, float sum) {
+  float accum = 0;
+  #pragma clang loop unroll(full)
+  for (int i = 0; i < 4; i++) {
+    accum += x_thread[i] * ((w >> (8 * i)) & 0xffu);
+  }
+  return scale * accum + sum * bias;
+}
+"""
+
+
+def _router_source(K, N, NSG):
+    """One simdgroup per row with every load of the row issued before the math.
+
+    The arithmetic is MLX's ``qmv`` kernel for 8-bit weights step by step (lane l takes
+    values 128 t + 4 l .. + 3 of step t, sums in that order, ``simd_sum`` at the end), so
+    the logits are bitwise the ones of ``mx.quantized_matmul``. That kernel walks the row
+    in 16 dependent steps; this one has one memory latency per row.
+    """
+    NB = K // 128
+    return f"""
+    constexpr int K = {K}, N = {N}, NSG = {NSG}, NB = {NB}, KW = K / 4, KG = K / 64;
+    const int lane = thread_index_in_simdgroup;
+    const int row = threadgroup_position_in_grid.x * NSG + simdgroup_index_in_threadgroup;
+    if (row >= N) return;
+    const int hi = lane / 16;
+    const device uint32_t* wr = w + (size_t)row * KW + lane;
+    const device T* sr = scales + (size_t)row * KG + hi;
+    const device T* br = biases + (size_t)row * KG + hi;
+    const device T* xr = x + lane * 4;
+    uint wv[NB];
+    vec<T, 4> xv[NB];
+    T sv[NB], bv[NB];
+    {_UNROLL}
+    for (int t = 0; t < NB; t++) {{
+      wv[t] = wr[t * 32];
+      xv[t] = *(const device vec<T, 4>*)(xr + t * 128);
+      sv[t] = sr[2 * t];
+      bv[t] = br[2 * t];
+    }}
+    float result = 0.0f;
+    {_UNROLL}
+    for (int t = 0; t < NB; t++) {{
+      float sum = 0.0f;
+      float xt[4];
+      {_UNROLL}
+      for (int i = 0; i < 4; i++) {{ sum += xv[t][i]; xt[i] = xv[t][i]; }}
+      const float s = sv[t];
+      const float b = bv[t];
+      result += qdot8(wv[t], xt, s, b, sum);
+    }}
+    result = simd_sum(result);
+    if (lane == 0) y[row] = static_cast<T>(result);
+"""
+
+
+def router_ok(gate, x):
+    """True when ``router`` runs: one row, an 8-bit g64 affine ``QuantizedLinear`` without bias."""
+    *batch, k = x.shape
+    return (
+        enabled()
+        and math.prod(batch) == 1
+        and isinstance(gate, nn.QuantizedLinear)
+        and gate.bits == 8
+        and gate.group_size == 64
+        and getattr(gate, "mode", "affine") == "affine"
+        and "bias" not in gate
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and gate.scales.dtype == x.dtype
+        and k % 128 == 0
+        and gate.weight.shape[1] * 4 == k
+    )
+
+
+def router(gate, x, nsg=4):
+    """``gate(x)``: the router logits of one token through the low-latency 8-bit matvec."""
+    if not router_ok(gate, x):
+        return gate(x)
+    *batch, K = x.shape
+    N = gate.weight.shape[0]
+    key = ("router", N, K, nsg, _tag(x.dtype))
+    call = _calls.get(key)
+    if call is None:
+        kern = _kernel(
+            "moe_small_router",
+            key[1:],
+            lambda: _router_source(K, N, nsg),
+            ["x", "w", "scales", "biases"],
+            ["y"],
+            _ROUTER_HEADER,
+        )
+        kwargs = dict(
+            template=[("T", x.dtype)],
+            grid=(32 * nsg * (-(-N // nsg)), 1, 1),
+            threadgroup=(32 * nsg, 1, 1),
+            output_shapes=[(1, N)],
+            output_dtypes=[x.dtype],
+        )
+        call = _calls[key] = (kern, kwargs)
+    kern, kwargs = call
+    (y,) = kern(inputs=[x.reshape(1, K), gate.weight, gate.scales, gate.biases], **kwargs)
+    return y.reshape(*batch, N)
+
+
+_SORT_HEADER = """
+// MLX's LessThan of sort.h (NaN sorts last).
+template <typename T> struct SortLess {
+  bool operator()(T a, T b) const {
+    bool an = metal::isnan(a), bn = metal::isnan(b);
+    if (an | bn) return (!an) & bn;
+    return a < b;
+  }
+};
+"""
+
+
+def _topk_plan_source(E, TOPK, S, NT):
+    """Appended to the copy prep of one token: threads 0..63 argsort the E logits as MLX's
+    single-block sort does (carg_block_sort, 64 threads x 4 values, the same merges and tie
+    order), the last TOPK indices are the experts of mx.argpartition, and the plan is one
+    pair per slot with the shared expert last."""
+    return f"""
+    {{
+      constexpr int E = {E}, TOPK = {TOPK}, S = {S}, PW = 3, BN = 64, TN = 4, NPB = BN * TN;
+      threadgroup T tv[NPB];
+      threadgroup uint ti[NPB];
+      SortLess<T> op;
+      const T init = metal::numeric_limits<T>::quiet_NaN();
+      for (int i = t; i < NPB; i += {NT}) {{ tv[i] = i < E ? logits[i] : init; ti[i] = uint(i); }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const bool sorter = t < BN;
+      const int idx = t * TN;
+      T vals[TN];
+      uint idxs[TN];
+      if (sorter) {{
+        for (int i = 0; i < TN; ++i) {{ vals[i] = tv[idx + i]; idxs[i] = ti[idx + i]; }}
+        if (idx < E) {{
+          for (short i = 0; i < TN; ++i) {{
+            for (short j = i & 1; j < TN - 1; j += 2) {{
+              if (op(vals[j + 1], vals[j])) {{
+                T w = vals[j + 1]; vals[j + 1] = vals[j]; vals[j] = w;
+                uint wi = idxs[j + 1]; idxs[j + 1] = idxs[j]; idxs[j] = wi;
+              }}
+            }}
+          }}
+        }}
+      }}
+      for (int merge_threads = 2; merge_threads <= BN; merge_threads *= 2) {{
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sorter) for (int i = 0; i < TN; ++i) {{ tv[idx + i] = vals[i]; ti[idx + i] = idxs[i]; }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sorter) {{
+          const int merge_group = t / merge_threads, merge_lane = t % merge_threads;
+          const int sort_sz = TN * merge_threads, sort_st = sort_sz * merge_group;
+          const int A_st = sort_st, A_ed = sort_st + sort_sz / 2, B_st = A_ed, B_ed = sort_st + sort_sz;
+          const threadgroup T* As = tv + A_st;
+          const threadgroup T* Bs = tv + B_st;
+          short A_sz = A_ed - A_st, B_sz = B_ed - B_st;
+          const short sort_md = TN * merge_lane;
+          short pa = max(0, sort_md - B_sz), pe = min(sort_md, A_sz);
+          while (pa < pe) {{
+            const short md = pa + (pe - pa) / 2;
+            const T a = As[md];
+            const T b = Bs[sort_md - 1 - md];
+            if (op(b, a)) pe = md; else pa = md + 1;
+          }}
+          const short partition = pe;
+          As += partition;
+          Bs += sort_md - partition;
+          A_sz -= partition;
+          B_sz -= sort_md - partition;
+          const threadgroup uint* As_idx = ti + A_st + partition;
+          const threadgroup uint* Bs_idx = ti + B_st + sort_md - partition;
+          short a_idx = 0, b_idx = 0;
+          for (int i = 0; i < TN; ++i) {{
+            const T a = (a_idx < A_sz) ? As[a_idx] : init;
+            const T b = (b_idx < B_sz) ? Bs[b_idx] : init;
+            const bool pred = (b_idx < B_sz) && (a_idx >= A_sz || op(b, a));
+            vals[i] = pred ? b : a;
+            idxs[i] = pred ? Bs_idx[b_idx] : ((a_idx < A_sz) ? As_idx[a_idx] : 0u);
+            b_idx += short(pred);
+            a_idx += short(!pred);
+          }}
+        }}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sorter) for (int i = 0; i < TN; ++i) {{ tv[idx + i] = vals[i]; ti[idx + i] = idxs[i]; }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (t < TOPK) inds[t] = ti[E - TOPK + t];
+      if (t < S) {{
+        plan[t * PW] = t < TOPK ? int(ti[E - TOPK + t]) : E;
+        plan[t * PW + 1] = 1;
+        plan[t * PW + 2] = t;
+      }}
+    }}
+"""
+
+
+def topk_ok(block, x):
+    """True for one token, 128 < experts <= 256 (MLX's 64 x 4 single-block sort) and K <= 8192."""
+    *batch, k = x.shape
+    return math.prod(batch) == 1 and 128 < block.num_experts <= 256 and k <= 8192
+
+
+def topk_prep(x, logits, E, top_k):
+    """The copy prep of one token x (1, K) plus the top-k experts of its logits and the plan.
+
+    Returns (x16, xsum, rscale, plan, inds); ``inds`` (top_k,) equals
+    ``mx.argpartition(logits[..., :E], kth=-top_k)[..., -top_k:]`` bit for bit.
+    """
+    M, K = x.shape
+    S = top_k + 1
+    NT = _scan_threads(K)
+    key = ("topk_prep", K, E, top_k, _tag(x.dtype))
+    call = _calls.get(key)
+    if call is None:
+        kern = _kernel(
+            "moe_small_topk_prep",
+            key[1:],
+            lambda: _prep_source(K, 1, "copy") + _topk_plan_source(E, top_k, S, NT),
+            ["x", "logits"],
+            ["x16", "xsum", "rscale", "plan", "inds"],
+            _HEADER + _SORT_HEADER,
+        )
+        kwargs = dict(
+            template=[("T", x.dtype)],
+            grid=(NT * _prep_segments(K), 1, 1),
+            threadgroup=(NT, 1, 1),
+            output_shapes=[(1, K), (K // 16, _mp(1)), (_mp(1),), (S, 3), (top_k,)],
+            output_dtypes=[mx.float16, mx.float32, mx.float32, mx.int32, mx.uint32],
+        )
+        call = _calls[key] = (kern, kwargs)
+    kern, kwargs = call
+    return kern(inputs=[x, logits.reshape(1, -1)], **kwargs)
+
+
+def experts_topk(block, x, logits, slots=False):
+    """``experts`` for one token with the top-k, the plan and the prep in one kernel."""
+    *batch, K = x.shape
+    E, top_k = block.num_experts, block.top_k
+    x16, xsum, rscale, plan, inds = topk_prep(x.reshape(1, K), logits, E, top_k)
+    gu = _gather((x16, xsum, rscale), plan, block.switch_mlp.gate_up_proj, inds, 1, top_k, True)
+    h = _prep(gu, "swiglu")
+    y = _gather(h, plan, block.switch_mlp.down_proj, inds, 1, top_k, False, logits.reshape(1, -1))
     y = y.reshape(*batch, top_k + 1, K)
     return y if slots else y.sum(axis=-2)

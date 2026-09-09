@@ -157,9 +157,13 @@ class Attention(Qwen3NextAttention):
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if fused and mask is None and fused_ops.sdpa_ok(queries, keys, cache):
+            # Two dispatches with many threadgroups; bitwise the sdpa_vector kernel
+            output = fused_ops.sdpa_two_pass(queries, keys, values, self.scale)
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         if fused:
             # The gate is read in place from the projection rows
             qkv2 = qkv.reshape(B * L, -1)
@@ -246,13 +250,19 @@ class SparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         E, k = self.num_experts, self.top_k
-        logits = self.gate(x)
-        inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
-        if moe_small.routes(self, x):
+        logits = moe_small.router(self.gate, x)
+        if moe_small.routes(self, x) and moe_small.topk_ok(self, x):
+            # One token: the top-k, the plan and the prep of x in one kernel
+            y = moe_small.experts_topk(
+                self, x, logits, slots and self.sharding_group is None
+            )
+        elif moe_small.routes(self, x):
+            inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
             y = moe_small.experts(
                 self, x, logits, inds, slots and self.sharding_group is None
             )
         else:
+            inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
             if self.norm_topk_prob:
                 top = mx.take_along_axis(logits, inds, axis=-1)
                 scores = mx.softmax(top, axis=-1, precise=True)

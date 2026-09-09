@@ -495,3 +495,172 @@ def attn_gate(x, qkv):
         output_dtypes=[x.dtype],
     )
     return out.reshape(B, L, H * Dh)
+
+
+# The sdpa_vector kernel of MLX (sdpa_vector.h) runs one 1024-thread threadgroup per
+# query head: 16 threadgroups on a 40-core GPU, each walking its keys in 32 simdgroups.
+# Below 1024 keys MLX picks that kernel. These two kernels split the same work over
+# (kv head, key block) threadgroups and combine the blocks as the kernel combines its
+# simdgroups: block b holds the keys b, b + 32, ..., summed in the same order with the
+# same exp, so the output is bitwise the one-pass output. The partials stay in float.
+_SDPA_BLOCKS = 32
+_SDPA_MAX_KEYS = 1024
+
+
+def _sdpa_pass1_source(D, V, GQA):
+    return f"""
+    constexpr int D = {D}, V = {V}, GQA = {GQA}, NBLK = {_SDPA_BLOCKS}, BD = 32;
+    constexpr int qk_per_thread = D / BD, v_per_thread = V / BD;
+    const int lane = thread_index_in_simdgroup;
+    const int blk = threadgroup_position_in_grid.x;
+    const int kvh = threadgroup_position_in_grid.y;
+    const int h = kvh * GQA + int(simdgroup_index_in_threadgroup);
+    const int N = keys_shape[2];
+    const size_t k_head_stride = keys_strides[1], k_seq_stride = keys_strides[2];
+    const size_t v_head_stride = values_strides[1], v_seq_stride = values_strides[2];
+    const device T* qp = queries + (size_t)h * D + lane * qk_per_thread;
+    const device T* kp = keys + (size_t)kvh * k_head_stride + (size_t)blk * k_seq_stride + lane * qk_per_thread;
+    const device T* vp = values + (size_t)kvh * v_head_stride + (size_t)blk * v_seq_stride + lane * v_per_thread;
+    float q[qk_per_thread], k[qk_per_thread], o[v_per_thread];
+    for (int i = 0; i < qk_per_thread; i++) q[i] = static_cast<float>(scale) * qp[i];
+    for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+    float max_score = -metal::numeric_limits<float>::max();
+    float sum_exp_score = 0;
+    for (int i = blk; i < N; i += NBLK) {{
+      // 16-byte loads of the key and value slices (the values are the same as element loads)
+      T v[v_per_thread];
+      #pragma clang loop unroll(full)
+      for (int j = 0; j < qk_per_thread; j += 4) {{
+        const vec<T, 4> kk = *(const device vec<T, 4>*)(kp + j);
+        k[j] = kk.x; k[j + 1] = kk.y; k[j + 2] = kk.z; k[j + 3] = kk.w;
+      }}
+      #pragma clang loop unroll(full)
+      for (int j = 0; j < v_per_thread; j += 4) {{
+        const vec<T, 4> vv = *(const device vec<T, 4>*)(vp + j);
+        v[j] = vv.x; v[j + 1] = vv.y; v[j + 2] = vv.z; v[j + 3] = vv.w;
+      }}
+      float score = 0;
+      #pragma clang loop unroll(full)
+      for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
+      score = simd_sum(score);
+      float new_max = max(max_score, score);
+      float factor = metal::fast::exp(max_score - new_max);
+      float exp_score = metal::fast::exp(score - new_max);
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+      #pragma clang loop unroll(full)
+      for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * v[j];
+      kp += NBLK * k_seq_stride;
+      vp += NBLK * v_seq_stride;
+    }}
+    device float4* po = (device float4*)(part + ((size_t)h * NBLK + blk) * V + lane * v_per_thread);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < v_per_thread; i += 4) po[i / 4] = float4(o[i], o[i + 1], o[i + 2], o[i + 3]);
+    if (lane == 0) {{
+      pmax[h * NBLK + blk] = max_score;
+      psum[h * NBLK + blk] = sum_exp_score;
+    }}
+"""
+
+
+def _sdpa_pass2_source(V):
+    return f"""
+    constexpr int V = {V}, BN = {_SDPA_BLOCKS}, BD = 32, v_per_thread = V / BD;
+    const int h = threadgroup_position_in_grid.x;
+    const int lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    threadgroup float outputs[BN * BD];
+    threadgroup float max_scores[BN];
+    threadgroup float sum_exp_scores[BN];
+    const device float4* po = (const device float4*)(part + ((size_t)h * BN + sg) * V + lane * v_per_thread);
+    float o[v_per_thread];
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < v_per_thread; i += 4) {{
+      const float4 f = po[i / 4];
+      o[i] = f.x; o[i + 1] = f.y; o[i + 2] = f.z; o[i + 3] = f.w;
+    }}
+    if (lane == 0) {{
+      max_scores[sg] = pmax[h * BN + sg];
+      sum_exp_scores[sg] = psum[h * BN + sg];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_score = max_scores[lane];
+    float new_max = simd_max(max_score);
+    float factor = metal::fast::exp(max_score - new_max);
+    float sum_exp_score = simd_sum(sum_exp_scores[lane] * factor);
+    for (int i = 0; i < v_per_thread; i++) {{
+      outputs[lane * BD + sg] = o[i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      o[i] = simd_sum(outputs[sg * BD + lane] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    if (lane == 0) {{
+      device T* op = out + (size_t)h * V + sg * v_per_thread;
+      for (int i = 0; i < v_per_thread; i++) op[i] = static_cast<T>(o[i]);
+    }}
+"""
+
+
+def sdpa_ok(queries, keys, cache):
+    """True when ``sdpa_two_pass`` handles this call: one query row of one sequence, a
+    plain KV cache and fewer than 1024 keys (where MLX runs its one-pass kernel)."""
+    B, H, L, D = queries.shape
+    Bk, Hkv, N, Dk = keys.shape
+    return (
+        enabled()
+        and not hasattr(cache, "bits")
+        and B == 1
+        and L == 1
+        and D == Dk
+        and D % 32 == 0
+        and H % Hkv == 0
+        and 1 <= N < _SDPA_MAX_KEYS
+        and queries.dtype in (mx.bfloat16, mx.float16)
+        and keys.dtype == queries.dtype
+    )
+
+
+def sdpa_two_pass(queries, keys, values, scale):
+    """``mx.fast.scaled_dot_product_attention`` of one query row, bitwise, as two kernels.
+
+    ``queries`` (1, H, 1, D) contiguous; ``keys`` and ``values`` (1, Hkv, N, D) may be
+    views into the cache (their strides are read in the kernel).
+    """
+    B, H, L, D = queries.shape
+    Hkv, N = keys.shape[1], keys.shape[2]
+    V = values.shape[-1]
+    GQA = H // Hkv
+    NBLK = _SDPA_BLOCKS
+    kern1 = _kernel(
+        "sdpa_pass1",
+        (D, V, GQA, str(queries.dtype)),
+        lambda: _sdpa_pass1_source(D, V, GQA),
+        ["queries", "keys", "values", "scale"],
+        ["part", "pmax", "psum"],
+        ensure_row_contiguous=False,
+    )
+    kern2 = _kernel(
+        "sdpa_pass2",
+        (V, str(queries.dtype)),
+        lambda: _sdpa_pass2_source(V),
+        ["part", "pmax", "psum"],
+        ["out"],
+    )
+    part, pmax, psum = kern1(
+        inputs=[queries, keys, values, mx.array(scale, mx.float32)],
+        template=[("T", queries.dtype)],
+        grid=(32 * GQA * NBLK, Hkv, 1),
+        threadgroup=(32 * GQA, 1, 1),
+        output_shapes=[(H, NBLK, V), (H, NBLK), (H, NBLK)],
+        output_dtypes=[mx.float32] * 3,
+    )
+    (out,) = kern2(
+        inputs=[part, pmax, psum],
+        template=[("T", queries.dtype)],
+        grid=(32 * NBLK * H, 1, 1),
+        threadgroup=(32 * NBLK, 1, 1),
+        output_shapes=[(B, H, L, V)],
+        output_dtypes=[queries.dtype],
+    )
+    return out
