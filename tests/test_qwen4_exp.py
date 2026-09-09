@@ -383,3 +383,19 @@ class TestFlashNextKernels(unittest.TestCase):
             want = norm(x, z).reshape(1, rows, heads * D)
             self.assertTrue(mx.array_equal(got, want).item(), rows)
 
+    def test_ple_conv_matches_ops(self):
+        from mlx_lm.models import fused_ops
+
+        C, KW, DIL = 512, 4, 3
+        conv = nn.Conv1d(C, C, kernel_size=KW, dilation=DIL, groups=C, bias=False)
+        conv.weight = (mx.random.normal(conv.weight.shape) * 0.3).astype(mx.bfloat16)
+        for B, L in ((1, 1), (2, 5), (1, 12)):
+            x = mx.random.normal((B, L, C)).astype(mx.bfloat16)
+            state = mx.random.normal((B, (KW - 1) * DIL, C)).astype(mx.bfloat16)
+            out, new_state = fused_ops.ple_conv(x, state, conv.weight)
+            conv_input = mx.concatenate([state, x], axis=1)
+            want = nn.silu(conv(conv_input))
+            self.assertTrue(mx.array_equal(new_state, conv_input[:, -(KW - 1) * DIL :]).item())
+            diff = (out.astype(mx.float32) - want.astype(mx.float32)).abs()
+            self.assertLess(diff.max().item(), 1e-2, (B, L))
+            self.assertGreater((diff == 0).mean().item(), 0.9, (B, L))

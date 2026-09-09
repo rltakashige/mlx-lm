@@ -514,3 +514,54 @@ def attn_gate(x, qkv):
         output_dtypes=[x.dtype],
     )
     return out.reshape(B, L, H * Dh)
+
+
+def _ple_conv_source(KW, DIL):
+    return f"""
+    constexpr int KW = {KW}, DIL = {DIL}, NS = (KW - 1) * DIL;
+    const int c = thread_position_in_grid.x;
+    const int row = thread_position_in_grid.y;
+    const int b = row / (L + NS), t = row % (L + NS);
+    if (c >= C) return;
+    // [state; x] row r of batch b
+    auto in = [&](int r) -> T {{
+      return r < NS ? state[((size_t)b * NS + r) * C + c] : x[((size_t)b * L + r - NS) * C + c];
+    }};
+    if (t < L) {{
+      float acc = 0.0f;
+      for (int j = 0; j < KW; j++) acc += float(in(t + j * DIL)) * float(w[c * KW + j]);
+      // conv1d rounds to T, then the compiled silu in T
+      const float cv = float(T(acc));
+      out[((size_t)b * L + t) * C + c] = T(cv * sigmoid_t<T>(cv));
+    }} else {{
+      // The next state: the last NS rows of [state; x]
+      state_out[((size_t)b * NS + t - L) * C + c] = in(t - L + L);
+    }}
+"""
+
+
+def ple_conv(x, state, weight):
+    """``silu(depthwise conv1d([state; x]))`` of the PLE layer and the next state, one kernel.
+
+    ``x`` (B, L, C), ``state`` (B, (KW - 1) * dilation, C), ``weight`` (C, KW, 1).
+    """
+    B, L, C = x.shape
+    KW = weight.shape[1]
+    NS = state.shape[1]
+    DIL = NS // (KW - 1)
+    kern = _kernel(
+        "ple_conv",
+        (KW, DIL, str(x.dtype)),
+        lambda: _ple_conv_source(KW, DIL),
+        ["x", "state", "w", "L", "C"],
+        ["out", "state_out"],
+        _HEADER + _SIGMOID_T,
+    )
+    return kern(
+        inputs=[x, state, weight, L, C],
+        template=[("T", x.dtype)],
+        grid=(C, B * (L + NS), 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, L, C), (B, NS, C)],
+        output_dtypes=[x.dtype, x.dtype],
+    )

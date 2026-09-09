@@ -590,17 +590,24 @@ class PLELayer(nn.Module):
             state = cache[2]
         else:
             state = mx.zeros((B, self.state_len, x.shape[-1]), dtype=x.dtype)
-        conv_input = mx.concatenate([state, x], axis=1)
+        if fused_ops.enabled() and x.dtype in (mx.bfloat16, mx.float16) and self.conv1d.weight.dtype == x.dtype:
+            out, new_state = fused_ops.ple_conv(x, state, self.conv1d.weight)
+            conv_input = None
+        else:
+            conv_input = mx.concatenate([state, x], axis=1)
+            out, new_state = nn.silu(self.conv1d(conv_input)), conv_input[:, -self.state_len :]
         if cache is not None:
-            cache[2] = mx.contiguous(conv_input[:, -self.state_len :])
+            cache[2] = mx.contiguous(new_state)
             if cache.keep_states and L > 1:
                 # Let the cache rebuild the conv state and the context after ``steps`` rows
+                if conv_input is None:
+                    conv_input = mx.concatenate([state, x], axis=1)
                 n, ctx, history = self.state_len, self.ple_embedding.hasher.context_len, cache.ple_history
                 cache.ple_rollback = lambda steps: (
                     conv_input[:, steps : steps + n],
                     mx.array(history[:, steps : steps + ctx]),
                 )
-        return nn.silu(self.conv1d(conv_input))
+        return out
 
     def __call__(self, hyper: mx.array, ids: np.ndarray, cache) -> mx.array:
         B, L, _ = hyper.shape
