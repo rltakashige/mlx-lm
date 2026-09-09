@@ -28,7 +28,7 @@ _VPL = 16  # K values per lane per step
 _MIN_M, _MAX_M = 3, 8
 # From 6 rows the tensor-op kernel (qmv_nax) is faster than the SIMD kernel, also under sustained load.
 _NAX_MIN_M, _NAX_MAX_M = 6, 32
-_NAX_KSTEP = 1024  # K values per split-K slice at the largest split
+_NAX_KSTEP = 512  # K values per split-K slice: 8 simdgroups x 64 (16 when K / 64 is a multiple of 16)
 # Below 8 MB of weights the prep launch and the low threadgroup count cost more than the kernel saves.
 _MIN_BYTES = 8 << 20
 _KSTEP = 32 * _VPL  # K values per main-kernel step
@@ -432,7 +432,7 @@ def _main_source(M, N, K, R, NSG, MC):
 """
 
 
-def _kernel(kind, key, source, inputs, outputs, header=""):
+def _kernel(kind, key, source, inputs, outputs, header="", atomic=False):
     kern = _kernels.get((kind, key))
     if kern is None:
         name = kind + "_" + "_".join(str(v) for v in key)
@@ -443,6 +443,7 @@ def _kernel(kind, key, source, inputs, outputs, header=""):
             output_names=outputs,
             source=source(),
             header=header,
+            atomic_outputs=atomic,
         )
         _kernels[(kind, key)] = kern
     return kern

@@ -53,7 +53,7 @@ def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL, GROUP=64):
     const int M = x16_shape[0];
     constexpr int G = {G}, GS = {GS}, NU = {NU}, GU = {GU}, KW = K / 8, CC = {CC};
     // Scale rows have SG groups of GROUP values; a 64-value block holds GPB of them.
-    constexpr int SG = K / {GROUP}, GPB = 64 / {GROUP};
+    constexpr int GROUP = {GROUP}, SG = K / GROUP, GPB = 64 / GROUP;
     const int lane = thread_index_in_simdgroup;
     const int sg = simdgroup_index_in_threadgroup;
     const int tile0 = threadgroup_position_in_grid.x * (NT * NTS);
@@ -92,8 +92,8 @@ def _source(MB, N, K, NSG, NT, KOP, mode, NTS, GU, PF, NCOL, GROUP=64):
       if (tile0 + tt * NT >= N / NCOL) break;
       const int n0 = (tile0 + tt * NT) * NCOL;
       const device uint32_t* wp = w + (size_t)(n0 + fm) * KW + g0 * 8 + cls * 2 * GU;
-      const device T* sp = scales + (size_t)(n0 + fm) * SG + g0 * GPB + (16 * GU * cls) / {GROUP};
-      const device T* bp = biases + (size_t)(n0 + fm) * SG + g0 * GPB + (16 * GU * cls) / {GROUP};
+      const device T* sp = scales + (size_t)(n0 + fm) * SG + g0 * GPB + (16 * GU * cls) / GROUP;
+      const device T* bp = biases + (size_t)(n0 + fm) * SG + g0 * GPB + (16 * GU * cls) / GROUP;
       const device T* sq = scales + (size_t)(n0 + 4 * cls) * G + g0;
       (void)sp; (void)bp; (void)sq;""")
     for t in range(NT):
