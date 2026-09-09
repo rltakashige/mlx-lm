@@ -182,6 +182,31 @@ class TestTinyModel(unittest.TestCase):
         self.assertEqual(hidden.shape, (1, 22, 4 * 64))
         self.assertTrue(mx.allclose(logits, prefill))
 
+        # EOS tokens (id 1) reset the n-gram context: the cached decode must agree
+        with_eos = mx.array([[3, 8, 12, 5, 9, 1, 1, 30, 31, 32, 7, 1, 40, 41, 42, 43]])
+        prefill = model(with_eos)
+        cache = make_prompt_cache(model)
+        steps = [model(with_eos[:, i : i + 1], cache=cache) for i in range(16)]
+        self.assertTrue(mx.allclose(prefill, mx.concatenate(steps, axis=1), atol=1e-4))
+
+    def test_mtp_head_reproduces_greedy_decoding(self):
+        from mlx_lm.generate import generate_step, speculative_generate_step
+        from mlx_lm.models import qwen4_exp_mtp
+
+        model = tiny_model()
+        mx.random.seed(1)
+        draft = qwen4_exp_mtp.Model(
+            qwen4_exp_mtp.ModelArgs(model_type="qwen4_exp_mtp", text_config=dict(TEXT_CONFIG))
+        )
+        prompt = mx.array([3, 17, 42, 7, 99, 5, 61, 8, 23, 44, 12, 13])
+        greedy = [t for t, _ in generate_step(prompt, model, max_tokens=24)]
+        # A random head drafts wrong tokens: every cycle rolls the caches back
+        for k in (1, 3):
+            out = speculative_generate_step(
+                prompt, model, draft, max_tokens=24, num_draft_tokens=k, draft_stop_prob=0.0, draft_candidates=0
+            )
+            self.assertEqual([t for t, _, _ in out], greedy)
+
     def test_trim_rolls_the_states_back(self):
         model = tiny_model()
         inputs = mx.array([list(range(2, 16))])
