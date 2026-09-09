@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -401,6 +402,47 @@ class TestQwen3_5MTP(unittest.TestCase):
                 self.assertGreaterEqual(sum(sib_draft), sum(from_draft))
                 if k != 2:
                     self.assertGreater(sum(sib_draft), sum(from_draft))
+
+    def test_typical_acceptance(self):
+        target, head = _models()
+        expected = _greedy(PROMPT, target, 32)
+        # Off: the loop is greedy
+        tokens, _ = _speculative(
+            PROMPT, target, head, 32, num_draft_tokens=3, accept_entropy=0.0
+        )
+        self.assertEqual(tokens, expected)
+        for e, ratio in ((0.3, 0.0), (0.9, 0.0), (0.3, 0.5)):
+            out = list(
+                speculative_generate_step(
+                    PROMPT,
+                    target,
+                    head,
+                    max_tokens=32,
+                    num_draft_tokens=3,
+                    accept_entropy=e,
+                    accept_ratio=ratio,
+                )
+            )
+            tokens = mx.array([t for t, _, _ in out])
+            # The emitted text scores the same in a teacher-forced pass
+            logits = target(mx.concatenate([PROMPT, tokens])[None])
+            logits = logits[0, PROMPT.size - 1 : -1].astype(mx.float32)
+            forced = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            kept = 0
+            for (token, lp, from_draft), lp_forced in zip(out, forced):
+                self.assertLess(abs(lp[token].item() - lp_forced[token].item()), 1e-3)
+                if not from_draft:
+                    self.assertEqual(token, mx.argmax(lp).item())
+                    continue
+                kept += 1
+                p = mx.exp(lp)
+                bound = min(2 * math.log(e), math.log(e) + mx.sum(p * lp).item())
+                if ratio:
+                    bound = max(bound, mx.max(lp).item() + math.log(ratio))
+                # A kept draft passes the bound, so it is one of the top choices
+                self.assertGreaterEqual(lp[token].item(), bound - 1e-4)
+                self.assertLess(mx.sum(lp > lp[token]).item(), math.exp(-bound))
+            self.assertGreater(kept, 0)
 
     def test_load_sidecar_and_bundled(self):
         for moe in (False, True):
