@@ -129,7 +129,9 @@ def run(
                     f"draft_{i}", lambda: draft.sample(inp, hd, cache=draft_cache, head=head)
                 )
                 hd_new = hd_new[:, -1:]
-                tok, p, margin = tok2[:1], stat[:1], stat[1:].item()
+                tok, p = tok2[:1], stat[:1]
+                # The margin is read only for the fallback: every .item() is a sync
+                margin = stat[1:].item() if fallback else 0.0
                 if head is not None:
                     stats["cand_steps"] += 1
                     if fallback and margin < fallback:
@@ -158,7 +160,7 @@ def run(
             p = mx.max(mx.softmax(l))
             if head is not None:
                 tok = head.ids[tok]
-                margin = mx.abs(mx.diff(mx.topk(l, 2))).item()
+                margin = mx.abs(mx.diff(mx.topk(l, 2))).item() if fallback else 0.0
                 stats["cand_steps"] += 1
                 if check:
                     full = phase("check", lambda: draft.lm_head(hd_new)[0, -1])
