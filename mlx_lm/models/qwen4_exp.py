@@ -182,33 +182,60 @@ class GatedResidual(nn.Module):
             self.block_inject_weight = nn.Linear(hc_dims, self.hc, bias=False)
 
     def __call__(self, hyper: mx.array):
-        normed = self.hc_norm(hyper)
-        mix = _gate(self.input_mix_weight_down(normed), 1 / self.hc)
-        streams = normed.reshape(*normed.shape[:-1], self.hc, self.dims)
-        mixed = _weigh(self.input_mix_weight_up(mix).reshape(streams.shape), streams).mean(axis=-2)
-        if "block_inject_weight" not in self:
-            return mixed
-        return mixed, _inject(self.block_inject_weight(normed), 1 / self.hc)
+        # The whole site is one compiled graph: one Python call instead of ~15
+        linears = [self.input_mix_weight_down, self.input_mix_weight_up]
+        inject = "block_inject_weight" in self
+        if inject:
+            linears.append(self.block_inject_weight)
+        quant = None
+        params = []
+        for m in linears:
+            if hasattr(m, "scales"):
+                quant = (m.group_size, m.bits, m.mode)
+                params += [m.weight, m.scales, m.biases]
+            else:
+                params.append(m.weight)
+        fn = _mix_function(self.hc, self.dims, self.hc_norm.eps, quant, inject)
+        return fn(hyper, self.hc_norm.gain(), *params)
 
     def combine(self, hyper: mx.array, x: mx.array, inject: mx.array) -> mx.array:
         streams = hyper.reshape(*hyper.shape[:-1], self.hc, self.dims)
         return _combine(streams, x, inject).reshape(hyper.shape)
 
 
-# The elementwise chains of a hyper-connection site, each compiled into one kernel
-@mx.compile
-def _gate(x, inv_hc):
-    return nn.silu(x * inv_hc)
+_MIX_FUNCTIONS = {}
 
 
-@mx.compile
-def _weigh(logits, streams):
-    return mx.sigmoid(logits) * streams
+def _mix_function(hc, dims, eps, quant, inject):
+    """The compiled mix of a hyper-connection site, shared by the sites of a shape."""
+    key = (hc, dims, eps, quant, inject)
+    fn = _MIX_FUNCTIONS.get(key)
+    if fn is not None:
+        return fn
+    inv_hc = 1.0 / hc
+    per = 1 if quant is None else 3
 
+    def matmul(x, *p):
+        if quant is None:
+            return x @ p[0].T
+        return mx.quantized_matmul(
+            x, *p, transpose=True, group_size=quant[0], bits=quant[1], mode=quant[2]
+        )
 
-@mx.compile
-def _inject(x, inv_hc):
-    return 2 * mx.sigmoid(x * inv_hc)
+    def mix(hyper, gain, *params):
+        B, L, _ = hyper.shape
+        normed = mx.fast.rms_norm(hyper.reshape(B, L, hc, dims), None, eps)
+        normed = normed.reshape(B, L, hc * dims) * gain
+        streams = normed.reshape(B, L, hc, dims)
+        g = nn.silu(matmul(normed, *params[:per]) * inv_hc)
+        weights = mx.sigmoid(matmul(g, *params[per : 2 * per])).reshape(B, L, hc, dims)
+        mixed = (weights * streams).mean(axis=-2)
+        if not inject:
+            return mixed
+        return mixed, 2 * mx.sigmoid(matmul(normed, *params[2 * per :]) * inv_hc)
+
+    fn = _MIX_FUNCTIONS[key] = mx.compile(mix)
+    return fn
 
 
 @mx.compile
