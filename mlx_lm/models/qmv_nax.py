@@ -134,11 +134,12 @@ def _source(MB, N, K, NSG, fmt):
 
 def _config(M, N, K, fmt):
     """Simdgroups per tile: split K over 8, 16 for the small-N projections where the grid is short
-    (their 32-row reduction does not fit threadgroup memory)."""
+    (their 32-row reduction does not fit threadgroup memory) when each simdgroup keeps at
+    least 4 blocks (at 3-bit the blocks are 128 wide: 16 would leave out_proj 3 blocks each)."""
     NB = K // (4 * fmt.P)
     if M > 16:
         return 4 if N >= 32768 else 8
-    return 16 if N <= 8192 and NB % 16 == 0 else 8
+    return 16 if N <= 8192 and NB % 16 == 0 and NB >= 64 else 8
 
 
 def supported(x, w, scales, biases, group_size, bits, mode="affine"):
