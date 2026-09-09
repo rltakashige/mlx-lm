@@ -199,7 +199,8 @@ class GatedResidual(nn.Module):
 
     def combine(self, hyper: mx.array, x: mx.array, inject: mx.array) -> mx.array:
         streams = hyper.reshape(*hyper.shape[:-1], self.hc, self.dims)
-        return _combine(streams, x, inject).reshape(hyper.shape)
+        # A float32 block output (the MoE's atomic sum) is rounded like the ops' sum
+        return _combine(streams, x.astype(hyper.dtype), inject).reshape(hyper.shape)
 
     def mix(self, hyper: mx.array, pending=None):
         """The site on ``hyper`` with the previous block's ``pending`` (x, inject)
@@ -819,6 +820,8 @@ class DecoderLayer(nn.Module):
         else:
             self.self_attn = Attention(args)
         self.mlp = SparseMoeBlock(args)
+        # The expert rows of a token are summed inside the down gather (float32 output)
+        self.mlp.atomic_sum = True
         # ple_layer_ids are one-indexed
         if layer_idx + 1 in args.ple_layer_ids:
             self.ple = PLELayer(args, sorted(args.ple_layer_ids).index(layer_idx + 1))

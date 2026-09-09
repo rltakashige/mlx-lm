@@ -164,8 +164,10 @@ def _prep(x, kind, inds=None, m=0, top_k=0, eshared=0):
     return kern(inputs=[x] + ([inds] if plan else []), **kwargs)
 
 
-def _body(c, R, MC, LPR):
-    """The main loop over K for ``c`` gathered rows (the ``qmv_small`` loop with per-row x)."""
+def _body(c, R, MC, LPR, atomic=False):
+    """The main loop over K for ``c`` gathered rows (the ``qmv_small`` loop with per-row x).
+
+    With ``atomic`` the rows of a token are summed into its float32 output row."""
     wload = "\n".join(
         f"        {{dst}}[{r}] = *(const device uint2*)(wp + {r} * KW);"
         for r in range(R)
@@ -209,12 +211,13 @@ def _body(c, R, MC, LPR):
                     + f"\n          acc[{r}][{m}] = fma(s[{r}], float(p.x + p.y), fma(bb[{r}], xs[{mm}], acc[{r}][{m}])); }}"
                 )
         chunks.append(xl + "\n" + xs + "\n" + "\n".join(fm))
+    if atomic:
+        put = "atomic_fetch_add_explicit(&y[(size_t)(prow[{m}] / S) * N + row0 + {r}], acc[{r}][{m}] * sc, memory_order_relaxed);"
+    else:
+        put = "y[(size_t)prow[{m}] * N + row0 + {r}] = T(acc[{r}][{m}] * sc);"
     store = "\n".join(
         f"        {{ const float sc = rscale[xrow[{m}]] * score(prow[{m}]);\n"
-        + "\n".join(
-            f"          y[(size_t)prow[{m}] * N + row0 + {r}] = T(acc[{r}][{m}] * sc);"
-            for r in range(R)
-        )
+        + "\n".join("          " + put.format(m=m, r=r) for r in range(R))
         + " }"
         for m in range(c)
     )
@@ -267,11 +270,11 @@ def _score_source(LW):
 """
 
 
-def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW, LPR, G):
+def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW, LPR, G, atomic):
     NB = K // (LPR * _VPL)
     NRG = 32 // LPR  # row groups per simdgroup
     cases = "\n".join(
-        f"      case {c}: {{{_body(c, R, MC, LPR)}      break; }}" for c in range(1, M + 1)
+        f"      case {c}: {{{_body(c, R, MC, LPR, atomic)}      break; }}" for c in range(1, M + 1)
     )
     return f"""
     constexpr int M = {M}, N = {N}, K = {K}, R = {R}, NSG = {NSG}, VPL = {_VPL}, Mp = {Mp}, MC = {MC};
@@ -316,8 +319,10 @@ def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW, LPR, G):
 """
 
 
-def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
-    """y (P, N): every pair's expert matvec; the x rows are tokens (``tokens``) or pairs."""
+def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None, atomic=False):
+    """y (P, N): every pair's expert matvec; the x rows are tokens (``tokens``) or pairs.
+
+    With ``atomic`` the pairs of a token are summed into y (m, N) float32 instead."""
     x16, xsum, rscale = prepped
     w, scales, biases = proj.weight, proj.scales, proj.biases
     N, K = w.shape[1], w.shape[2] * 8
@@ -328,13 +333,13 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     Mp = xsum.shape[1]
     RDIV = S if tokens else 1
     LW = logits.shape[-1] if logits is not None else 0
-    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, LPR, G, _tag(scales.dtype))
+    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, LPR, G, atomic, _tag(scales.dtype))
     call = _calls.get(key)
     if call is None:
         kern = _kernel(
             "moe_small_gather",
             key[1:],
-            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, LPR, G),
+            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, LPR, G, atomic),
             [
                 "x16",
                 "xsum",
@@ -347,14 +352,17 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
                 "logits",
             ],
             ["y"],
+            atomic=atomic,
         )
         kwargs = dict(
             template=[("T", scales.dtype)],
             grid=(32 * NSG * m * S * (N // (R * (32 // LPR) * NSG)), 1, 1),
             threadgroup=(32 * NSG, 1, 1),
-            output_shapes=[(m * S, N)],
-            output_dtypes=[scales.dtype],
+            output_shapes=[(m, N) if atomic else (m * S, N)],
+            output_dtypes=[mx.float32 if atomic else scales.dtype],
         )
+        if atomic:
+            kwargs["init_value"] = 0
         call = _calls[key] = (kern, kwargs)
     kern, kwargs = call
     # An unused input (scores of 1) reuses an existing array so no op is added
@@ -365,10 +373,11 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     return y
 
 
-def experts(block, x, logits, inds, slots=False):
+def experts(block, x, logits, inds, slots=False, atomic=False):
     """The routed and the shared expert of x (.., K) -> (.., K); ``logits`` (.., E + 1).
 
-    With ``slots`` the top_k + 1 expert outputs of a token are returned unsummed (.., S, K).
+    With ``slots`` the top_k + 1 expert outputs of a token are returned unsummed (.., S, K);
+    with ``atomic`` they are summed inside the down gather and returned in float32.
     """
     *batch, K = x.shape
     m = math.prod(batch)
@@ -388,6 +397,9 @@ def experts(block, x, logits, inds, slots=False):
         top_k,
         False,
         logits.reshape(m, -1),
+        atomic=atomic and not slots,
     )
+    if atomic and not slots:
+        return y.reshape(*batch, K)
     y = y.reshape(*batch, top_k + 1, K)
     return y if slots else y.sum(axis=-2)

@@ -250,7 +250,12 @@ class SparseMoeBlock(nn.Module):
         inds = mx.argpartition(logits[..., :E], kth=-k, axis=-1)[..., -k:]
         if moe_small.routes(self, x):
             y = moe_small.experts(
-                self, x, logits, inds, slots and self.sharding_group is None
+                self,
+                x,
+                logits,
+                inds,
+                slots and self.sharding_group is None,
+                atomic=getattr(self, "atomic_sum", False),
             )
         else:
             if self.norm_topk_prob:

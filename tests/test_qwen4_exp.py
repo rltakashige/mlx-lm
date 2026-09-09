@@ -317,6 +317,13 @@ class TestHyperConnectionKernels(unittest.TestCase):
             # The kernels give the same rows at every M
             one = hc_small.mix(block, h[:, :1], None if pending is None else (pending[0][:, :1], pending[1][:, :1]))
             self.assertTrue(mx.array_equal(one[0], mixed[:, :1]))
+        if pending is not None:
+            # A float32 block output is rounded to the stream type before the combine
+            xf = pending[0].astype(mx.float32) + 1e-3
+            mf, inject_f, comb_f = hc_small.mix(block, h, (xf, pending[1]))
+            ref_f = block.combine(h, xf, pending[1])
+            self.assertTrue(mx.array_equal(comb_f, ref_f))
+            self.assertTrue(mx.array_equal(mf, hc_small.mix(block, h, (xf.astype(mx.bfloat16), pending[1]))[0]))
 
     def test_sites_match_the_compiled_ops(self):
         for group_size in (32, 64):
@@ -368,6 +375,10 @@ class TestFlashNextKernels(unittest.TestCase):
                     expected = block(xx).astype(mx.float32)
                 tol = 0.03 * mx.abs(expected).max().item()
                 self.assertLess(mx.abs(y - expected).max().item(), tol, (hidden, group, mm))
+                # The token sums inside the down gather (float32 atomics) equal the summed slot rows
+                ya = moe_small.experts(block, xx, lg, inds, atomic=True)
+                self.assertEqual(ya.dtype, mx.float32)
+                self.assertLess(mx.abs(ya - y).max().item(), 2.5e-2 * mx.abs(y).max().item() + 1e-3, (hidden, group, mm))
 
     def test_sigmoid_gated_norm_matches_ops(self):
         from mlx_lm.models import fused_ops
