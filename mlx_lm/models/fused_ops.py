@@ -240,7 +240,13 @@ def gdn_in(net, proj, conv_state, chain=None):
     )
 
 
-def _gated_norm_source(D, GS, GO, eps):
+def _gated_norm_source(D, GS, GO, eps, act):
+    # silu: the compiled precise swiglu in float; sigmoid: the eager op in T, then a T multiply
+    gate = (
+        "const float s = gf * Sigmoid{}(gf);\n      o[i] = static_cast<T>(s * static_cast<float>(n));"
+        if act == "silu"
+        else "o[i] = static_cast<T>(static_cast<float>(n) * static_cast<float>(SigmoidLib{}(zr[i])));"
+    )
     return f"""
     constexpr int D = {D}, GS = {GS}, GO = {GO};
     constexpr float EPS = {eps!r}f;
@@ -261,17 +267,18 @@ def _gated_norm_source(D, GS, GO, eps):
     const device T* zr = gate + (size_t)(row / HEADS) * GS + GO + (size_t)(row % HEADS) * D + c0;
     device T* o = out + (size_t)row * D + c0;
     for (int i = 0; i < 4; i++) {{
-      // mx.fast.rms_norm with weight, then silu(gate) * x in float (_precise_swiglu)
+      // mx.fast.rms_norm with weight, then the gate
       const T n = weight[c0 + i] * static_cast<T>(xv[i] * inv);
       const float gf = static_cast<float>(zr[i]);
-      const float s = gf * Sigmoid{{}}(gf);
-      o[i] = static_cast<T>(s * static_cast<float>(n));
+      (void)gf;
+      {gate}
     }}
 """
 
 
 def gated_norm(norm, x, gate, gate_offset=0):
-    """``norm(x, z)`` (per-head RMSNorm times silu(z)) as one kernel; z is read in place.
+    """``norm(x, z)`` (per-head RMSNorm times silu(z), or sigmoid(z) when
+    ``norm.activation`` says so) as one kernel; z is read in place.
 
     ``x`` is (.., heads, D); ``gate`` (rows, GS) holds z of row r at column ``gate_offset``.
     """
@@ -279,10 +286,11 @@ def gated_norm(norm, x, gate, gate_offset=0):
     rows = x.size // D
     TG = -(-D // 128) * 32
     GS = gate.shape[-1]
+    act = getattr(norm, "activation", "silu")
     kern = _kernel(
         "gated_norm",
-        (D, GS, gate_offset, norm.eps, heads, str(x.dtype)),
-        lambda: _gated_norm_source(D, GS, gate_offset, norm.eps),
+        (D, GS, gate_offset, norm.eps, heads, act, str(x.dtype)),
+        lambda: _gated_norm_source(D, GS, gate_offset, norm.eps, act),
         ["x", "gate", "weight"],
         ["out"],
         _HEADER,

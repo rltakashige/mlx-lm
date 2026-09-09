@@ -791,11 +791,13 @@ class GatedDeltaNet(Qwen3_5GatedDeltaNet):
         proj = qlinear(self.in_proj, inputs)
         if not self.training and fused_ops.gdn_in_ok(self, proj, mask, cache):
             out, _, z_off = self._mixer_fused(proj, cache, chain)
-            z = proj[..., z_off : z_off + self.value_dim]
+            # One kernel: the per-head norm times sigmoid(z), z read in place
+            normed = fused_ops.gated_norm(self.norm, out, proj, z_off)
         else:
             out, z = self._mixer(proj, mask, cache, chain)
-        z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
-        return self.out_proj(self.norm(out, z).reshape(B, S, -1))
+            z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
+            normed = self.norm(out, z).reshape(B, S, -1)
+        return qlinear(self.out_proj, normed)
 
 
 # ------------------------------------------------------------- decoder

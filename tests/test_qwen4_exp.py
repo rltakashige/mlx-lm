@@ -369,3 +369,17 @@ class TestFlashNextKernels(unittest.TestCase):
                 tol = 0.03 * mx.abs(expected).max().item()
                 self.assertLess(mx.abs(y - expected).max().item(), tol, (hidden, group, mm))
 
+    def test_sigmoid_gated_norm_matches_ops(self):
+        from mlx_lm.models import fused_ops
+
+        heads, D, GS, GO = 6, 128, 2000, 800
+        norm = qwen4_exp.RMSNormGated(D, eps=1e-6, activation="sigmoid")
+        norm.weight = (mx.random.normal((D,)) * 0.2 + 1).astype(mx.bfloat16)
+        for rows in (1, 4):
+            x = (mx.random.normal((1, rows, heads, D)) * 2).astype(mx.bfloat16)
+            wide = (mx.random.normal((rows, GS)) * 2).astype(mx.bfloat16)
+            z = wide[:, GO : GO + heads * D].reshape(1, rows, heads, D)
+            got = fused_ops.gated_norm(norm, x, wide, GO)
+            want = norm(x, z).reshape(1, rows, heads * D)
+            self.assertTrue(mx.array_equal(got, want).item(), rows)
+
