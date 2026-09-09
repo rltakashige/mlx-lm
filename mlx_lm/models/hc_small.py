@@ -8,15 +8,19 @@ mean of the gated streams; its last ``hc`` down rows are the injection gates of
 the block output. Two kernels replace the ~9 ops of a site:
 
 ``down``: the pending combine of the previous block (streams + x * inject), the
-norm statistics, the down matvec and its activations. Every threadgroup owns R
-down rows; simdgroup s reads stream s, so the norm of a stream stays inside one
-simdgroup and the K split needs no second pass.
-``up``: the up matvec with the down output in threadgroup memory, the sigmoid
-gate and the mean over the streams; a threadgroup owns 32 dims of every stream.
+norm statistics, the down matvec and its activations. A threadgroup owns R down
+rows and hc * KS simdgroups: simdgroup (stream, part) reads that stream's chunks
+part, part + KS, .. so the streams are read once per R rows and the weight loads
+of the whole projection are in flight at once.
+``up``: the up matvec with the down output in threadgroup memory (LPR lanes per
+row), the sigmoid gate and the mean over the streams; a threadgroup owns 32 / LPR
+dims of every stream.
 
-The weights are 4-bit affine (group size 32 or 64). Rounding follows the ops
-(bf16 at the op boundaries); the float accumulation order differs from
-``mx.quantized_matmul``, so the results agree to bf16 rounding, not bitwise.
+The weights are 4-bit affine (group size 32 or 64). The block output ``x`` may
+be the float32 sum of the MoE gather; it is rounded to the stream type as the
+ops' sum was. Rounding follows the ops (bf16 at the op boundaries); the float
+accumulation order differs from ``mx.quantized_matmul``, so the results agree to
+bf16 rounding, not bitwise. Rows past ``_MAX_M`` take the ops path.
 """
 
 import mlx.core as mx
@@ -24,7 +28,7 @@ import mlx.nn as nn
 
 from .qmv_small import _HEADER, _UNROLL, _kernel, _tag
 
-_MAX_M = 4
+_MAX_M = 4  # above 4 rows the ops path is faster (the streams are re-read per row)
 # Down projection: 8 rows per threadgroup and 4 simdgroups per stream (16 simdgroups), so the
 # streams are read once per 8 rows and 41 threadgroups keep ~1.7 MB of weight loads in flight.
 _R = 8

@@ -8,7 +8,10 @@ kernel of x also builds a plan: for each distinct expert its id, its row count a
 M pair indices. The gather kernel runs one threadgroup per (plan slot, N tile), so the
 rows that share an expert read and dequantize its weights once. The down projection
 scales each row by its routing score in the epilogue (softmax over the token's top-k
-logits, sigmoid of the shared gate logit) and the block output is the sum over the slots.
+logits, sigmoid of the shared gate logit) and the block output is the sum over the slots,
+taken by the consumer or, with ``atomic``, inside the down gather (float32 atomics).
+The weights are 4-bit affine, group size 64 or 32; K multiples of 512 use 32-lane rows and
+other multiples of 128 use 8-lane row groups.
 """
 
 import math
