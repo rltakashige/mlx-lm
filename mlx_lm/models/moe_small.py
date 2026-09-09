@@ -155,14 +155,8 @@ def _prep(x, kind, inds=None, m=0, top_k=0, eshared=0):
     return kern(inputs=[x] + ([inds] if plan else []), **kwargs)
 
 
-def _body(c, R, MC, NB=0, full=False):
-    """The main loop over K for ``c`` gathered rows (the ``qmv_small`` loop with per-row x).
-
-    With ``full`` every weight, scale, bias and x load of the tile's ``NB`` steps is issued
-    before the math; the math and its order are unchanged, so the outputs are the same bits.
-    """
-    if full:
-        return _body_full(c, R, NB)
+def _body(c, R, MC):
+    """The main loop over K for ``c`` gathered rows (the ``qmv_small`` loop with per-row x)."""
     wload = "\n".join(
         f"        {{dst}}[{r}] = *(const device uint2*)(wp + {r} * KW);"
         for r in range(R)
@@ -240,89 +234,6 @@ def _body(c, R, MC, NB=0, full=False):
 """
 
 
-def _body_full(c, R, NB):
-    """``_body`` with all loads of the tile hoisted above the math (``c`` <= 2 rows)."""
-    nl = "\n"
-    wl = nl.join(
-        f"        wa[{b}][{r}] = *(const device uint2*)(wp + {b} * (32 * VPL / 8) + {r} * KW);"
-        for b in range(NB)
-        for r in range(R)
-    )
-    sl = nl.join(
-        f"        sa[{b}][{r}] = float(sp[{b} * (32 * VPL / 64) + {r} * KG]); ba[{b}][{r}] = float(bp[{b} * (32 * VPL / 64) + {r} * KG]);"
-        for b in range(NB)
-        for r in range(R)
-    )
-    xl = nl.join(
-        f"        xa[{b}][{m}][{cc}] = *(const device uint4*)(xp + {b} * 32 * VPL + xo[{m}] + {cc} * 8);"
-        for b in range(NB)
-        for m in range(c)
-        for cc in range(2)
-    )
-    xsl = nl.join(
-        f"        xsa[{b}][{m}] = xsp[{b} * 32 * Mp + xrow[{m}]];" for b in range(NB) for m in range(c)
-    )
-    steps = []
-    for b in range(NB):
-        deq = []
-        for r in range(R):
-            for wi in range(2):
-                wd = f"wa[{b}][{r}][{wi}]"
-                deq.append(f"        {{ const uint lo = {wd}, hi = {wd} >> 8;")
-                for j, (src, mask) in enumerate(
-                    (
-                        ("lo", "0x000F000Fu"),
-                        ("lo", "0x00F000F0u"),
-                        ("hi", "0x000F000Fu"),
-                        ("hi", "0x00F000F0u"),
-                    )
-                ):
-                    deq.append(
-                        f"          q2[{r}][{wi * 4 + j}] = as_type<half2>(({src} & {mask}) | 0x64006400u) - half2(1024.0h);"
-                    )
-                deq[-1] += " }"
-        fm = []
-        for r in range(R):
-            for m in range(c):
-                fm.append(
-                    f"        {{ half2 p = q2[{r}][0] * x2b({b}, {m}, 0);\n"
-                    + nl.join(
-                        f"          p = fma(q2[{r}][{j}], x2b({b}, {m}, {j}), p);"
-                        for j in range(1, 8)
-                    )
-                    + f"\n          acc[{r}][{m}] = fma(sa[{b}][{r}], float(p.x + p.y), fma(ba[{b}][{r}], xsa[{b}][{m}], acc[{r}][{m}])); }}"
-                )
-        steps.append(nl.join(deq) + nl + nl.join(fm))
-    store = nl.join(
-        f"        {{ const float sc = rscale[xrow[{m}]] * score(prow[{m}]);\n"
-        + nl.join(
-            f"          y[(size_t)prow[{m}] * N + row0 + {r}] = T(acc[{r}][{m}] * sc);"
-            for r in range(R)
-        )
-        + " }"
-        for m in range(c)
-    )
-    return f"""
-      {{
-        uint2 wa[{NB}][R];
-        float sa[{NB}][R], ba[{NB}][R];
-        uint4 xa[{NB}][{c}][2];
-        float xsa[{NB}][{c}];
-        #define x2b(b, m, j) as_type<half2>(xa[b][m][(j) / 4][(j) % 4])
-{wl}
-{sl}
-{xl}
-{xsl}
-{nl.join(steps)}
-        #undef x2b
-      }}
-{nl.join(f"      acc[{r}][{m}] = simd_sum(acc[{r}][{m}]);" for r in range(R) for m in range(c))}
-      if (lane == 0) {{
-{store}
-      }}
-"""
-
-
 def _score_source(LW):
     """Routing score of pair q from the logits (width LW, the shared gate last), or 1."""
     if not LW:
@@ -341,17 +252,10 @@ def _score_source(LW):
 """
 
 
-# Hoist all loads of a tile above the math for tiles of up to this many rows.
-_FULL_ROWS = 0
-
-
-def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW, full_rows=None):
+def _gather_source(M, N, K, R, NSG, MC, Mp, S, TOPK, RDIV, LW):
     NB = K // _KSTEP
-    if full_rows is None:
-        full_rows = _FULL_ROWS
     cases = "\n".join(
-        f"      case {c}: {{{_body(c, R, MC, NB, c <= full_rows)}      break; }}"
-        for c in range(1, M + 1)
+        f"      case {c}: {{{_body(c, R, MC)}      break; }}" for c in range(1, M + 1)
     )
     return f"""
     constexpr int M = {M}, N = {N}, K = {K}, R = {R}, NSG = {NSG}, VPL = {_VPL}, Mp = {Mp}, MC = {MC};
@@ -405,13 +309,13 @@ def _gather(prepped, plan, proj, inds, m, top_k, tokens, logits=None):
     Mp = xsum.shape[1]
     RDIV = S if tokens else 1
     LW = logits.shape[-1] if logits is not None else 0
-    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype), _FULL_ROWS)
+    key = ("gather", m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _tag(scales.dtype))
     call = _calls.get(key)
     if call is None:
         kern = _kernel(
             "moe_small_gather",
             key[1:],
-            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW, _FULL_ROWS),
+            lambda: _gather_source(m, N, K, R, NSG, MC, Mp, S, top_k, RDIV, LW),
             [
                 "x16",
                 "xsum",
@@ -484,44 +388,53 @@ inline float qdot8(uint w, const thread float* x_thread, float scale, float bias
 
 
 def _router_source(K, N, NSG):
-    """One simdgroup per row with every load of the row issued before the math.
-
-    The arithmetic is MLX's ``qmv`` kernel for 8-bit weights step by step (lane l takes
-    values 128 t + 4 l .. + 3 of step t, sums in that order, ``simd_sum`` at the end), so
-    the logits are bitwise the ones of ``mx.quantized_matmul``. That kernel walks the row
-    in 16 dependent steps; this one has one memory latency per row.
+    """One simdgroup per row; the row's weights, the scales/biases and x are staged in threadgroup
+    memory with 16-byte loads (7 device loads per lane), then the math is MLX's ``qmv`` kernel for
+    8-bit weights step by step (lane l takes values 128 t + 4 l .. + 3 of step t, sums in that
+    order, ``simd_sum`` at the end), so the logits are bitwise ``mx.quantized_matmul``'s. MLX's
+    kernel walks the row in 16 dependent steps of scalar loads; this one issues a few wide loads.
     """
     NB = K // 128
+    KW4 = K // 16  # uint4 words per weight row
+    XW4 = K // 8  # uint4 words of x (T = 2 bytes)
     return f"""
-    constexpr int K = {K}, N = {N}, NSG = {NSG}, NB = {NB}, KW = K / 4, KG = K / 64;
+    constexpr int K = {K}, N = {N}, NSG = {NSG}, NB = {NB}, KW = K / 4, KG = K / 64, KW4 = {KW4}, XW4 = {XW4};
     const int lane = thread_index_in_simdgroup;
-    const int row = threadgroup_position_in_grid.x * NSG + simdgroup_index_in_threadgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int tid = thread_position_in_threadgroup.x;
+    const int row = threadgroup_position_in_grid.x * NSG + sg;
+    threadgroup uint4 wbuf[NSG][KW4];
+    threadgroup uint4 xbuf[XW4];
+    threadgroup uint4 sbuf[NSG][KG / 8];
+    threadgroup uint4 bbuf[NSG][KG / 8];
+    if (row < N) {{
+      const device uint4* wr = (const device uint4*)(w + (size_t)row * KW);
+      {_UNROLL}
+      for (int j = 0; j < KW4 / 32; j++) wbuf[sg][lane + 32 * j] = wr[lane + 32 * j];
+      if (lane < KG / 8) {{
+        sbuf[sg][lane] = ((const device uint4*)(scales + (size_t)row * KG))[lane];
+        bbuf[sg][lane] = ((const device uint4*)(biases + (size_t)row * KG))[lane];
+      }}
+    }}
+    for (int j = tid; j < XW4; j += 32 * NSG) xbuf[j] = ((const device uint4*)x)[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (row >= N) return;
     const int hi = lane / 16;
-    const device uint32_t* wr = w + (size_t)row * KW + lane;
-    const device T* sr = scales + (size_t)row * KG + hi;
-    const device T* br = biases + (size_t)row * KG + hi;
-    const device T* xr = x + lane * 4;
-    uint wv[NB];
-    vec<T, 4> xv[NB];
-    T sv[NB], bv[NB];
-    {_UNROLL}
-    for (int t = 0; t < NB; t++) {{
-      wv[t] = wr[t * 32];
-      xv[t] = *(const device vec<T, 4>*)(xr + t * 128);
-      sv[t] = sr[2 * t];
-      bv[t] = br[2 * t];
-    }}
+    const threadgroup uint* wt = (const threadgroup uint*)wbuf[sg];
+    const threadgroup vec<T, 4>* xt = (const threadgroup vec<T, 4>*)xbuf;
+    const threadgroup T* st = (const threadgroup T*)sbuf[sg];
+    const threadgroup T* bt = (const threadgroup T*)bbuf[sg];
     float result = 0.0f;
     {_UNROLL}
     for (int t = 0; t < NB; t++) {{
+      const vec<T, 4> xv = xt[32 * t + lane];
       float sum = 0.0f;
-      float xt[4];
+      float xt4[4];
       {_UNROLL}
-      for (int i = 0; i < 4; i++) {{ sum += xv[t][i]; xt[i] = xv[t][i]; }}
-      const float s = sv[t];
-      const float b = bv[t];
-      result += qdot8(wv[t], xt, s, b, sum);
+      for (int i = 0; i < 4; i++) {{ sum += xv[i]; xt4[i] = xv[i]; }}
+      const float s = st[2 * t + hi];
+      const float b = bt[2 * t + hi];
+      result += qdot8(wt[32 * t + lane], xt4, s, b, sum);
     }}
     result = simd_sum(result);
     if (lane == 0) y[row] = static_cast<T>(result);
@@ -541,7 +454,7 @@ def router_ok(gate, x):
         and "bias" not in gate
         and x.dtype in (mx.bfloat16, mx.float16)
         and gate.scales.dtype == x.dtype
-        and k % 128 == 0
+        and k % 512 == 0
         and gate.weight.shape[1] * 4 == k
     )
 

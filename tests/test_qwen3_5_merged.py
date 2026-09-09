@@ -319,7 +319,7 @@ class TestLatencyKernels(unittest.TestCase):
     def test_router_matches_quantized_matmul(self):
         from mlx_lm.models import moe_small
 
-        for N, K in ((257, 2048), (513, 2560), (129, 1024), (8, 128)):
+        for N, K in ((257, 2048), (513, 2560), (129, 1024), (8, 512)):
             gate = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=8)
             for seed in range(20):
                 mx.random.seed(seed)

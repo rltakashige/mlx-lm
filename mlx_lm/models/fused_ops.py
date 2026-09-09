@@ -508,50 +508,60 @@ _SDPA_MAX_KEYS = 1024
 
 
 def _sdpa_pass1_source(D, V, GQA):
+    """The block's keys and values are staged in threadgroup memory in chunks of CH (16-byte loads
+    shared by the GQA query heads of the group); each simdgroup then runs the one-pass kernel's
+    loop over them in order, so the partials are the one-pass kernel's."""
+    CH = 16
     return f"""
-    constexpr int D = {D}, V = {V}, GQA = {GQA}, NBLK = {_SDPA_BLOCKS}, BD = 32;
+    constexpr int D = {D}, V = {V}, GQA = {GQA}, NBLK = {_SDPA_BLOCKS}, BD = 32, CH = {CH};
     constexpr int qk_per_thread = D / BD, v_per_thread = V / BD;
+    constexpr int KW4 = D / 8, VW4 = V / 8;  // uint4 words per key / value row (T = 2 bytes)
+    constexpr int NT = 32 * GQA;
     const int lane = thread_index_in_simdgroup;
+    const int tid = thread_position_in_threadgroup.x;
     const int blk = threadgroup_position_in_grid.x;
     const int kvh = threadgroup_position_in_grid.y;
     const int h = kvh * GQA + int(simdgroup_index_in_threadgroup);
     const int N = keys_shape[2];
     const size_t k_head_stride = keys_strides[1], k_seq_stride = keys_strides[2];
     const size_t v_head_stride = values_strides[1], v_seq_stride = values_strides[2];
+    threadgroup uint4 kbuf[CH][KW4];
+    threadgroup uint4 vbuf[CH][VW4];
     const device T* qp = queries + (size_t)h * D + lane * qk_per_thread;
-    const device T* kp = keys + (size_t)kvh * k_head_stride + (size_t)blk * k_seq_stride + lane * qk_per_thread;
-    const device T* vp = values + (size_t)kvh * v_head_stride + (size_t)blk * v_seq_stride + lane * v_per_thread;
+    const device T* kbase = keys + (size_t)kvh * k_head_stride;
+    const device T* vbase = values + (size_t)kvh * v_head_stride;
     float q[qk_per_thread], k[qk_per_thread], o[v_per_thread];
     for (int i = 0; i < qk_per_thread; i++) q[i] = static_cast<float>(scale) * qp[i];
     for (int i = 0; i < v_per_thread; i++) o[i] = 0;
     float max_score = -metal::numeric_limits<float>::max();
     float sum_exp_score = 0;
-    for (int i = blk; i < N; i += NBLK) {{
-      // 16-byte loads of the key and value slices (the values are the same as element loads)
-      T v[v_per_thread];
-      #pragma clang loop unroll(full)
-      for (int j = 0; j < qk_per_thread; j += 4) {{
-        const vec<T, 4> kk = *(const device vec<T, 4>*)(kp + j);
-        k[j] = kk.x; k[j + 1] = kk.y; k[j + 2] = kk.z; k[j + 3] = kk.w;
+    const int nk = blk < N ? (N - blk + NBLK - 1) / NBLK : 0;
+    for (int c0 = 0; c0 < nk; c0 += CH) {{
+      const int nc = min(CH, nk - c0);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int j = tid; j < nc * KW4; j += NT) {{
+        const int kk = j / KW4, wd = j % KW4;
+        kbuf[kk][wd] = ((const device uint4*)(kbase + (size_t)(blk + (c0 + kk) * NBLK) * k_seq_stride))[wd];
       }}
-      #pragma clang loop unroll(full)
-      for (int j = 0; j < v_per_thread; j += 4) {{
-        const vec<T, 4> vv = *(const device vec<T, 4>*)(vp + j);
-        v[j] = vv.x; v[j + 1] = vv.y; v[j + 2] = vv.z; v[j + 3] = vv.w;
+      for (int j = tid; j < nc * VW4; j += NT) {{
+        const int kk = j / VW4, wd = j % VW4;
+        vbuf[kk][wd] = ((const device uint4*)(vbase + (size_t)(blk + (c0 + kk) * NBLK) * v_seq_stride))[wd];
       }}
-      float score = 0;
-      #pragma clang loop unroll(full)
-      for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
-      score = simd_sum(score);
-      float new_max = max(max_score, score);
-      float factor = metal::fast::exp(max_score - new_max);
-      float exp_score = metal::fast::exp(score - new_max);
-      max_score = new_max;
-      sum_exp_score = sum_exp_score * factor + exp_score;
-      #pragma clang loop unroll(full)
-      for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * v[j];
-      kp += NBLK * k_seq_stride;
-      vp += NBLK * v_seq_stride;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int kk = 0; kk < nc; kk++) {{
+        const threadgroup T* kp = (const threadgroup T*)kbuf[kk] + lane * qk_per_thread;
+        const threadgroup T* vp = (const threadgroup T*)vbuf[kk] + lane * v_per_thread;
+        for (int j = 0; j < qk_per_thread; j++) k[j] = kp[j];
+        float score = 0;
+        for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
+        score = simd_sum(score);
+        float new_max = max(max_score, score);
+        float factor = metal::fast::exp(max_score - new_max);
+        float exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * vp[j];
+      }}
     }}
     device float4* po = (device float4*)(part + ((size_t)h * NBLK + blk) * V + lane * v_per_thread);
     #pragma clang loop unroll(full)
@@ -564,40 +574,47 @@ def _sdpa_pass1_source(D, V, GQA):
 
 
 def _sdpa_pass2_source(V):
+    """The one-pass kernel's combine over the 32 blocks on NSG simdgroups: the head's partials are
+    staged in threadgroup memory in slices (16-byte loads), lane b of a simdgroup holds block b
+    and the ``simd_max`` / ``simd_sum`` trees are the ones of the one-pass kernel."""
+    NSG = 8
     return f"""
-    constexpr int V = {V}, BN = {_SDPA_BLOCKS}, BD = 32, v_per_thread = V / BD;
+    constexpr int V = {V}, BN = {_SDPA_BLOCKS}, BD = 32, v_per_thread = V / BD, NSG = {NSG}, NT = 32 * NSG;
+    constexpr int SW = NSG * v_per_thread;  // floats of a block per round (NSG slices)
+    constexpr int SW4 = SW / 4;
     const int h = threadgroup_position_in_grid.x;
     const int lane = thread_index_in_simdgroup;
     const int sg = simdgroup_index_in_threadgroup;
-    threadgroup float outputs[BN * BD];
+    const int tid = thread_position_in_threadgroup.x;
+    threadgroup float4 pbuf[BN][SW4];
     threadgroup float max_scores[BN];
     threadgroup float sum_exp_scores[BN];
-    const device float4* po = (const device float4*)(part + ((size_t)h * BN + sg) * V + lane * v_per_thread);
-    float o[v_per_thread];
-    #pragma clang loop unroll(full)
-    for (int i = 0; i < v_per_thread; i += 4) {{
-      const float4 f = po[i / 4];
-      o[i] = f.x; o[i + 1] = f.y; o[i + 2] = f.z; o[i + 3] = f.w;
-    }}
-    if (lane == 0) {{
-      max_scores[sg] = pmax[h * BN + sg];
-      sum_exp_scores[sg] = psum[h * BN + sg];
+    const device float4* src = (const device float4*)(part + (size_t)h * BN * V);
+    if (tid < BN) {{
+      max_scores[tid] = pmax[h * BN + tid];
+      sum_exp_scores[tid] = psum[h * BN + tid];
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float max_score = max_scores[lane];
-    float new_max = simd_max(max_score);
-    float factor = metal::fast::exp(max_score - new_max);
-    float sum_exp_score = simd_sum(sum_exp_scores[lane] * factor);
-    for (int i = 0; i < v_per_thread; i++) {{
-      outputs[lane * BD + sg] = o[i];
+    const float max_score = max_scores[lane];
+    const float new_max = simd_max(max_score);
+    const float factor = metal::fast::exp(max_score - new_max);
+    const float sum_exp_score = simd_sum(sum_exp_scores[lane] * factor);
+    const threadgroup float* pb = (const threadgroup float*)pbuf[lane];
+    for (int r = 0; r < BD / NSG; r++) {{
+      // slices r * NSG .. + NSG of every block: block b's floats [r * SW, (r + 1) * SW)
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      o[i] = simd_sum(outputs[sg * BD + lane] * factor);
-      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      for (int j = tid; j < BN * SW4; j += NT) pbuf[j / SW4][j % SW4] = src[(j / SW4) * (V / 4) + r * SW4 + j % SW4];
       threadgroup_barrier(mem_flags::mem_threadgroup);
-    }}
-    if (lane == 0) {{
-      device T* op = out + (size_t)h * V + sg * v_per_thread;
-      for (int i = 0; i < v_per_thread; i++) op[i] = static_cast<T>(o[i]);
+      const int g = r * NSG + sg;
+      float o[v_per_thread];
+      for (int i = 0; i < v_per_thread; i++) {{
+        o[i] = simd_sum(pb[sg * v_per_thread + i] * factor);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      }}
+      if (lane == 0) {{
+        device T* op = out + (size_t)h * V + g * v_per_thread;
+        for (int i = 0; i < v_per_thread; i++) op[i] = static_cast<T>(o[i]);
+      }}
     }}
 """
 
@@ -658,8 +675,8 @@ def sdpa_two_pass(queries, keys, values, scale):
     (out,) = kern2(
         inputs=[part, pmax, psum],
         template=[("T", queries.dtype)],
-        grid=(32 * NBLK * H, 1, 1),
-        threadgroup=(32 * NBLK, 1, 1),
+        grid=(256 * H, 1, 1),
+        threadgroup=(256, 1, 1),
         output_shapes=[(B, H, L, V)],
         output_dtypes=[queries.dtype],
     )
