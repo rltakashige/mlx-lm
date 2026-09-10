@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import math
 import sys
 import time
 from collections import deque
@@ -17,6 +18,7 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .models.cache import (
+    ArraysCache,
     QuantizedKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
@@ -38,6 +40,7 @@ DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.1
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
+DEFAULT_DRAFT_CANDIDATES = 16384
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
@@ -213,11 +216,65 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--draft-stop-prob",
+        type=float,
+        help="Stop drafting once the product of the draft top-1 probabilities "
+        "is below this value (0 disables).",
+        default=0.5,
+    )
+    parser.add_argument(
+        "--accept-ratio",
+        type=float,
+        default=0.0,
+        help="Keep a draft token when the target gives it at least this fraction of its top probability (0 = exact greedy)",
+    )
+    parser.add_argument(
+        "--accept-entropy",
+        type=float,
+        default=0.0,
+        help="Typical acceptance: keep a draft token when the target gives it probability "
+        "at least min(e^2, e * exp(-entropy)) (0 = off; composes with --accept-ratio)",
+    )
+    parser.add_argument(
+        "--accept-floor",
+        type=float,
+        default=0.0,
+        help="Never keep a draft token whose target probability is below this (0 = off)",
+    )
+    parser.add_argument(
+        "--draft-candidates",
+        type=int,
+        help="Draft with a candidate set of the output head: the first N rows of "
+        "the vocabulary plus a running top set (0 uses the full head).",
+        default=DEFAULT_DRAFT_CANDIDATES,
+    )
+    parser.add_argument(
+        "--draft-siblings",
+        action="store_true",
+        help="Verify the drafter's second choice at every position as a sibling row.",
+    )
+    parser.add_argument(
+        "--draft-fallback-margin",
+        type=float,
+        help="Rescore a draft with the full head when its two best candidates "
+        "are closer than this logit margin (0 disables).",
+        default=0.0,
+    )
     return parser
 
 
 # A stream on the default device just for generation
 generation_stream = mx.new_thread_local_stream(mx.default_device())
+
+
+def sibling_rows(num_draft: int) -> int:
+    """Sibling rows to verify with ``num_draft`` drafts: the verify costs the same
+    up to 4 rows and from 8 rows on (the accelerator kernels), more in between."""
+    rows = num_draft + 1
+    if rows + num_draft >= 8:
+        return num_draft
+    return max(0, min(num_draft, 4 - rows))
 
 
 @contextlib.contextmanager
@@ -411,6 +468,8 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
+            # bfloat16 log-probs step by 0.125 for logits in [16, 32)
+            logits = logits.astype(mx.float32)
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
@@ -476,6 +535,13 @@ def speculative_generate_step(
     draft_model: nn.Module,
     *,
     num_draft_tokens: int = 2,
+    draft_stop_prob: float = 0.5,
+    accept_ratio: float = 0.0,
+    accept_entropy: float = 0.0,
+    accept_floor: float = 0.0,
+    draft_candidates: int = 16384,
+    draft_fallback_margin: float = 0.0,
+    draft_siblings: bool = False,
     max_tokens: int = 256,
     sampler: Optional[Sampler] = None,
     logits_processors: Optional[List[LogitsProcessor]] = None,
@@ -491,9 +557,36 @@ def speculative_generate_step(
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        draft_model (nn.Module): The draft model for speculative decoding.
+        draft_model (nn.Module): The draft model for speculative decoding. A
+          multi-token prediction head (``needs_hidden``) is bound to the model
+          and fed its hidden states.
         num_draft_tokens (int, optional): The number of draft tokens for
           speculative decoding. Default: ``2``.
+        accept_ratio (float, optional): Keep a draft token when the target gives it
+          at least this fraction of its top probability (0 = exact greedy).
+        accept_entropy (float, optional): Typical acceptance with the single knob
+          ``e``: keep a draft token when the target gives it probability at least
+          ``min(e^2, e * exp(-H))``, ``H`` the entropy of the target's distribution
+          at that position (Medusa's ``eps`` and ``delta`` at ``e = 0.3``). ``0``
+          turns it off. With ``accept_ratio`` a draft must pass both bounds.
+        accept_floor (float, optional): Never keep a draft token whose target
+          probability is below this (0 = off).
+        draft_stop_prob (float, optional): Stop drafting once the product of
+          the drafts' top-1 probabilities is below this value. The probabilities
+          are read one draft late, so the draft computed past the stop is
+          dropped. ``0`` disables the stop. Default: ``0.5``.
+        draft_candidates (int, optional): An MTP head scores only a candidate
+          set of the vocabulary per draft: its first ``draft_candidates`` rows,
+          the 8192 rows with the largest running softmax mass in the target's
+          outputs, the recent tokens and the last drafts. ``0`` uses the full
+          head. Default: ``16384``.
+        draft_fallback_margin (float, optional): Rescore a candidate draft with
+          the full head when its two best candidates are closer than this logit
+          margin. ``0`` disables the fallback. Default: ``0``.
+        draft_siblings (bool, optional): Verify the drafter's second choice at
+          every draft position as a sibling row of the same forward. When the
+          target rejects a draft for its sibling, the sibling and the target's
+          token after it are both accepted. Default: ``False``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
         sampler (Sampler, optional): A sampler for sampling a
@@ -517,6 +610,20 @@ def speculative_generate_step(
 
     y = prompt.astype(mx.uint32)
     prev_tokens = None
+    mtp = getattr(draft_model, "needs_hidden", False)
+    hidden = None
+    candidates = None
+    # Logits processors need the full vocabulary and the chain order
+    siblings = mtp and draft_siblings and not logits_processors
+    if mtp:
+        draft_model.bind(model)
+        if (
+            draft_candidates
+            and not logits_processors
+            and hasattr(draft_model, "candidates")
+        ):
+            candidates = draft_model.candidates(draft_candidates)
+            candidates.extend(y)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -526,13 +633,14 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
-        raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
-        )
-
     sampler = sampler or greedy_sampler
+    # Greedy MTP drafts: one kernel samples the draft after the head
+    fused_draft = (
+        mtp
+        and not logits_processors
+        and sampler is greedy_sampler
+        and hasattr(draft_model, "sample")
+    )
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -546,13 +654,33 @@ def speculative_generate_step(
             for processor in logits_processors:
                 logits = processor(tokens, logits)
 
+        logits = logits.astype(mx.float32)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1):
+    def _step(model, cache, y, n_predict=1, hidden=None, head=None, chain=None):
+        """``chain`` verifies sibling rows (see ``draft_siblings``). A draft step
+        also returns the second choice when siblings are on."""
+        second, drafting = None, hidden is not None
         with mx.stream(generation_stream):
-            logits = model(y[None], cache=cache)
+            if drafting and fused_draft:
+                # The two best tokens, the top probability and the margin from one kernel
+                tokens, stats, hidden = model.sample(y[None], hidden, cache=cache, head=head)
+                quantize_cache_fn(cache)
+                return tokens[:1], stats, hidden[:, -1:], tokens[1:]
+            # The MTP drafter is given the hidden states of the tokens
+            if hidden is not None:
+                logits, hidden = model(y[None], hidden, cache=cache, head=head)
+                hidden = hidden[:, -1:]
+            elif chain is not None:
+                logits, hidden = model(
+                    y[None], cache=cache, return_hidden=True, chain=chain
+                )
+            elif mtp:
+                logits, hidden = model(y[None], cache=cache, return_hidden=True)
+            else:
+                logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
             quantize_cache_fn(cache)
@@ -570,11 +698,20 @@ def speculative_generate_step(
                     y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
                     out_y.append(y)
                     out_logprobs.append(logprobs)
-                return mx.concatenate(out_y, axis=0), mx.concatenate(
-                    out_logprobs, axis=0
-                )
+                y = mx.concatenate(out_y, axis=0)
+                logprobs = mx.concatenate(out_logprobs, axis=0)
             else:
-                return _process_and_sample(None, logits.squeeze(0))
+                y, logprobs = _process_and_sample(None, logits.squeeze(0))
+                if siblings and drafting:
+                    masked = mx.put_along_axis(
+                        logprobs, y[:, None], mx.array(-mx.inf), -1
+                    )
+                    second = mx.argmax(masked, axis=-1)
+                    if head is not None:
+                        second = head.ids[second]
+                if head is not None:
+                    y = head.ids[y]
+            return y, logprobs, hidden, second
 
     def _prefill(model, cache, y):
         while y.size > 1:
@@ -586,74 +723,284 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
-    def _rewind_cache(num_draft, num_accept):
-        trim_prompt_cache(model_cache, num_draft - num_accept)
-        trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+    def _prefill_mtp(y):
+        nonlocal hidden
+        while y.size > 1:
+            n = min(prefill_step_size, y.size - 1)
+            logits, h = model(y[:n][None], cache=model_cache, return_hidden=True)
+            if candidates is not None:
+                candidates.observe(logits[0, -64:])
+            if hidden is not None:
+                h = mx.concatenate([hidden, h], axis=1)
+            # Seed the drafter with each token and the hidden state before it
+            if h.shape[1] > 1:
+                draft_model(
+                    y[n + 1 - h.shape[1] : n][None], h[:, :-1], cache=draft_cache
+                )
+                quantize_cache_fn(draft_cache)
+                mx.eval([c.state for c in draft_cache])
+            hidden = h[:, -1:]
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache], hidden)
+            y = y[n:]
+            mx.clear_cache()
+        return y
 
-    def _draft_generate(y, num_draft):
-        if num_draft == 0:
-            return mx.array([], mx.uint32)
-        ys = []
-        for _ in range(num_draft):
-            y, _ = _step(draft_model, draft_cache, y)
-            mx.async_eval(y)
-            ys.append(y)
-        return mx.concatenate(ys)
+    def _draft_generate(y, num_draft, head=None):
+        """The drafts and, with siblings, the second choice at every position."""
+        nonlocal prev_tokens
+        ys, hs, ps, ms, alts, q = [], [], [], [], [], 1.0
+        h, i = hidden, 0
+        fallback = draft_fallback_margin if head is not None else 0
+        while i < num_draft:
+            y_in = y if i == 0 else ys[-1]
+            y_i, logprobs, h, alt = _step(
+                draft_model, draft_cache, y_in, hidden=h, head=head
+            )
+            ys.append(y_i)
+            hs.append(h)
+            alts.append(alt)
+            if not draft_stop_prob and not fallback:
+                mx.async_eval(y_i, *([alt] if siblings else []))
+                i += 1
+                continue
+            if fused_draft:
+                # The fused step returns (top probability, margin) instead of logprobs
+                ps.append(logprobs[:1])
+                ms.append(logprobs[1:] if fallback else None)
+            else:
+                ps.append(mx.exp(logprobs.max()))
+                # The gap of the two best candidates tells when the set was too narrow
+                ms.append(mx.abs(mx.diff(mx.topk(logprobs, 2))) if fallback else None)
+            mx.async_eval([a for a in (y_i, alt, ps[-1], ms[-1]) if a is not None])
+            # Read the previous draft's numbers while this one runs.
+            # The last draft is not read, so the verify is built without a wait.
+            if 0 < i < num_draft - 1:
+                if ms[i - 1] is not None and ms[i - 1].item() < fallback:
+                    # Rescore the previous draft with the full head and redo this one
+                    logits = draft_model.lm_head(hs[i - 1])
+                    ys[i - 1], logprobs = _process_and_sample(None, logits.squeeze(0))
+                    ps[i - 1], ms[i - 1] = mx.exp(logprobs.max()), None
+                    if siblings:
+                        masked = mx.put_along_axis(
+                            logprobs, ys[i - 1][:, None], mx.array(-mx.inf), -1
+                        )
+                        alts[i - 1] = mx.argmax(masked, axis=-1)
+                    mx.async_eval(ys[i - 1], ps[i - 1])
+                    trim_prompt_cache(draft_cache, 1)
+                    for seq in (ys, hs, ps, ms, alts):
+                        seq.pop()
+                    h = hs[-1]
+                    continue
+                q *= ps[i - 1].item()
+                if q < draft_stop_prob:
+                    # The chain is likely broken: drop the draft computed past it.
+                    trim_prompt_cache(draft_cache, 1)
+                    if prev_tokens is not None:
+                        prev_tokens = prev_tokens[:-1]
+                    ys.pop()
+                    alts.pop()
+                    break
+            i += 1
+        empty = mx.array([], mx.uint32)
+        drafts = mx.concatenate(ys) if ys else empty
+        if not siblings:
+            return drafts, None
+        return drafts, mx.concatenate(alts) if alts else empty
 
     with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
-        y = _prefill(model, model_cache, y)
+        if mtp:
+            y = _prefill_mtp(y)
+        else:
+            _prefill(draft_model, draft_cache, y)
+            y = _prefill(model, model_cache, y)
+        draft_y = y
 
         ntoks = 0
         # Set these so the finally block doesn't raise
-        num_draft = 0
-        n = 0
+        num_draft = n = drafted = draft_trim = 0
+        rows = keep = 1
+        draft_tokens = None
         try:
+            gdn_caches = [c for c in model_cache if isinstance(c, ArraysCache)]
+            for c in gdn_caches:
+                c.keep_states = True
+            if not can_trim_prompt_cache(model_cache):
+                types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+                raise ValueError(
+                    "Speculative decoding requires a trimmable prompt cache "
+                    f"(got {types})."
+                )
             while True:
-                num_draft = min(max_tokens - ntoks, num_draft_tokens)
-                draft_tokens = _draft_generate(draft_y, num_draft)
+                if draft_tokens is None:
+                    num_draft = min(max_tokens - ntoks, num_draft_tokens)
+                    if mtp and hidden is None:
+                        num_draft = 0
+                    head = candidates.make_head() if candidates else None
+                    draft_tokens, sibling_tokens = _draft_generate(
+                        draft_y, num_draft, head
+                    )
+                num_draft = draft_tokens.size
+                n = drafted = draft_trim = 0
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[
                         : prev_tokens.size - y.size - num_draft + 1
                     ]
+                # With siblings the verify rows are the chain [y, drafts] then
+                # the siblings of the first draft positions; the sibling of
+                # draft i + 1 sits at row chain + i
+                n_sib = sibling_rows(num_draft) if siblings else 0
+                chain = num_draft + 1 if n_sib else None
                 y = mx.concatenate([y, draft_tokens])
-                tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
-                mx.eval(tokens, draft_tokens)
+                if chain:
+                    y = mx.concatenate([y, sibling_tokens[:n_sib]])
+                rows, keep = y.size, 1
+                tokens, logprobs, hidden_out, _ = _step(
+                    model, model_cache, y, rows, chain=chain
+                )
+                mx.async_eval(
+                    tokens, draft_tokens, *([sibling_tokens] if chain else [])
+                )
+                # Build and run the state rollback for the accepted path while the
+                # verify runs, so the GPU has work queued during the readback
+                if (accept_ratio or accept_entropy or accept_floor) and num_draft:
+                    lp = logprobs[:num_draft]
+                    at_draft = mx.take_along_axis(lp, draft_tokens[:, None], axis=-1)[
+                        :, 0
+                    ]
+                    bounds = []
+                    if accept_ratio:
+                        bounds.append(mx.max(lp, axis=-1) + math.log(accept_ratio))
+                    if accept_entropy:
+                        # Typical acceptance: the bound follows the target's entropy
+                        p = mx.exp(lp)
+                        entropy = -mx.sum(mx.where(p > 0, p * lp, 0.0), axis=-1)
+                        bounds.append(
+                            mx.minimum(
+                                2 * math.log(accept_entropy),
+                                math.log(accept_entropy) - entropy,
+                            )
+                        )
+                    if accept_floor:
+                        bounds.append(mx.full(at_draft.shape, math.log(accept_floor)))
+                    ok = at_draft >= functools.reduce(mx.maximum, bounds)
+                else:
+                    ok = tokens[:num_draft] == draft_tokens
+                accepted = mx.sum(mx.cumprod(ok.astype(mx.int32)))
+                extra = None
+                if chain:
+                    # The sibling of the first rejected draft may hold the correction
+                    at = mx.minimum(accepted, n_sib - 1)
+                    sib_ok = (accepted < n_sib) & (sibling_tokens[at] == tokens[at])
+                    extra = mx.where(sib_ok, chain + at, -1)
+                for c in gdn_caches:
+                    c.stage(accepted + 1, extra)
+                mx.async_eval([c.staged for c in gdn_caches if c.staged is not None])
+                head = None
+                if candidates is not None:
+                    # Build the next candidate set while the tokens are read back
+                    candidates.observe(logprobs)
+                    head = candidates.make_head(draft_tokens, tokens)
+                    mx.async_eval(head.first, *head.rows)
+                mx.eval(tokens, draft_tokens, ok)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
-                n = 0
-                while n < num_draft:
-                    tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
-                    if tn != dtn:
-                        break
+                ok = ok.tolist()
+                n_accept = 0
+                while n_accept < num_draft and ok[n_accept]:
+                    n_accept += 1
+                # The accepted drafts are the emitted tokens; the target's token follows them
+                tokens[:n_accept] = draft_tokens[:n_accept]
+                new_tokens = mx.array(tokens, mx.uint32)
+                # A rejected draft whose sibling is the correction: the sibling row
+                # is accepted and the target's token after it is one more token
+                sibling = (
+                    chain is not None
+                    and n_accept < n_sib
+                    and sibling_tokens[n_accept].item() == tokens[n_accept]
+                )
+                bonus = tokens[chain + n_accept] if sibling else None
+
+                # Draft the next cycle before the tokens are consumed: the GPU
+                # runs the drafts while the caller handles the tokens
+                y = mx.array([bonus if sibling else tokens[n_accept]], mx.uint32)
+                draft_y = y
+                # If we accepted all the draft tokens, include the last
+                # draft token in the next draft step since it hasn't been
+                # processed yet by the draft model; likewise an accepted sibling
+                if n_accept == num_draft:
+                    draft_y = mx.concatenate(
+                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
+                    )
+                elif sibling:
+                    draft_y = mx.concatenate(
+                        [mx.array(tokens[n_accept : n_accept + 1], mx.uint32), draft_y]
+                    )
+                if sibling:
+                    hidden = mx.concatenate(
+                        [
+                            hidden_out[:, n_accept : n_accept + 1],
+                            hidden_out[:, chain + n_accept : chain + n_accept + 1],
+                        ],
+                        axis=1,
+                    )
+                elif mtp:
+                    hidden = hidden_out[:, n_accept + 1 - draft_y.size : n_accept + 1]
+                if candidates is not None:
+                    candidates.extend(new_tokens[: n_accept + 1])
+                    if sibling:
+                        candidates.extend(
+                            new_tokens[chain + n_accept : chain + n_accept + 1]
+                        )
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[: -max(num_draft - n_accept, 1)]
+                draft_trim = trim_prompt_cache(
+                    draft_cache, max(num_draft - n_accept - 1, 0)
+                )
+                next_draft = None
+                remaining = max_tokens - ntoks - n_accept - 1
+                if remaining > 0:
+                    next_draft = _draft_generate(
+                        draft_y, min(remaining, num_draft_tokens), head
+                    )
+                    drafted = draft_y.size + next_draft[0].size - 1
+                if sibling:
+                    # Move the sibling row of the KV caches behind the accepted chain
+                    for c in model_cache:
+                        if not isinstance(c, ArraysCache):
+                            c.move_row(rows - chain - n_accept, rows - n_accept - 1)
+
+                while n < n_accept:
                     n += 1
                     ntoks += 1
-                    yield tn, lpn, True
+                    keep += 1
+                    yield tokens[n - 1], logprobs[n - 1], True
                     if ntoks == max_tokens:
                         break
                 if ntoks < max_tokens:
                     ntoks += 1
-                    yield tokens[n], logprobs[n], False
+                    yield tokens[n], logprobs[n], sibling
+                if sibling and ntoks < max_tokens:
+                    ntoks += 1
+                    yield bonus, logprobs[chain + n_accept], False
+                    # The cache keeps the sibling row once its token is not the last one
+                    keep += 1
 
                 if ntoks == max_tokens:
                     break
-
-                y = mx.array([tokens[n]], mx.uint32)
-                draft_y = y
-
-                # If we accepted all the draft tokens, include the last
-                # draft token in the next draft step since it hasn't been
-                # processed yet by the draft model
-                if n == num_draft:
-                    draft_y = mx.concatenate(
-                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                    )
-
-                if prev_tokens is not None:
-                    prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-                _rewind_cache(num_draft, n)
+                trim_prompt_cache(model_cache, rows - keep)
+                draft_tokens, sibling_tokens = next_draft
         finally:
-            _rewind_cache(num_draft, n)
+            # Fewer tokens than accepted may have been yielded: do not use the staged state
+            for c in gdn_caches:
+                c.staged = None
+            trim_prompt_cache(model_cache, rows - keep)
+            # Drop the drafts of the next cycle and the rest of this one
+            trim_prompt_cache(
+                draft_cache, drafted + max(num_draft - n - 1, 0) - draft_trim
+            )
+            for c in gdn_caches:
+                c.keep_states = False
 
 
 def stream_generate(
@@ -706,7 +1053,17 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
+        for key in (
+            "num_draft_tokens",
+            "draft_stop_prob",
+            "accept_ratio",
+            "accept_entropy",
+            "accept_floor",
+            "draft_candidates",
+            "draft_fallback_margin",
+            "draft_siblings",
+        ):
+            kwargs.pop(key, None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -1406,6 +1763,7 @@ class GenerationBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         # Normalize the logits
+        logits = logits.astype(mx.float32)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
         # Sample
@@ -2157,6 +2515,13 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        draft_stop_prob=args.draft_stop_prob,
+        accept_ratio=args.accept_ratio,
+        accept_entropy=args.accept_entropy,
+        accept_floor=args.accept_floor,
+        draft_candidates=args.draft_candidates,
+        draft_fallback_margin=args.draft_fallback_margin,
+        draft_siblings=args.draft_siblings,
     )
     if not args.verbose:
         print(response)
