@@ -902,6 +902,7 @@ class DeepseekV4Cache:
             not isinstance(other.local, BatchRotatingKVCache)
             and self.local.offset == other.local.offset
             and self.local._idx == other.local._idx
+            and self._buffer_length(self.local) == self._buffer_length(other.local)
         ):
             if self.local.keys is not None or other.local.keys is not None:
                 self.local.keys = self._concat_optional(self.local.keys, other.local.keys)
@@ -1226,6 +1227,12 @@ class DeepseekV4Cache:
         return BatchRotatingKVCache.merge(
             [cls._extract_local(local, i) for i in range(batch)]
         )
+
+    @staticmethod
+    def _buffer_length(local):
+        # RotatingKVCache grows its buffer ahead of ``_idx`` on single-token
+        # updates, so equal offsets and indices do not imply equal lengths.
+        return None if local.keys is None else local.keys.shape[2]
 
     @staticmethod
     def _concat_optional(a, b):

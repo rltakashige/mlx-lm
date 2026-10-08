@@ -1457,6 +1457,43 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.abs(row_sums - 1.0) < 1e-3))
         self.assertTrue(mx.all(mx.abs(col_sums - 1.0) < 1e-3))
 
+    def test_deepseek_v4_cache_extend_mismatched_buffers(self):
+        from mlx_lm.models.deepseek_v4 import DeepseekV4Cache
+
+        def kv(length, seed):
+            mx.random.seed(seed)
+            return mx.random.normal((1, 1, length, 8)), mx.random.normal(
+                (1, 1, length, 8)
+            )
+
+        def logical_keys(cache, row):
+            local = cache.extract(row).local
+            return local._temporal_order(local.keys)
+
+        # 20-token prompt then one decode step: the buffer grows past _idx.
+        grown = DeepseekV4Cache(128)
+        prompt_keys, prompt_values = kv(20, 0)
+        grown.update_and_fetch(prompt_keys, prompt_values)
+        step_keys, step_values = kv(1, 1)
+        grown.update_and_fetch(step_keys, step_values)
+
+        # 21-token prompt in one go: same offset and _idx, shorter buffer.
+        exact = DeepseekV4Cache(128)
+        exact_keys, exact_values = kv(21, 2)
+        exact.update_and_fetch(exact_keys, exact_values)
+        self.assertEqual(grown.local.offset, exact.local.offset)
+        self.assertEqual(grown.local._idx, exact.local._idx)
+        self.assertNotEqual(grown.local.keys.shape, exact.local.keys.shape)
+
+        grown.extend(exact)
+        self.assertTrue(
+            mx.array_equal(
+                logical_keys(grown, 0),
+                mx.concatenate([prompt_keys, step_keys], axis=2),
+            )
+        )
+        self.assertTrue(mx.array_equal(logical_keys(grown, 1), exact_keys))
+
     def test_deepseek_v4(self):
         from mlx_lm.models import deepseek_v4
         from mlx_lm.models.cache import RotatingKVCache
